@@ -1,0 +1,20 @@
+services:
+  db:
+    image: timescale/timescaledb-ha:pg16
+    container_name: taiex-timescale
+    environment:
+      POSTGRES_DB: taiex
+      POSTGRES_USER: taiex
+      POSTGRES_PASSWORD: taiex
+    ports:
+      - "5432:5432"
+    volumes:
+      - taiex-pg:/home/postgres/pgdata/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taiex -d taiex"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  taiex-pg:

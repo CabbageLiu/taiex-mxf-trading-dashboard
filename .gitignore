@@ -1,0 +1,35 @@
+# env
+.env
+.env.local
+.env.*.local
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv
+# (keep uv.lock — committed for reproducible installs)
+
+# node / next
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# jupyter
+.ipynb_checkpoints/
+
+# logs
+*.log
