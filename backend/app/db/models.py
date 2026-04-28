@@ -1,0 +1,65 @@
+from datetime import datetime
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    func,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Tick(Base):
+    __tablename__ = "ticks"
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String, primary_key=True)
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class Signal(Base):
+    __tablename__ = "signals"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String, nullable=False)
+    resolution: Mapped[str] = mapped_column(String, nullable=False)
+    strategy: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String, nullable=False)
+    price: Mapped[float | None] = mapped_column(Float)
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+Index("ix_signals_strategy_ts", Signal.strategy, Signal.ts.desc())
+
+
+class Alert(Base):
+    __tablename__ = "alerts"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    signal_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("signals.id"))
+    channel: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    http_code: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(String)
+
+
+class StrategyConfig(Base):
+    __tablename__ = "strategy_config"
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    params: Mapped[dict] = mapped_column(JSONB, default=dict)
+    channels: Mapped[list[str]] = mapped_column(
+        ARRAY(String), default=list, server_default="{discord,n8n,inapp}"
+    )
