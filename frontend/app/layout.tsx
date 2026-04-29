@@ -2,6 +2,7 @@ import "./globals.css";
 import type { ReactNode } from "react";
 import { Providers } from "./providers";
 import { dict } from "@/lib/i18n";
+import { ShellHeader } from "@/components/ShellHeader";
 
 export const metadata = {
   title: dict.app_title,
@@ -19,7 +20,12 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         />
       </head>
       <body>
-        <Providers>{children}</Providers>
+        <Providers>
+          <div className="shell">
+            <ShellHeader />
+            <main className="shell-main">{children}</main>
+          </div>
+        </Providers>
       </body>
     </html>
   );

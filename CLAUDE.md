@@ -4,7 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-### Local infrastructure
+### One-command dev stack (recommended)
+
+```sh
+docker compose up           # db + backend + frontend, hot-reload all three
+docker compose up --build   # first run, or after dependency changes
+docker compose down         # clean stop (data preserved)
+docker compose down -v      # also nuke ticks/signals/alerts
+```
+
+Browser → `http://localhost:3000`. Backend on `:8000`. DB on `:5432`. Source is bind-mounted; both servers hot-reload on file edits.
+
+### Host workflow (no Docker)
+
+Use this when you want pytest, ruff, or alembic revisions outside containers.
+
+#### Local infrastructure
 
 ```sh
 docker compose up -d db          # TimescaleDB on 127.0.0.1:5432, volume taiex-pg
@@ -13,7 +28,7 @@ docker compose stop              # keep data
 docker compose down -v           # nuke ticks/signals/alerts
 ```
 
-### Backend (uv-managed; venv lives in `backend/.venv`)
+#### Backend (uv-managed; venv lives in `backend/.venv`)
 
 ```sh
 cd backend
@@ -32,7 +47,7 @@ uv run alembic revision -m "msg" --autogenerate   # author a new migration
 
 A new alembic migration **must** load `target_metadata = Base.metadata` from `app.db.models` (already wired in `app/db/migrations/env.py`). Continuous aggregates and Timescale extension setup are raw SQL inside the migration body — autogenerate cannot produce them; hand-edit.
 
-### Frontend
+#### Frontend
 
 ```sh
 cd frontend

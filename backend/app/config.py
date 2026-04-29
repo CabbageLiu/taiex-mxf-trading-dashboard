@@ -2,7 +2,7 @@ from datetime import time
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,7 +26,17 @@ class Settings(BaseSettings):
     market_close: time = Field(default=time(13, 45), alias="MARKET_CLOSE")
     poll_interval_sec: float = Field(default=5.0, alias="POLL_INTERVAL_SEC")
     symbol_display: str = Field(default="MXF", alias="SYMBOL_DISPLAY")
-    symbol_source: str = Field(default="TAIEX", alias="SYMBOL_SOURCE")
+    symbol_source: str = Field(default="MXF", alias="SYMBOL_SOURCE")
+
+    # AI insights (Anthropic Claude Sonnet) — V2 strategy analysis page
+    anthropic_api_key: SecretStr | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
+    insights_cache_ttl_seconds: int = Field(
+        default=1800, alias="INSIGHTS_CACHE_TTL_SECONDS"
+    )
+    insights_cache_max_entries: int = Field(
+        default=256, alias="INSIGHTS_CACHE_MAX_ENTRIES"
+    )
 
     @property
     def tz(self) -> ZoneInfo:

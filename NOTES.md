@@ -1,84 +1,80 @@
 # Operator notes — TAIEX MXF dashboard
 
-Personal runbook. Three local processes: TimescaleDB (Docker), FastAPI
-backend, Next.js frontend. All bound to `127.0.0.1` only. Sharing access
-to other devices goes through Tailscale.
+Personal runbook. Whole stack (TimescaleDB + FastAPI backend + Next.js
+frontend) runs in Docker via one command. Ports bind to `127.0.0.1`
+only. Sharing access to other devices goes through Tailscale.
 
 ---
 
 ## 0. One-time setup
 
 ```sh
-# clone + env
 git clone <this repo>
 cd TAIEX
 cp .env.example .env       # fill in FINMIND_TOKEN, DISCORD_WEBHOOK_URL, N8N_WEBHOOK_URL
-
-# backend deps
-cd backend && uv sync --extra dev
-
-# DB up + schema
-cd ..
-docker compose up -d db
-cd backend && uv run alembic upgrade head
-
-# frontend deps
-cd ../frontend && npm install
+docker compose up --build  # first build pulls images + installs deps
 ```
 
-`.env` is gitignored. Never commit it. If you rotate any secret, just
-edit `.env` and restart the backend.
+`.env` is gitignored. Never commit it. Rotate any secret → edit `.env`,
+restart with `docker compose restart backend`.
+
+For the host fallback workflow (running pytest / ruff / alembic outside
+containers), also do:
+
+```sh
+cd backend && uv sync --extra dev
+cd ../frontend && npm install
+```
 
 ---
 
 ## 1. Daily start
 
-Three terminals, in this order. Each one waits for the previous to be
-ready before the next is useful.
-
-### Terminal 1 — database
+One command, one terminal:
 
 ```sh
 cd /Users/raccoon/Desktop/TAIEX
-docker compose up -d db
-docker compose ps                 # wait until taiex-timescale shows "healthy"
+docker compose up
 ```
 
-If Docker Desktop isn't running yet, open it from Applications first.
+Open **http://localhost:3000**.
 
-### Terminal 2 — backend (FastAPI + ingest loop)
+What happens:
 
-```sh
-cd /Users/raccoon/Desktop/TAIEX/backend
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
+- `db` (TimescaleDB) starts, waits until healthy.
+- `backend` starts, runs `alembic upgrade head` (idempotent, safe to
+  re-run), then `uvicorn` on port 8000. Healthcheck polls `/health`.
+- `frontend` waits for backend healthy, then runs `next dev` on port 3000.
+- Logs from all three interleave in the terminal. Ctrl-C stops everything.
 
-Wait for `Application startup complete`. The ingest loop will:
+During TW market hours (08:45–13:45 Asia/Taipei) the backend ingest loop
+polls FinMind every 5 s. Outside market hours it sleeps and emits a
+heartbeat.
 
-- Backfill the last 2 days of TAIEX 5-sec ticks from FinMind on startup.
-- During TW market hours (08:45–13:45 Asia/Taipei) poll every 5 s.
-- Outside market hours, sleep and emit a heartbeat.
+> **Note:** the FinMind backfill is gone (the new sponsor
+> `taiwan_futures_snapshot` endpoint is real-time only). The first time
+> you start during market hours, the chart is empty until the first bar
+> closes; subsequent days resume from whatever ticks were captured.
 
-### Terminal 3 — frontend (Next.js)
+### When to use `--build`
 
-```sh
-cd /Users/raccoon/Desktop/TAIEX/frontend
-npm run dev
-```
-
-Open **http://127.0.0.1:3000** (NOT `localhost`, NOT `192.168.x.x`).
+| Change | Command |
+|---|---|
+| Edited Python / TypeScript source | `docker compose up` (hot-reload picks it up) |
+| Edited `pyproject.toml` (added a Python dep) | `docker compose up --build` |
+| Edited `package.json` (added an npm dep) | `docker compose up --build` |
+| First time ever, or after `down -v` | `docker compose up --build` |
 
 ---
 
 ## 2. Daily stop
 
 ```sh
-# in each running terminal
+# in the running terminal
 Ctrl+C
 
-# in any terminal
-cd /Users/raccoon/Desktop/TAIEX
-docker compose stop                # data persists in the taiex-pg volume
+# or, if running detached (`docker compose up -d`)
+docker compose down              # stops containers, KEEPS data in taiex-pg volume
 ```
 
 To wipe the DB completely (resets ticks/signals/alerts):
@@ -89,78 +85,111 @@ docker compose down -v
 
 ---
 
-## 3. Sharing access via Tailscale
+## 3. Editing while it runs
 
-Goal: only people you invite can reach the dashboard. Servers stay
-bound to `127.0.0.1`; Tailscale exposes port 3000 (Next dev) onto the
-private mesh.
+Both servers hot-reload via bind mounts:
+
+- Edit `backend/app/**.py` → uvicorn reloads (~1 s).
+- Edit `frontend/**.tsx` / `**.ts` → Next HMR refreshes the browser.
+
+No restart needed unless you change `pyproject.toml` / `package.json` /
+`docker-compose.yml` / Dockerfiles → then `docker compose up --build`.
+
+---
+
+## 4. Host workflow (no Docker)
+
+Use this for one-shot dev tools that don't need the full stack:
+
+```sh
+cd backend
+uv run pytest -q                              # all tests (no DB needed)
+uv run ruff check .                           # lint
+uv run alembic revision -m "msg" --autogenerate   # author a new migration
+
+cd ../frontend
+npx tsc --noEmit                              # typecheck only
+npm run build                                 # production build
+```
+
+You can also run the backend on the host while the DB stays in Docker:
+
+```sh
+docker compose up -d db
+cd backend && uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+---
+
+## 5. Sharing access via Tailscale
+
+Goal: only people you invite can reach the dashboard. Containers
+publish on `127.0.0.1`; Tailscale exposes port 3000 onto the private
+mesh.
 
 ### One-time host install
 
 ```sh
-brew install --cask tailscale       # opens the Tailscale app
-# sign in (Google / GitHub / Microsoft) — creates your tailnet
+brew install --cask tailscale
 tailscale up
-tailscale status                    # confirm host is "active"
+tailscale status
 ```
 
 ### Expose the dashboard onto the tailnet
 
 ```sh
-# share the Next dev port over HTTPS within the tailnet
 tailscale serve --bg --https=443 http://127.0.0.1:3000
-
-# print the URL
-tailscale serve status
+tailscale serve status                          # prints the URL
 ```
 
-The URL looks like `https://your-mac.tailxxxx.ts.net/`. Bookmark it.
+URL looks like `https://your-mac.tailxxxx.ts.net/`. Bookmark it.
 
 ### Inviting someone
 
-1. They install Tailscale on their device (iOS, Android, macOS, Windows, Linux).
-2. You go to <https://login.tailscale.com/admin/users> → **Invite**, type their email.
-3. They accept the email invite, sign in to Tailscale.
+1. They install Tailscale (iOS / Android / macOS / Windows / Linux).
+2. <https://login.tailscale.com/admin/users> → **Invite**, type their email.
+3. They accept, sign in to Tailscale.
 4. They open the URL from `tailscale serve status`.
 
 ### Stop sharing
 
 ```sh
 tailscale serve --https=443 off
+# or
+tailscale down
 ```
-
-Or just `tailscale down` to leave the tailnet entirely.
 
 ### Notes
 
-- Both `next dev` and `uvicorn` bind `127.0.0.1` on purpose. Anyone on
-  the same Wi-Fi who tries `http://192.168.x.x:3000` gets connection
-  refused. Tailscale is the only public entry point.
-- The Next dev server proxies REST (`/api/*`) and WebSocket (`/ws/*`) to
-  FastAPI on `127.0.0.1:8000`, so only port 3000 needs to go through
-  Tailscale Serve.
+- All published ports use `127.0.0.1:` prefix (`5432`, `8000`, `3000`).
+  Anyone on the same Wi-Fi trying `http://192.168.x.x:3000` gets
+  connection refused. Tailscale is the only public entry point.
+- Next dev proxies REST (`/api/*`) and WebSocket (`/ws/*`) to the
+  backend container internally, so only port 3000 needs Tailscale Serve.
 - If the host Mac sleeps, the dashboard goes down for everyone on the
-  tailnet until you wake it. There is no 24/7 ingest. Consider a small
-  always-on host (VPS, Raspberry Pi) when you outgrow this.
+  tailnet. No 24/7 ingest. Consider an always-on host (VPS, Pi) when
+  you outgrow this.
 
 ---
 
-## 4. Troubleshooting
+## 6. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Backend: `ConnectionRefusedError [Errno 61]` | DB container not up | `docker compose up -d db`, wait for healthy |
-| Backend: `relation "ticks" does not exist` | Schema not migrated | `cd backend && uv run alembic upgrade head` |
-| Backend: stuck on FinMind 400 | Token expired / quota | Check `FINMIND_TOKEN` in `.env`, regenerate at finmindtrade.com |
-| Frontend: chart empty, WS reconnecting | Backend down, or DB has no bars yet | Confirm backend running; wait for first 1-min bar to close |
-| Frontend: zh-TW characters render as boxes | Google Fonts blocked | Allow `fonts.googleapis.com` / `fonts.gstatic.com` in any blocker |
-| Frontend: `500 Internal Server Error` from `/strategies` | Schema not migrated, or DB down | Run alembic, restart backend |
-| `npm run dev` exposes on LAN | Old script | Pull latest; `package.json` `dev` script must include `-H 127.0.0.1` |
-| Tailscale URL fails for invited user | They didn't accept invite, or aren't logged in to Tailscale | Re-send invite from admin console |
+| `docker compose up` hangs at "backend Starting" | First-run image pulls | Wait 1–2 min; `docker compose logs backend` to watch progress |
+| Backend exits with `ConnectionRefusedError` | DB not healthy yet | Should not happen — backend `depends_on db: service_healthy`. If it does, `docker compose logs db` |
+| Frontend shows API errors right after start | Backend healthcheck not green yet | Frontend already waits for backend healthy; otherwise refresh |
+| `relation "ticks" does not exist` | Migration didn't run | `docker compose logs backend` — check the alembic line. To force: `docker compose run --rm backend uv run alembic upgrade head` |
+| FinMind 400 / 401 | Token expired or wrong tier | Check `FINMIND_TOKEN` in `.env`. Sponsor tier required for `taiwan_futures_snapshot` |
+| Chart empty during market hours | First bar hasn't closed yet, or wrong `SYMBOL_SOURCE` | Wait one minute. Confirm `.env` has `SYMBOL_SOURCE=TXF` (or TMF / CDF) |
+| zh-TW characters render as boxes | Google Fonts blocked | Allow `fonts.googleapis.com` / `fonts.gstatic.com` in any blocker |
+| Tailscale URL fails for invited user | They didn't accept invite, or aren't logged in | Re-send invite from admin console |
+| Hot-reload not picking up changes | Editor saving outside `./backend` or `./frontend`, or filesystem watcher quirks on macOS | `docker compose restart backend` (or `frontend`) |
+| Want to nuke everything and start clean | — | `docker compose down -v && docker compose up --build` |
 
 ---
 
-## 5. Adding a strategy
+## 7. Adding a strategy
 
 Drop a new file under `backend/app/strategies/examples/` (or ship as a
 pip package exposing entry point group `taiex.strategies`):
@@ -194,16 +223,18 @@ class MyStrategy(Strategy):
             )
 ```
 
-Restart backend, refresh dashboard. The strategy panel auto-discovers it.
-Toggle it On — signals start flowing to Discord + n8n + the in-app log.
+Save the file → uvicorn auto-reloads → refresh the dashboard. The
+strategy panel auto-discovers it. Toggle On → signals flow to Discord +
+n8n + the in-app log.
 
 ---
 
-## 6. Tests
+## 8. Tests
 
 ```sh
 cd backend && uv run pytest -q
 ```
 
-Currently 13 tests covering indicator math, FinMind dedupe, notifier
-hub fan-out + failure isolation. No DB required for these.
+14 tests covering indicator math, FinMind snapshot adapter dedupe,
+notifier hub fan-out + per-channel failure isolation. None require a
+live database.

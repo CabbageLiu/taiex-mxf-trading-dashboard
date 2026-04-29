@@ -4,11 +4,12 @@ from logging import getLogger
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import alerts, bars, indicators, strategies
+from app.api.routes import alerts, bars, indicators, insights, status, strategies, trades
 from app.api.ws import router as ws_router
 from app.db.engine import dispose_engine, init_engine
 from app.ingest.runner import IngestRunner
 from app.notify.hub import NotifierHub
+from app.runner.position_tracker import PositionTracker
 from app.runner.strategy_loop import StrategyLoop
 
 log = getLogger("taiex")
@@ -23,14 +24,18 @@ async def lifespan(app: FastAPI):
     await ingest.start()
     strat = StrategyLoop(hub=hub, ingest=ingest)
     await strat.start()
+    tracker = PositionTracker(hub=hub)
+    await tracker.start()
 
     app.state.ingest = ingest
     app.state.hub = hub
     app.state.strategies = strat
+    app.state.position_tracker = tracker
 
     try:
         yield
     finally:
+        await tracker.stop()
         await strat.stop()
         await ingest.stop()
         await hub.stop()
@@ -49,6 +54,9 @@ def create_app() -> FastAPI:
     app.include_router(indicators.router)
     app.include_router(strategies.router)
     app.include_router(alerts.router)
+    app.include_router(trades.router, prefix="/trades", tags=["trades"])
+    app.include_router(status.router, tags=["status"])
+    app.include_router(insights.router, prefix="/insights", tags=["insights"])
     app.include_router(ws_router)
 
     @app.get("/health")

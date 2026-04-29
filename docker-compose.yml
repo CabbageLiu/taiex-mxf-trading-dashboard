@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: taiex
       POSTGRES_PASSWORD: taiex
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - taiex-pg:/home/postgres/pgdata/data
     healthcheck:
@@ -15,6 +15,42 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  backend:
+    build: ./backend
+    container_name: taiex-backend
+    env_file: ./.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://taiex:taiex@db:5432/taiex
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./backend:/app
+      - /app/.venv
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    build: ./frontend
+    container_name: taiex-frontend
+    environment:
+      API_BASE: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
 
 volumes:
   taiex-pg:

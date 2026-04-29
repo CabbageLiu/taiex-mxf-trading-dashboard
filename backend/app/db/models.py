@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Column,
     DateTime,
     Float,
     ForeignKey,
@@ -63,3 +64,24 @@ class StrategyConfig(Base):
     channels: Mapped[list[str]] = mapped_column(
         ARRAY(String), default=list, server_default="{discord,n8n,inapp}"
     )
+
+
+class Trade(Base):
+    __tablename__ = "trades"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    strategy = Column(String, nullable=False, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    side = Column(String, nullable=False)  # "LONG" | "SHORT"
+    entry_ts = Column(DateTime(timezone=True), nullable=False, index=True)
+    entry_price = Column(Float, nullable=False)
+    entry_signal_id = Column(BigInteger, ForeignKey("signals.id"), nullable=True)
+    exit_ts = Column(DateTime(timezone=True), nullable=True, index=True)
+    exit_price = Column(Float, nullable=True)
+    exit_signal_id = Column(BigInteger, ForeignKey("signals.id"), nullable=True)
+    qty = Column(Float, nullable=False, default=1.0)
+    pnl_points = Column(Float, nullable=True)  # NULL while open
+    payload = Column(JSONB, nullable=False, default=dict)
+
+
+Index("ix_trades_strategy_entry_ts", Trade.strategy, Trade.entry_ts.desc())
+Index("ix_trades_symbol_entry_ts", Trade.symbol, Trade.entry_ts.desc())

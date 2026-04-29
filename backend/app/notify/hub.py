@@ -48,13 +48,17 @@ class NotifierHub:
         if not targets:
             return []
         results = await asyncio.gather(
-            *[self._send(n, signal) for n in targets], return_exceptions=False
+            *[self._send(n, signal, signal_id) for n in targets], return_exceptions=False
         )
         await self._record(signal_id, results)
         return results
 
-    async def _send(self, notifier: Notifier, signal: Signal) -> AlertResult:
+    async def _send(
+        self, notifier: Notifier, signal: Signal, signal_id: int | None = None
+    ) -> AlertResult:
         try:
+            if isinstance(notifier, InAppNotifier):
+                return await notifier.send(signal, signal_id=signal_id)
             return await notifier.send(signal)
         except Exception as e:
             log.exception("notifier %s raised", notifier.name)

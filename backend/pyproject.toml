@@ -17,6 +17,7 @@ dependencies = [
   "tenacity>=9.0",
   "websockets>=13",
   "anyio>=4.6",
+  "anthropic>=0.40.0",
 ]
 
 [project.optional-dependencies]

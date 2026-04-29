@@ -17,9 +17,10 @@ class InAppNotifier:
     def __init__(self) -> None:
         self._subs: set[asyncio.Queue[dict]] = set()
 
-    async def send(self, signal: Signal) -> AlertResult:
+    async def send(self, signal: Signal, signal_id: int | None = None) -> AlertResult:
         msg = {
             "type": "signal",
+            "id": signal_id,
             "ts": signal.ts.isoformat(),
             "symbol": signal.symbol,
             "resolution": signal.resolution,

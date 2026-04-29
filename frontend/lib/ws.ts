@@ -5,12 +5,21 @@ import { useEffect, useRef, useState } from "react";
 export type WsMessage =
   | { type: "bar_update"; resolution: string; bucket: string; price: number; ts: string; symbol: string }
   | { type: "bar_close"; resolution: string; bucket: string; symbol: string }
-  | { type: "signal"; ts: string; symbol: string; resolution: string; strategy: string; side: string; price: number; reason: string; payload: Record<string, unknown> };
+  | {
+      type: "signal";
+      id: number | null;
+      ts: string;
+      symbol: string;
+      resolution: string;
+      strategy: string;
+      side: string;
+      price: number;
+      reason: string;
+      payload: Record<string, unknown>;
+    };
 
 const wsBase = () => {
   if (typeof window === "undefined") return "";
-  const explicit = process.env.NEXT_PUBLIC_API_BASE;
-  if (explicit) return explicit.replace(/^http/, "ws");
   // Same-origin path. Works for localhost:3000 (Next dev proxies) AND for
   // Tailscale Serve where the page itself is reached via the tailnet hostname.
   // The Next.js rewrite rule in next.config.mjs forwards /ws/* to the FastAPI

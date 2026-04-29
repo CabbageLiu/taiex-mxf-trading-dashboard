@@ -13,17 +13,16 @@ from app.config import get_settings
 
 log = logging.getLogger("taiex.adapter.finmind")
 
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
-DATASET = "TaiwanVariousIndicators5Seconds"
-SOURCE = "FINMIND_TAIEX"
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/taiwan_futures_snapshot"
+SOURCE = "FINMIND_FUTURES_SNAPSHOT"
 
 
 class FinMindTaiexAdapter:
-    """Polls FinMind 5-second TAIEX cash index. Yields each new row as a Tick.
+    """Polls FinMind sponsor `taiwan_futures_snapshot` endpoint.
 
-    User wants MXF on the chart but free FinMind only ships TAIEX cash; we surface
-    TAIEX as a proxy and label rows with the user's display symbol so swap-in is
-    invisible to the rest of the stack.
+    Snapshot is real-time only: each call returns the latest tick for `data_id`
+    (TXF / TMF / CDF). Display symbol is decoupled from source so the rest of
+    the stack still labels rows with `symbol_display` (e.g. MXF).
     """
 
     def __init__(self, display_symbol: str | None = None) -> None:
@@ -35,6 +34,7 @@ class FinMindTaiexAdapter:
         self._poll = s.poll_interval_sec
         self._open = s.market_open
         self._close = s.market_close
+        self._data_id = s.symbol_source
         self._last_seen_ts: datetime | None = None
 
     async def stream_ticks(self) -> AsyncIterator[Tick]:
@@ -48,7 +48,7 @@ class FinMindTaiexAdapter:
                 continue
 
             try:
-                rows = await self._fetch(now.strftime("%Y-%m-%d"))
+                rows = await self._fetch()
             except Exception:
                 log.exception("FinMind fetch failed; backing off")
                 await asyncio.sleep(self._poll * 2)
@@ -60,22 +60,9 @@ class FinMindTaiexAdapter:
             await asyncio.sleep(self._poll)
 
     async def backfill(self, start: datetime, end: datetime) -> list[Tick]:
-        days: list[str] = []
-        d = start.date()
-        while d <= end.date():
-            days.append(d.strftime("%Y-%m-%d"))
-            d = d + timedelta(days=1)
-
-        out: list[Tick] = []
-        for day in days:
-            try:
-                rows = await self._fetch(day)
-            except Exception:
-                log.exception("backfill day %s failed", day)
-                continue
-            out.extend(self._rows_to_ticks(rows))
-        out.sort(key=lambda t: t.ts)
-        return out
+        # Snapshot endpoint has no history. Return empty so runner skips backfill.
+        log.info("backfill skipped: taiwan_futures_snapshot is real-time only")
+        return []
 
     def _market_open(self, now: datetime) -> bool:
         if now.weekday() >= 5:
@@ -92,11 +79,13 @@ class FinMindTaiexAdapter:
             candidate = candidate + timedelta(days=1)
         return candidate
 
-    async def _fetch(self, date_str: str) -> list[dict]:
+    async def _fetch(self) -> list[dict]:
         headers: dict[str, str] = {}
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
-        params = {"dataset": DATASET, "start_date": date_str, "end_date": date_str}
+        params: dict[str, str] = {}
+        if self._data_id:
+            params["data_id"] = self._data_id
 
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(3),
@@ -118,7 +107,9 @@ class FinMindTaiexAdapter:
         out: list[Tick] = []
         for r in rows:
             raw_ts = r.get("date")
-            raw_price = r.get("TAIEX")
+            raw_price = r.get("close")
+            if raw_price is None:
+                raw_price = r.get("price")
             if raw_ts is None or raw_price is None:
                 continue
             try:

@@ -31,7 +31,7 @@ def upgrade() -> None:
 
     op.execute(
         """
-        CREATE TABLE ticks (
+        CREATE TABLE IF NOT EXISTS ticks (
             ts        TIMESTAMPTZ NOT NULL,
             symbol    TEXT NOT NULL,
             price     DOUBLE PRECISION NOT NULL,
@@ -40,12 +40,12 @@ def upgrade() -> None:
         )
         """
     )
-    op.execute("SELECT create_hypertable('ticks', 'ts')")
-    op.execute("CREATE INDEX ix_ticks_ts ON ticks (ts DESC)")
+    op.execute("SELECT create_hypertable('ticks', 'ts', if_not_exists => TRUE)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_ticks_ts ON ticks (ts DESC)")
 
     op.execute(
         """
-        CREATE TABLE signals (
+        CREATE TABLE IF NOT EXISTS signals (
             id         BIGSERIAL PRIMARY KEY,
             ts         TIMESTAMPTZ NOT NULL,
             symbol     TEXT NOT NULL,
@@ -57,12 +57,12 @@ def upgrade() -> None:
         )
         """
     )
-    op.execute("CREATE INDEX ix_signals_ts ON signals (ts DESC)")
-    op.execute("CREATE INDEX ix_signals_strategy_ts ON signals (strategy, ts DESC)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_signals_ts ON signals (ts DESC)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_signals_strategy_ts ON signals (strategy, ts DESC)")
 
     op.execute(
         """
-        CREATE TABLE alerts (
+        CREATE TABLE IF NOT EXISTS alerts (
             id         BIGSERIAL PRIMARY KEY,
             ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
             signal_id  BIGINT REFERENCES signals(id) ON DELETE SET NULL,
@@ -76,7 +76,7 @@ def upgrade() -> None:
 
     op.execute(
         """
-        CREATE TABLE strategy_config (
+        CREATE TABLE IF NOT EXISTS strategy_config (
             name      TEXT PRIMARY KEY,
             enabled   BOOLEAN NOT NULL DEFAULT FALSE,
             params    JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -88,7 +88,7 @@ def upgrade() -> None:
     for label, interval in CONT_AGG_RESOLUTIONS:
         op.execute(
             f"""
-            CREATE MATERIALIZED VIEW bars_{label}
+            CREATE MATERIALIZED VIEW IF NOT EXISTS bars_{label}
             WITH (timescaledb.continuous) AS
             SELECT
                 symbol,
@@ -109,7 +109,8 @@ def upgrade() -> None:
                 'bars_{label}',
                 start_offset => INTERVAL '30 days',
                 end_offset   => INTERVAL '{interval}',
-                schedule_interval => INTERVAL '30 seconds'
+                schedule_interval => INTERVAL '30 seconds',
+                if_not_exists => TRUE
             )
             """
         )
@@ -118,7 +119,7 @@ def upgrade() -> None:
     for label, interval in [("1w", "1 week"), ("1mo", "1 month")]:
         op.execute(
             f"""
-            CREATE VIEW bars_{label} AS
+            CREATE OR REPLACE VIEW bars_{label} AS
             SELECT
                 symbol,
                 time_bucket(INTERVAL '{interval}', bucket) AS bucket,

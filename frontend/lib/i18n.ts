@@ -20,6 +20,8 @@ export const dict = {
 
   btn_on: "啟用",
   btn_off: "關閉",
+  btn_save: "儲存",
+  btn_cancel: "取消",
 
   status_live: "即時",
   status_reconnecting: "重新連線中",
@@ -31,6 +33,62 @@ export const dict = {
 
   channels_label: "通知頻道",
   resolutions_label: "週期",
+
+  // V2 — navigation
+  "nav.trading": "交易",
+  "nav.analysis": "分析",
+
+  // V2 — status pill
+  "status.ok": "連線正常",
+  "status.lag": "資料延遲",
+  "status.error": "連線錯誤",
+  "status.lastTick": "最後 Tick",
+  "status.lagSec": "延遲秒數",
+  "status.db": "資料庫",
+  "status.notifiers": "通知通道",
+
+  // V2 — KPI strip
+  "kpi.winRate": "勝率",
+  "kpi.trades": "交易筆數",
+  "kpi.pnl": "累積損益",
+  "kpi.drawdown": "最大回撤",
+  "kpi.unit.points": "點",
+  "kpi.unit.trades": "筆",
+
+  // V2 — filters
+  "filter.all": "全部",
+  "filter.win": "獲利",
+  "filter.loss": "虧損",
+  "filter.dateRange": "日期區間",
+
+  // V2 — trades table
+  "trades.col.date": "日期",
+  "trades.col.side": "方向",
+  "trades.col.entry": "進場",
+  "trades.col.exit": "出場",
+  "trades.col.hold": "持倉時長",
+  "trades.col.pnl": "損益",
+  "trades.empty": "此區間無交易紀錄",
+  "trades.loading": "讀取中…",
+
+  // V2 — side labels
+  "side.long": "多",
+  "side.short": "空",
+
+  // V2 — insight panel
+  "insight.title": "AI 建議",
+  "insight.generate": "生成洞察",
+  "insight.empty": "點擊上方按鈕，由 Sonnet 產生本期洞察。",
+  "insight.cached": "已快取",
+  "insight.loading": "Sonnet 思考中…",
+  "insight.error": "生成失敗，請稍後重試",
+
+  // V2 — patterns block
+  "patterns.title": "模式分析",
+
+  // V2 — chart crosshair
+  "crosshair.time": "時間",
+  "crosshair.ohlc": "OHLC",
 } as const;
 
 export type DictKey = keyof typeof dict;
