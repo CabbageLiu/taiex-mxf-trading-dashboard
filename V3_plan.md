@@ -28,10 +28,12 @@ V2 ships round-trip pairing with `pnl_points`. Real trading needs:
 
 ## Backtesting
 
-V2 only attributes live signals. V3 should let the user replay a strategy against historical bars to compare its hypothetical PnL curve against the realised one.
+V2.5 added historical tick backfill (`/admin/backfill`, auto-on-startup) so historical bars can be reconstructed from FinMind's `TaiwanFuturesTick`. The remaining V3 work is the strategy-replay layer on top.
 
-- New module `app/backtest/runner.py` that takes `(strategy_name, params, start, end)` and returns the same `Trade` rows shape, persisted into a separate `backtest_trades` table (or a `mode` column on `trades` to discriminate live vs. backtest).
+- New module `app/backtest/runner.py` that takes `(strategy_name, params, start, end)`, replays the historical bars through `Strategy.on_bar`, and returns trade rows shaped like `Trade`. Persist into a separate `backtest_trades` table (or a `mode` column on `trades` to discriminate live vs. backtest).
 - Frontend `/analysis` filter gains a `live | backtest | both` toggle.
+- Trading-day calendar: V2.5's `_trading_days` is Mon-Fri only — TW holidays still get fetched and return zero rows (wasted API calls). V3 should consult `TaiwanStockTradingDate` (Free dataset) and skip non-trading days.
+- Backfill resume / progress: `/admin/backfill` is synchronous. For multi-month backtests, make it streaming (SSE) or a background job that the frontend can poll.
 
 ## Strategy authoring UX
 

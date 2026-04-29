@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     # stays alive; SYMBOL_DISPLAY decouples the UI label.
     symbol_source: str = Field(default="TXF", alias="SYMBOL_SOURCE")
 
+    # Historical backfill (V2.5) — TaiwanFuturesTick dataset for gap fills
+    # and backtesting.
+    backfill_data_id: str = Field(default="MTX", alias="BACKFILL_DATA_ID")
+    backfill_on_startup_days: int = Field(default=7, alias="BACKFILL_ON_STARTUP_DAYS")
+    backfill_min_ticks_per_day: int = Field(default=1000, alias="BACKFILL_MIN_TICKS_PER_DAY")
+
     # AI insights (Anthropic Claude Sonnet) — V2 strategy analysis page
     anthropic_api_key: SecretStr | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")

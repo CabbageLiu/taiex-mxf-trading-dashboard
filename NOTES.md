@@ -238,6 +238,7 @@ tailscale down
 | FinMind 400 / 401 | Token expired or wrong tier | Check `FINMIND_TOKEN` in `.env`. Sponsor tier required for `taiwan_futures_snapshot` |
 | Chart empty during market hours | First bar hasn't closed yet, or `SYMBOL_SOURCE` set to a `data_id` the FinMind sponsor endpoint doesn't serve | Wait one minute. Confirm `.env` has `SYMBOL_SOURCE=TXF` (or `TMF` / `CDF`). **`MXF` returns 0 rows from `taiwan_futures_snapshot` and freezes the feed** — keep source = TXF, change only `SYMBOL_DISPLAY` if you want a different label. |
 | Price stuck at a specific time during the day | FinMind sponsor endpoint stopped returning new rows for the configured `data_id` | Hit the endpoint manually: `curl -s -H "Authorization: Bearer $FINMIND_TOKEN" "https://api.finmindtrade.com/api/v4/taiwan_futures_snapshot?data_id=TXF" \| jq '.data \| length'`. Zero rows = wrong `data_id` or sponsor tier expired. |
+| Want to fill the gap from when the server was down | Backfill endpoint or wait for next boot | `curl -X POST 'http://127.0.0.1:8000/admin/backfill?start=YYYY-MM-DD&end=YYYY-MM-DD'`. See §7.8. |
 | Status pill stays red | Backend down, DB unreachable, or FinMind throwing | Hover the pill for which subsystem is failing; tail `docker compose logs backend` |
 | `/analysis` AI panel says `伺服器尚未設定 ANTHROPIC_API_KEY` | Key not set in `.env` | Add `ANTHROPIC_API_KEY=sk-ant-…` to `.env`, then `docker compose restart backend` |
 | `/analysis` says rate-limited | More than 5 insights/min/(strategy, ip) | Wait the `Retry-After` seconds shown in the toast; cache hits are free, so reusing a recent filter avoids the limit |
@@ -535,6 +536,82 @@ on next startup. The strategy class itself still uses
   instead. Exceptions are caught and logged but pollute the journal.
 - **No emitting `Signal` with `side` outside the enum** — anything other
   than `LONG / SHORT / EXIT / FLAT` is dropped by the position tracker.
+
+---
+
+## 7.8 Historical backfill (V2.5)
+
+Live FinMind `taiwan_futures_snapshot` is real-time only — every minute the
+server is down loses ticks. V2.5 wires a separate path that pulls those
+ticks back from FinMind's *historical* `TaiwanFuturesTick` dataset and
+inserts them into the same `ticks` table (with `source = "FINMIND_FUTURES_TICK"`
+so live and backfilled rows stay distinguishable).
+
+Two ways to trigger:
+
+**Auto on startup.** Backend boot scans the last `BACKFILL_ON_STARTUP_DAYS`
+days (default 7) for any market day with fewer than `BACKFILL_MIN_TICKS_PER_DAY`
+rows (default 1000) in the `ticks` table, and refetches each. Today is
+always skipped because the historical dataset updates end-of-day.
+
+Set `BACKFILL_ON_STARTUP_DAYS=0` in `.env` to disable.
+
+**Manual endpoint.** Use this for backtesting setup — pull a wide
+historical window once, then run strategies against the resulting bars.
+
+```sh
+curl -X POST 'http://127.0.0.1:8000/admin/backfill?start=2026-04-01&end=2026-04-28'
+```
+
+Response shape:
+```json
+{
+  "start": "2026-04-01",
+  "end": "2026-04-28",
+  "days": [
+    {"day": "2026-04-01", "fetched": 232820, "inserted": 39789, "error": null},
+    ...
+  ],
+  "total_inserted": 195403,
+  "total_fetched": 1164100
+}
+```
+
+`fetched` = rows from FinMind. `inserted` = rows actually persisted; the rest
+collide on the `(ts, symbol)` primary key because FinMind tick data is
+second-precision and many trades share the same second. The discrepancy
+is expected and harmless — the dashboard's smallest bar is 1 minute.
+
+Notes:
+
+- `data_id` defaults to `MTX` (小台 — densest history, ~16k unique seconds
+  per day after dedupe). Set `BACKFILL_DATA_ID=TX` in `.env` if you'd
+  rather backfill the 大台 (matches live `SYMBOL_SOURCE=TXF`).
+- Inserts are chunked at 5000 rows per query to stay under Postgres'
+  65,535-bind-parameter limit.
+- Continuous aggregates have a 30-second auto-refresh policy. After a
+  large historical backfill, the bars views catch up within a minute or
+  two — no manual refresh needed.
+- TaiwanFuturesTick is **Backer/Sponsor tier**. Free tokens get HTTP 402
+  on this dataset.
+- The `/admin/backfill` endpoint is unauthenticated in V2.5 — same gap
+  documented in `V3_plan.md` for the rest of the mutating endpoints. Do
+  not expose it publicly until the auth layer lands.
+
+Verify a backfill landed:
+
+```sh
+docker compose exec db psql -U taiex -d taiex -c \
+  "SELECT date(ts AT TIME ZONE 'Asia/Taipei') AS d,
+          source,
+          count(*)
+   FROM ticks
+   WHERE ts >= NOW() - interval '7 days'
+   GROUP BY d, source
+   ORDER BY d DESC, source;"
+```
+
+Look for `FINMIND_FUTURES_TICK` rows on the days you fetched.
 
 ---
 

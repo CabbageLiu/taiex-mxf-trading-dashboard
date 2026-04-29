@@ -133,12 +133,21 @@ A strategy declares `resolutions: list[str]` and an optional `indicator_specs: d
 
 V2 changed the downstream consequences of a `Signal`: alongside the notifier fan-out, the position tracker pairs LONG/SHORT/EXIT/FLAT into rows in the `trades` table. Same-direction signals are no-ops (no stacking); opposite-direction signals atomically close the open trade and open a fresh one at the same price/timestamp; same-id replays are idempotent. **Strategies that only emit `LONG` (like the V1 `always_long` example) never close a trade, so they never contribute to win-rate or PnL** — pair entries with an exit rule unless you specifically want a watchdog signal. The full pairing truth table and a worked LONG↔SHORT example live in `NOTES.md` §7.
 
+### Historical backfill (V2.5)
+
+`app/ingest/backfill.py` fills the gap between the live `taiwan_futures_snapshot` (real-time only, no history) and the user's expectation that closing the laptop should not lose data. It hits FinMind's historical `TaiwanFuturesTick` dataset (Backer/Sponsor tier) per market day, inserts ticks via the same `ON CONFLICT DO NOTHING` path the live ingest uses (with `source = "FINMIND_FUTURES_TICK"` so the two streams stay distinguishable). Inserts are chunked at 5000 rows/query because Postgres caps a single statement at 65,535 bind parameters and a full day of `MTX` ticks is 200k+ rows.
+
+Two entry points: `BackfillService.backfill_range(start, end)` (manual, exposed at `POST /admin/backfill?start=&end=`) and `BackfillService.backfill_recent(lookback_days)` (auto-fired in lifespan, scans the last N days for under-filled market days and refetches them — `BACKFILL_ON_STARTUP_DAYS=0` to disable).
+
+Today is always skipped during auto-backfill — TaiwanFuturesTick updates end-of-day, so the current session is never complete in the dataset until tonight. The live ingest fills the rest.
+
 ### V2 REST routes (additions only)
 
 - `GET /trades?strategy=&start=&end=&result=win|loss|all&limit=` — list. Date-only `end` strings are interpreted as start-of-next-day exclusive (so a `today` filter does not silently drop intraday trades).
 - `GET /trades/stats?strategy=&start=&end=` — aggregate (`trade_count`, `open_count`, `win_count`, `loss_count`, `win_rate`, `pnl_total`, `pnl_avg_win`, `pnl_avg_loss`, `max_drawdown`, `avg_hold_seconds`). Drawdown is reported as a positive magnitude (peak − cum); UI negates for display.
 - `GET /status` — `{ ok, ingest_running, last_tick_ts, ingest_lag_seconds, strategy_loop_running, position_tracker_running, db_ok, notifiers: { discord, n8n, inapp } }`. Powers the status pill.
 - `POST /insights/strategy` — body `{ strategy, start, end, filter }`, returns `{ cached, generated_at, content }`. 503 when `ANTHROPIC_API_KEY` is unset; 429 when rate-limited (with `Retry-After` header).
+- `POST /admin/backfill?start=YYYY-MM-DD&end=YYYY-MM-DD` — historical tick backfill from FinMind. Returns `{ start, end, days: [{day, fetched, inserted, error}], total_inserted, total_fetched }`. 503 when `FINMIND_TOKEN` is unset.
 
 ### Notifier hub
 
