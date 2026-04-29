@@ -2,6 +2,8 @@
 
 import type { ReactNode } from "react";
 
+import { Skeleton } from "./Skeleton";
+
 export type KpiTone = "neutral" | "up" | "down";
 
 export type KpiCardProps = {
@@ -9,6 +11,7 @@ export type KpiCardProps = {
   value: ReactNode;
   sub?: ReactNode;
   tone?: KpiTone;
+  isLoading?: boolean;
 };
 
 /**
@@ -20,17 +23,21 @@ export type KpiCardProps = {
  * carries a glyph as well as a tone — this card doesn't add one
  * automatically because some KPIs (e.g. trade count) are tone-neutral.
  */
-export function KpiCard({ label, value, sub, tone = "neutral" }: KpiCardProps) {
+export function KpiCard({ label, value, sub, tone = "neutral", isLoading = false }: KpiCardProps) {
   const valueColor =
     tone === "up" ? "var(--up)" : tone === "down" ? "var(--down)" : "var(--ink)";
 
   return (
-    <div className="kpi-card">
+    <div className="kpi-card card-enter">
       <div className="label">{label}</div>
       <div className="num" style={{ color: valueColor }}>
-        {value}
+        {isLoading ? <Skeleton width={100} height={30} /> : value}
       </div>
-      {sub != null && <div className="delta">{sub}</div>}
+      {sub != null && (
+        <div className="delta">
+          {isLoading ? <Skeleton width={80} height={11} /> : sub}
+        </div>
+      )}
     </div>
   );
 }

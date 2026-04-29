@@ -47,3 +47,14 @@ class Strategy(ABC):
 
     @abstractmethod
     def on_bar(self, ev: BarEvent) -> Signal | None: ...
+
+    @classmethod
+    def dump_state(cls, symbol: str) -> dict:
+        """Optional: return current strategy state for a given symbol.
+
+        Strategies that hold module-level / shared state (e.g. open
+        positions, daily confidence scores) override this to expose a
+        snapshot via the /strategies/{name}/state endpoint. Default is
+        an empty dict (stateless strategies).
+        """
+        return {}

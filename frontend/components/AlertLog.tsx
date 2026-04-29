@@ -30,7 +30,7 @@ export function AlertLog({ liveSignals }: { liveSignals: SignalRow[] }) {
   return (
     <>
       <div className="panel alerts">
-        <h3>{t("panel_live_signals")}</h3>
+        <h3 className="section-title">{t("panel_live_signals")}</h3>
         {merged.length === 0 && <div style={{ color: "var(--muted)" }}>{t("state_none")}</div>}
         {merged.map((s, i) => (
           <div key={i} className="row">
@@ -44,7 +44,7 @@ export function AlertLog({ liveSignals }: { liveSignals: SignalRow[] }) {
         ))}
       </div>
       <div className="panel alerts">
-        <h3>{t("panel_alert_delivery")}</h3>
+        <h3 className="section-title">{t("panel_alert_delivery")}</h3>
         {(alerts ?? []).slice(0, 20).map((a: AlertOut) => (
           <div key={a.id} className="row">
             <div>
@@ -52,7 +52,7 @@ export function AlertLog({ liveSignals }: { liveSignals: SignalRow[] }) {
               <span className={a.status === "ok" ? "ok" : "err"}>{a.status}</span>
               {a.http_code != null && <span style={{ color: "var(--muted)" }}> ({a.http_code})</span>}
             </div>
-            <div style={{ color: "var(--muted)", fontSize: 11 }}>
+            <div style={{ color: "var(--muted)", fontSize: "var(--fs-meta)" }}>
               {new Date(a.ts).toLocaleTimeString("zh-Hant-TW", {
                 timeZone: "Asia/Taipei",
                 hour: "2-digit",

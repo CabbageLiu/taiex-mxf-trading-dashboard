@@ -76,7 +76,19 @@ export function TradesTable({ trades, isLoading }: Props) {
   }, [trades]);
 
   return (
-    <table className="trades-table">
+    <table className="trades-table" aria-busy={isLoading} aria-live="polite">
+      <caption
+        style={{
+          position: "absolute",
+          width: 1,
+          height: 1,
+          overflow: "hidden",
+          clip: "rect(0 0 0 0)",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {isLoading ? t("trades.loading") : t("trades.col.date")}
+      </caption>
       <thead>
         <tr>
           <th>{t("trades.col.date")}</th>
@@ -119,7 +131,7 @@ export function TradesTable({ trades, isLoading }: Props) {
 
             return (
               <tr key={tr.id}>
-                <td>{fmtDate(tr.entry_ts)}</td>
+                <td className="tnum">{fmtDate(tr.entry_ts)}</td>
                 <td>
                   <span
                     aria-label={sideLabel}

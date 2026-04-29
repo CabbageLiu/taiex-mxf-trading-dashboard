@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { Settings } from "lucide-react";
 
 import { api, type StrategyOut } from "@/lib/api";
 import { t } from "@/lib/i18n";
@@ -148,7 +149,7 @@ export function StrategySelector() {
                   className="btn"
                   aria-pressed={s.enabled}
                   onClick={() => toggleEnable.mutate({ name: s.name, enabled: !s.enabled })}
-                  style={{ minHeight: 28, padding: "2px 8px", fontSize: 11 }}
+                  style={{ minHeight: 28, padding: "2px 8px", fontSize: "var(--fs-caption)" }}
                 >
                   {s.enabled ? t("btn_on") : t("btn_off")}
                 </button>
@@ -158,7 +159,7 @@ export function StrategySelector() {
                   onClick={() => setEditing(s.name)}
                   title="settings"
                 >
-                  ⚙
+                  <Settings size={16} aria-hidden />
                 </button>
               </div>
             </li>

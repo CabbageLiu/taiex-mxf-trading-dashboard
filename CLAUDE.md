@@ -15,6 +15,18 @@ docker compose down -v      # also nuke ticks/signals/alerts/trades
 
 Browser → `http://localhost:3000`. Backend on `:8000`. DB on `:5432`. Source is bind-mounted; both servers hot-reload on file edits.
 
+**When `frontend/package.json` or `backend/pyproject.toml` changes**, plain `up` is not enough. The `/app/node_modules` (frontend) and `/app/.venv` (backend) mounts are anonymous volumes that Compose v2 preserves across `down`/`up` by stable hash, so a stale volume from a pre-dep-change build will still mask the new image's deps. Run the matching one-liner:
+
+```sh
+# frontend
+docker compose stop frontend && docker rm -v taiex-frontend && docker compose up -d --build frontend
+
+# backend
+docker compose stop backend && docker rm -v taiex-backend && docker compose up -d --build backend
+```
+
+The `-v` flag removes the anon volume; `--build` regenerates the image with the new deps; `up` re-initializes a fresh anon volume from the new image.
+
 ### Host workflow (no Docker)
 
 Use this when you want pytest, ruff, or alembic revisions outside containers.
@@ -141,6 +153,32 @@ Two entry points: `BackfillService.backfill_range(start, end)` (manual, exposed 
 
 Today is always skipped during auto-backfill — TaiwanFuturesTick updates end-of-day, so the current session is never complete in the dataset until tonight. The live ingest fills the rest.
 
+### Data quality fixes (V2.6)
+
+Three pollution paths produced wicks-to-zero / wicks-to-baseline on the chart. All three are now fixed at the ingest boundary; a single shared `app.ingest.constants.PRICE_FLOOR = 1000.0` is the canonical sanity floor.
+
+1. **Zero-priced live ticks.** FinMind `taiwan_futures_snapshot` occasionally returns `close: 0` between trades. The continuous aggregate `min(price)` collapsed to 0 → wicks-to-zero on every bar. `app.adapters.finmind_taiex._rows_to_ticks` now drops rows with `price < PRICE_FLOOR`.
+
+2. **Calendar-spread quotes in the historical backfill.** FinMind `TaiwanFuturesTick` mixes outright single-leg trades (`contract_date='202605'`, price ~39k) with TAIFEX-listed combo orders (`contract_date='202604W5/202605'`, price ~86–700 representing the spread differential). `app.ingest.backfill.FinmindHistoricalClient.fetch_day` rejects rows where `'/' in contract_date` plus the same sub-floor guard.
+
+3. **Multi-contract pollution.** The snapshot endpoint returns ALL contract expiries for a product (TXFE6 front, TXFR1 rolling-front alias, TXFR2 next-week, TXFG6/I6/L6 back-months, TXFC7 far-month at +1000pt carry premium). Inserting all of them as the same symbol made the chart bounce between contracts. `_pick_front_month` now picks one row per poll: prefer `futures_id` ending `R1` (TAIFEX continuous-rolling alias), else highest `total_volume`, tie-break by smallest numeric `contract_date`. The historical backfill applies the analogous filter — count `contract_date` values, keep only the most-traded one per day. **Rows with empty `contract_date` get a free pass** (legacy payload shape compatibility); the filter logs a warning when it can't discriminate.
+
+### TAIFEX after-hours session (V2.6)
+
+The TAIFEX 夜盤 runs `15:00` Taipei through `05:00` the next morning (Mon-Fri evening start; Sat 00:00–05:00 belongs to Friday's session; Sat after 05:00 and all of Sunday are closed). The adapter previously only allowed the regular session `08:45–13:45` and went silent after 13:45 until next morning, which made live ingest dead for two-thirds of TAIFEX trading hours.
+
+Two new settings in `app/config.py`: `night_session_open=15:00`, `night_session_close=05:00`. `FinMindTaiexAdapter._market_open` evaluates day session OR night-evening (Mon-Fri ≥15:00) OR night-overnight (Tue-Sat ≤05:00). `_next_open` walks forward minute-by-minute (bounded at 4 days) — slow but only invoked when the market is closed.
+
+### Recovery scripts (V2.6)
+
+Two one-shot scripts under `backend/scripts/`:
+
+- `purge_zero_ticks.py` — deletes `WHERE price < PRICE_FLOOR` and refreshes all 8 continuous aggregates. Use after ingest fixes when the existing `ticks` rows still contain a small known-bad subset (zero ticks, sub-floor noise) but the bulk is good.
+
+- `wipe_and_rebackfill.py` — `TRUNCATE ticks` + cagg refresh + relies on the next backend restart to re-run auto-backfill with the current ingest logic. Use when the existing data is heterogeneously polluted (e.g. mixed contract expiries) and selective deletion can't help. Destructive — has no env guard, run inside the dev container only.
+
+Both scripts use a separate `AUTOCOMMIT` connection for the `CALL refresh_continuous_aggregate` calls because TimescaleDB rejects them inside a transaction.
+
 ### V2 REST routes (additions only)
 
 - `GET /trades?strategy=&start=&end=&result=win|loss|all&limit=` — list. Date-only `end` strings are interpreted as start-of-next-day exclusive (so a `today` filter does not silently drop intraday trades).
@@ -158,6 +196,8 @@ Today is always skipped during auto-backfill — TaiwanFuturesTick updates end-o
 `app/config.py` uses `pydantic-settings` with `env_file=("../.env", ".env")`, so the same `.env` at repo root works whether commands run from `backend/` or the project root. Settings are cached via `@lru_cache` on `get_settings`. The display symbol (`SYMBOL_DISPLAY`, default `MXF`) is decoupled from the source (`SYMBOL_SOURCE`, default `TXF`) — the adapter labels every tick with `symbol_display`, so the chart can read "MXF" while the data comes from TXF. **Important:** the FinMind sponsor `taiwan_futures_snapshot` endpoint serves `TXF / TMF / CDF` only; `data_id=MXF` returns zero rows and silently freezes the feed. We briefly tried `SYMBOL_SOURCE=MXF` early in V2 — it broke the live feed mid-session — and reverted. TXF and MXF both track the same TAIEX index, so labelling TXF data as MXF in the UI is semantically fine.
 
 V2 added optional Anthropic settings (`anthropic_api_key: SecretStr | None`, `anthropic_model: str = "claude-sonnet-4-6"`, `insights_cache_ttl_seconds`, `insights_cache_max_entries`). When `anthropic_api_key` is unset, `POST /insights/strategy` returns 503 and the frontend AI panel degrades cleanly — the rest of the app works.
+
+V2.6 added `night_session_open` (default `15:00`) and `night_session_close` (default `05:00`) for TAIFEX after-hours coverage — see "TAIFEX after-hours session" above. Override per-deployment via `NIGHT_SESSION_OPEN` / `NIGHT_SESSION_CLOSE` env vars if your broker / data provider has different boundaries.
 
 ### AI insights service (V2)
 
@@ -191,12 +231,91 @@ Live updates merge into the chart in `Chart.tsx`: every `bar_update` WS message 
 
 `lib/queries.ts` (V2) is the single home for TanStack Query hooks: `useStatus`, `useTrades`, `useTradeStats`, `useInsight` (mutation, manual trigger). Components import from there rather than calling `fetch` directly.
 
+V2.6 polish pass: typography scale tokens (`--fs-caption/meta/body/subhead/head/num-lg`) replace hardcoded `font-size` literals across `globals.css` and inline styles; base body lifts 14→15.5 px. Elevation tokens (`--shadow-sm/md/card/pop`) on header, KPI cards, popover, combobox listbox, insight panel. Focus rings on every interactive element via `:focus-visible`. Hover-lift micro-interactions on buttons and pills (with `prefers-reduced-motion` honored). New `Skeleton.tsx` component with shimmer; `KpiCard`, `TradesTable` (`aria-busy` + sr-only caption), and `TradeInsightPanel` accept an `isLoading` prop and render skeletons during initial fetch. Lucide-react icons replace unicode glyphs (`Settings` in `StrategySelector`, `RefreshCw` in `TopBar`).
+
+The TopBar now hosts a manual refresh button (lucide `RefreshCw`, 44×44 touch target, `aria-label="重新整理 K 線"`). Click invalidates `["bars", res]` and `["indicators"]` TanStack Query keys via `useQueryClient`; the button spins (`.spinning` class on `@keyframes spin` from `globals.css`) until both refetches resolve. **Adding a new npm dep requires a backend rebuild flow** — see "When `frontend/package.json` or `backend/pyproject.toml` changes" in the dev-stack section above; plain `docker compose up` reuses a stale anonymous `node_modules` volume and won't pick up new packages.
+
 ### Tests
 
-`backend/tests/` covers indicator math (against straight-uptrend fixtures), notifier hub fan-out + per-channel failure isolation + channel filter, FinMind adapter dedupe + invalid-row tolerance, V2 position tracker (open/close/flip/idempotency/rehydrate), V2 trades API (`compute_stats` win rate / drawdown / avg hold extracted as a pure function specifically so tests can call it without DB), V2 insights cache (TTL + LRU + key sensitivity), V2 insights service (system-prompt persona, `cache_control` marker, JSON-encoded payload escapes a known prompt-injection string), and V2.5 backfill (trading-day filter, FinMind client parse + quota path, `_missing_days` threshold + today-skip, range/recent flows). **57 tests as of V2.5.**
+`backend/tests/` covers indicator math (against straight-uptrend fixtures), notifier hub fan-out + per-channel failure isolation + channel filter, FinMind adapter dedupe + invalid-row tolerance + sub-floor rejection + front-month picker (R1 alias preference, volume-fallback, contract_date tiebreak, NaN-safe coercion) + day/night `_market_open` boundary cases, V2 position tracker (open/close/flip/idempotency/rehydrate), V2 trades API (`compute_stats` win rate / drawdown / avg hold extracted as a pure function specifically so tests can call it without DB), V2 insights cache (TTL + LRU + key sensitivity), V2 insights service (system-prompt persona, `cache_control` marker, JSON-encoded payload escapes a known prompt-injection string), V2.5 backfill (trading-day filter, FinMind client parse + quota path, `_missing_days` threshold + today-skip, range/recent flows), and V2.6 backfill spread/floor/dominant-contract filters. **76 tests as of V2.6.**
+
+**None of the tests require a live database.** When adding a feature that needs DB I/O, mock at the `session_scope()` boundary or extract the SQL-touching logic into a pure function the test can patch directly (this is what `compute_stats` does — the SQL part is in `_query_trades`, the math is separate).
+
+### V3 — Candle merge fix + UI polish + strategy plotting + backtest engine
+
+#### Candle in-progress bar fix
+
+`/bars` (`app/api/routes/bars.py`) now appends `bucket < :cutoff` where `cutoff = _bucket_start(now_utc, resolution)` from `app/ingest/runner.py`. The endpoint returns ONLY closed historical buckets — the WebSocket stream is the sole source of the live in-progress bar. This eliminates the visible "30s reset" of the live candle that the continuous-aggregate-refresh-policy lag was causing.
+
+`Chart.tsx` keeps `lastBarRef` as authoritative for the in-progress bucket. The bars-effect re-overlays `lastBarRef` after `setData(history)` if its `time` is strictly newer than the last historical bar. A `prevResRef` clears `lastBarRef` on resolution change so a stale 1m bar cannot leak into a 5m series. `refetchInterval` on `useQuery(['bars',res])` is `300_000` (5min) — refetch is now a recovery mechanism, not the primary update path.
+
+`IngestRunner` got a watchdog (`_watchdog_loop` + `_watchdog_tick`) that fires every 5s and force-closes any `_open_buckets[res]` older than `3 × RESOLUTION_DELTAS[res]` (3-bar grace covers FinMind's typical reconnect latency). A tombstone set `_closed_buckets` (bounded to 4 entries per resolution) blocks delayed ticks from re-seeding a force-closed bucket, preventing double `bar_close` emits.
+
+#### UI polish (ui-ux-pro-max-guided)
+
+Token additions in `globals.css` (additive only): `--fs-section: 22px`, `--fs-display: 32px`, `--fs-num-xl: 36px`, `--fw-semi: 600`, `--fw-bold: 700`, spacing scale `--space-1..7`, easing tokens `--ease-out/in/spring`, motion tokens `--dur-fast/base/slow`. Bumped `--fs-body` 15.5→16 px, `--fs-subhead` 16→17 px.
+
+Keyframes added (transform/opacity only, with explicit `prefers-reduced-motion: reduce` overrides):
+- `fadeInUp` (`opacity 0→1, translateY(8px)→0`).
+- `underlineGrow` (`scaleX(0)→1, transform-origin: left`).
+- `pulseAccent` (one-shot `box-shadow` ring expansion, no infinite loop).
+
+`.section-title` (Noto Serif TC, `--fs-section`, `--fw-bold`, tight tracking, accent rule via `::after` + `underlineGrow`) is the canonical heading style. Applied to all panel headings (AlertLog, TradeInsightPanel, equity panel, trades panel). KPI card stagger via `:nth-child` `animation-delay: 0/40/80/120ms`. `font-variant-numeric: tabular-nums` on every price/PnL/timestamp column. TopBar refresh button toggles a `.pulse-success` class on completion. Layout grid `1fr 340px` and TW candle palette unchanged.
+
+#### `trade_strat_v1` — multi-timeframe strategy
+
+`app/strategies/examples/trade_strat_v1.py` declares `resolutions = ["5m", "30m", "1d"]`.
+
+- **Entry** (30m): `KD>20` AND `MACD>0` AND `+DI>21`, fires only on rising edge (conditions just turned true).
+- **Exit assist** (5m, substituted from spec's 3m since `RESOLUTIONS` doesn't include 3m): `-DI>23` while LONG → emit EXIT.
+- **TP/SL** (30m): `+220 / -60 pt` checked on bar close.
+- **Daily confidence** (1d): tracks 0..3 long-side and 0..3 short-side condition counts. Display only — never blocks entry.
+- **Discipline**: 1 contract no pyramiding, 5×30m-bar cooldown after exit, freshness filter on rising edge.
+- **Fill convention deviation**: signals fire on bar close (framework limitation). Spec calls for next-bar-open fill — documented in module docstring as deferred.
+
+Strategy is recreated per `bar_close`, so position / cooldown state lives in module-level `_STATE: dict[(name, symbol), _StratState]`. The base `Strategy` ABC now has an optional `dump_state(symbol) -> dict` classmethod (default `{}`); `trade_strat_v1` implements it. `GET /strategies/{name}/state` exposes the snapshot via `app/api/routes/strategies.py`.
+
+#### Chart strategy plot overlays
+
+`Chart.tsx` consumes WS `signal` messages and the `useTrades` hook to render three overlay layers on the price pane:
+
+- **Markers** via lightweight-charts v5 `createSeriesMarkers(series, [])` — entry arrows (red `arrowUp` LONG below bar / green `arrowDown` SHORT above bar) and exit circles (red TP / green SL / accent DI flip). Idempotent on `signal.id` via `seenSignalIdsRef`.
+- **Entry / TP / SL price lines** via `series.createPriceLine(...)` — drawn on entry, torn down on exit. Line styles: entry grey dashed, TP red dotted, SL green dotted.
+- **Entry→exit dashed connector** — single `LineSeries` (dashed grey, `lineWidth: 1`). Segments built from closed `useTrades({strategy, result: "all"})` rows, separated by whitespace data points (`{time}` no `value`) so unrelated trades don't visually link.
+
+`DailyConfidenceBadge.tsx` is a top-right chart overlay for `trade_strat_v1`: 多/空 0..3 dot rows + position summary line. Hidden on cold start. Polls `useStrategyState(name)` every 60s.
+
+#### Backtest engine — Pine-Script Strategy Tester
+
+`app/backtest/engine.py` replays a registered strategy across closed historical bars and produces a Pine-Script-style result. `POST /backtest/run` accepts `{strategy, symbol?, start, end, params?}` and returns `{strategy, symbol, start, end, params, resolutions, bar_counts, signals[], trades[], stats, equity_curve[]}`.
+
+Engine details:
+- `load_bars` per declared resolution (reuses the same `/bars` cutoff that excludes the in-progress bucket — perfect for backtest).
+- Indicators precomputed via `indicator_cache.get` (warm across param sweeps).
+- Schedule interleaves bar_close events from all resolutions chronologically with smaller-resolution-first tie-break (so 5m fires before its containing 30m on a shared boundary).
+- `_swap_state` / `_restore_state` snapshot the strategy module's `_STATE[(name, symbol)]` before the run and restore after, so backtests cannot pollute live in-process state. Convention: any module-level `_STATE: dict` keyed by `(strategy_name, symbol)` is detected automatically; stateless strategies pay nothing.
+- `pair_into_trades` is a pure function mirroring `PositionTracker` (LONG/SHORT/EXIT/FLAT, reverse-on-opposite, no-op same-direction).
+- `compute_backtest_stats` reuses `app.api.routes.trades.compute_stats` via `SimpleNamespace` adapters and adds Pine-Script extras: `profit_factor`, `largest_win`, `largest_loss`, `avg_bars_in_trade`.
+
+Frontend `/backtest` page (`app/backtest/page.tsx`, App Router, Suspense-wrapped) renders form (strategy selector, start/end dates) → KPI strip (8 cards: pnl_total / win_rate / profit_factor / max_drawdown / trade_count / avg_bars_in_trade / largest_win / largest_loss) → equity curve `LineSeries` → trades table. **V4 plans to retire this as a top-level route — see `v4_plan.md`.**
+
+### Tests
+
+`backend/tests/` covers everything from V2.6 plus V3 additions: `/bars` cutoff exclusion, `IngestRunner` watchdog tick + tombstone double-emit guard + grace window, `trade_strat_v1` (dump_state shape, daily confidence count, rising-edge entry, no-repeat-without-reset), `/strategies/{name}/state` route (404 unknown / `{}` stateless / populated stateful), backtest engine (pair logic for long+exit / reverse / same-direction / orphan exit, stats math, equity curve cumulative, end-to-end smoke with stub strategy + patched `load_bars`, state isolation, empty-history + 404). **106 tests as of V3.**
 
 **None of the tests require a live database.** When adding a feature that needs DB I/O, mock at the `session_scope()` boundary or extract the SQL-touching logic into a pure function the test can patch directly (this is what `compute_stats` does — the SQL part is in `_query_trades`, the math is separate).
 
 ### Backlog and security
 
-V2 + V2.5 deferred several gaps to V3 (documented in `V3_plan.md`): CORS still wide open, mutating endpoints unauthenticated (`/strategies/*`, `/insights/strategy`, `/admin/backfill`), no global Anthropic spend cap, reverse-proxy IP gap on the rate limiter, no strategy replay over backfilled bars (the data is now available; the replay layer is not), no TW holiday calendar (V2.5 backfill iterates Mon-Fri including holidays — wasted API calls), `/admin/backfill` synchronous (multi-month windows block; V3 to make it streaming or background), no per-trade fees/slippage, no auth/multi-user. **Do not silently re-introduce these as if they were new ideas — check `V3_plan.md` first.** When working on V3 items, that file is the canonical scope reference.
+V3 shipped: candle in-progress bar fix, watchdog force-close, ui-ux-pro-max polish, `trade_strat_v1`, chart plot overlays (markers / price lines / connector), backtest engine + `/backtest/run`. Items still deferred from V2 / V2.5 (do NOT silently re-introduce as new ideas — check `V3_plan.md`): CORS still wide open, mutating endpoints unauthenticated (`/strategies/*`, `/insights/strategy`, `/admin/backfill`, `/backtest/run`), no global Anthropic spend cap, reverse-proxy IP gap on the rate limiter, no TW holiday calendar (V2.5 backfill iterates Mon-Fri including holidays — wasted API calls), `/admin/backfill` synchronous (multi-month windows block — to make streaming/background), no per-trade fees/slippage, no auth/multi-user.
+
+V2.6 known issues still open: `wipe_and_rebackfill.py` is a destructive script with no environment guard (gate behind env-name assertion), the front-month picker assumes FinMind keeps using the `R1` rolling-alias suffix (log when fallback path triggers, warn if `R1` rows ever disappear from the response), and the dominant-contract backfill filter falls through to "keep everything" when all rows have empty `contract_date` (logs a warning but doesn't fail — decide whether to abort or accept).
+
+V3 introduced new known-issue items, addressed in `v4_plan.md`:
+- `/backtest` is a top-level route. V4 retires it; strategy + window become a global lens that drives `/trading` and `/analysis`. Old bookmarks to `/backtest` should redirect.
+- 即時訊號 / 通知遞送 panels exist visually but the underlying wiring (Discord / n8n configured-state surfacing, signal seeding on mount, persistent test-webhook affordance) is partial. V4 phase 4 makes them first-class.
+- `POST /backtest/run` has no result cache — repeat calls re-run the engine. V4 phase 1 adds an LRU keyed on `(strategy, params, symbol, start, end, module_mtime)`.
+- Backtest engine fills at signal-bar close (no `next_bar_open` mode) and has no commission / slippage / position sizing. V5+.
+- `_STATE` swap convention is module-introspection-based. Reasonable for v1 stateful strategies but brittle if a strategy uses a non-`_STATE` name. Document the convention in any new strategy template.
+
+**`v4_plan.md` is the canonical scope reference for the next session.** It defines the strategy-as-lens model, the right-rail composition on `/trading`, the lens-driven `/analysis`, working alert plumbing (`/alerts/stats`, `/admin/test-webhook`, channel chips), and a 5-phase rollout. Read it before starting V4 work.

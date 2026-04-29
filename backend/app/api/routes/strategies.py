@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.config import get_settings
 from app.db.engine import session_scope
 from app.db.models import Signal as SignalRow
 from app.db.models import StrategyConfig
@@ -95,6 +96,16 @@ async def set_params(name: str, body: ParamsBody) -> dict:
         await s.execute(stmt)
         await s.commit()
     return {"name": name, **set_clause}
+
+
+@router.get("/{name}/state")
+async def strategy_state(name: str) -> dict:
+    cls = all_strategies().get(name)
+    if cls is None:
+        raise HTTPException(404, f"unknown strategy: {name}")
+    symbol = get_settings().symbol_display
+    state = cls.dump_state(symbol)
+    return {"name": name, "symbol": symbol, "state": state}
 
 
 @router.get("/{name}/signals")

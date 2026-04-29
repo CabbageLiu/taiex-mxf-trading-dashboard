@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     timezone: str = Field(default="Asia/Taipei", alias="TIMEZONE")
     market_open: time = Field(default=time(8, 45), alias="MARKET_OPEN")
     market_close: time = Field(default=time(13, 45), alias="MARKET_CLOSE")
+    # TAIFEX 夜盤 (after-hours): 15:00 today through 05:00 the next morning.
+    # Mon-Fri evening starts a session; the following morning continues it.
+    # Saturday morning <=05:00 belongs to Friday's night session; Sat after
+    # 05:00 and all of Sunday are closed.
+    night_session_open: time = Field(default=time(15, 0), alias="NIGHT_SESSION_OPEN")
+    night_session_close: time = Field(default=time(5, 0), alias="NIGHT_SESSION_CLOSE")
     poll_interval_sec: float = Field(default=5.0, alias="POLL_INTERVAL_SEC")
     symbol_display: str = Field(default="MXF", alias="SYMBOL_DISPLAY")
     # FinMind taiwan_futures_snapshot only serves TXF / TMF / CDF on the

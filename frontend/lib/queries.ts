@@ -4,10 +4,13 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 
 import {
   api,
+  type BacktestRequest,
+  type BacktestResponse,
   type InsightRequest,
   type InsightResponse,
   type StatsQuery,
   type StatusResponse,
+  type StrategyState,
   type TradeStats,
   type Trade,
   type TradesQuery,
@@ -38,6 +41,26 @@ export function useTradeStats(filter: StatsQuery = {}) {
     queryKey: ["trade-stats", filter],
     queryFn: () => api.getTradeStats(filter),
     staleTime: STALE_TRADES,
+  });
+}
+
+// Strategy live state — daily confidence + open position. Polled at 60 s
+// because the underlying `_STATE` only mutates on daily / 30 m / 5 m bar
+// closes; a faster cadence wastes round-trips.
+export function useStrategyState(name: string | null | undefined) {
+  return useQuery<StrategyState>({
+    queryKey: ["strategy-state", name],
+    queryFn: () => api.getStrategyState(name as string),
+    enabled: !!name,
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+}
+
+// Backtest — manual mutation, run on form submit.
+export function useBacktest() {
+  return useMutation<BacktestResponse, Error, BacktestRequest>({
+    mutationFn: (body) => api.runBacktest(body),
   });
 }
 

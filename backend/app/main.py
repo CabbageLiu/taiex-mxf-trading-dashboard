@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import (
     alerts,
     backfill,
+    backtest,
     bars,
     indicators,
     insights,
@@ -96,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(status.router, tags=["status"])
     app.include_router(insights.router, prefix="/insights", tags=["insights"])
     app.include_router(backfill.router, prefix="/admin", tags=["admin"])
+    app.include_router(backtest.router)
     app.include_router(ws_router)
 
     @app.get("/health")

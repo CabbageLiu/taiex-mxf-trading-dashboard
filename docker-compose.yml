@@ -2,6 +2,7 @@ services:
   db:
     image: timescale/timescaledb-ha:pg16
     container_name: taiex-timescale
+    restart: unless-stopped
     environment:
       POSTGRES_DB: taiex
       POSTGRES_USER: taiex
@@ -19,6 +20,7 @@ services:
   backend:
     build: ./backend
     container_name: taiex-backend
+    restart: unless-stopped
     env_file: ./.env
     environment:
       DATABASE_URL: postgresql+asyncpg://taiex:taiex@db:5432/taiex
@@ -40,6 +42,7 @@ services:
   frontend:
     build: ./frontend
     container_name: taiex-frontend
+    restart: unless-stopped
     environment:
       API_BASE: http://backend:8000
     depends_on:

@@ -58,6 +58,8 @@ from app.config import get_settings
 from app.db.engine import session_scope
 from app.db.models import Tick as TickRow
 
+from app.ingest.constants import PRICE_FLOOR
+
 log = logging.getLogger("taiex.backfill")
 
 FINMIND_DATA_URL = "https://api.finmindtrade.com/api/v4/data"
@@ -107,15 +109,72 @@ class FinmindHistoricalClient:
         if payload.get("status") == 402:
             raise RuntimeError("FinMind quota exceeded (HTTP 402)")
         rows = payload.get("data") or []
-        log.info("backfill day=%s rows=%d", day, len(rows))
-        return [
-            {
-                "ts": datetime.fromisoformat(str(r["date"])).replace(tzinfo=tz),
-                "price": float(r["price"]),
-            }
-            for r in rows
-            if r.get("date") and r.get("price") is not None
-        ]
+
+        # Pass 1: filter spreads + floor + parse, keeping contract_date around
+        # so pass 2 can pick the dominant outright contract.
+        from collections import Counter
+
+        intermediate: list[dict[str, Any]] = []
+        skipped_spread = 0
+        skipped_floor = 0
+        for r in rows:
+            if not r.get("date") or r.get("price") is None:
+                continue
+            cdate = str(r.get("contract_date") or "")
+            if "/" in cdate:
+                skipped_spread += 1
+                continue
+            try:
+                price = float(r["price"])
+            except (TypeError, ValueError):
+                continue
+            if price < PRICE_FLOOR:
+                skipped_floor += 1
+                continue
+            intermediate.append(
+                {
+                    "ts": datetime.fromisoformat(str(r["date"])).replace(tzinfo=tz),
+                    "price": price,
+                    "contract_date": cdate,
+                }
+            )
+
+        # Pass 2: pick the dominant (most-traded) contract_date — front month.
+        # Mixing back-months (`202606`, `202609`, `202612`) injects carry
+        # premium and produces price discontinuities. Rows with no
+        # contract_date (legacy payload shape) are kept as a free pass so
+        # tests + older data continue to work.
+        counts = Counter(r["contract_date"] for r in intermediate if r["contract_date"])
+        dominant = counts.most_common(1)[0][0] if counts else None
+        if dominant is None and len(intermediate) > 1:
+            # Degenerate: every row has an empty contract_date. We can't
+            # discriminate front vs back-month — flag loudly so we notice
+            # if FinMind's payload shape regresses.
+            log.warning(
+                "backfill day=%s: no contract_date present on any of %d rows; "
+                "front-month filter is a no-op for this batch",
+                day,
+                len(intermediate),
+            )
+        skipped_off_contract = 0
+        clean: list[dict[str, Any]] = []
+        for r in intermediate:
+            if r["contract_date"] and dominant and r["contract_date"] != dominant:
+                skipped_off_contract += 1
+                continue
+            clean.append({"ts": r["ts"], "price": r["price"]})
+
+        log.info(
+            "backfill day=%s rows=%d kept=%d dominant=%s skipped_spread=%d skipped_floor=%d skipped_off_contract=%d",
+            day,
+            len(rows),
+            len(clean),
+            dominant,
+            skipped_spread,
+            skipped_floor,
+            skipped_off_contract,
+        )
+        return clean
 
 
 class BackfillService:

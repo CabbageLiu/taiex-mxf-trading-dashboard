@@ -101,6 +101,79 @@ export type InsightResponse = {
   content: string;
 };
 
+// Backtest engine response — Pine-Script-style strategy tester payload.
+export type BacktestSignal = {
+  ts: string;
+  side: "LONG" | "SHORT" | "EXIT" | "FLAT";
+  price: number;
+  resolution: string;
+  reason: string;
+  payload: Record<string, unknown>;
+};
+
+export type BacktestTrade = {
+  id: number;
+  side: "LONG" | "SHORT";
+  entry_ts: string;
+  entry_price: number;
+  exit_ts: string;
+  exit_price: number;
+  pnl_points: number;
+  hold_seconds: number;
+  bars_held: number;
+  entry_reason: string;
+  exit_reason: string;
+};
+
+export type BacktestStats = TradeStats & {
+  profit_factor: number | null;
+  largest_win: number | null;
+  largest_loss: number | null;
+  avg_bars_in_trade: number | null;
+};
+
+export type BacktestRequest = {
+  strategy: string;
+  symbol?: string;
+  start: string;
+  end: string;
+  params?: Record<string, unknown>;
+};
+
+export type BacktestResponse = {
+  strategy: string;
+  symbol: string;
+  start: string;
+  end: string;
+  params: Record<string, unknown>;
+  resolutions: string[];
+  bar_counts: Record<string, number>;
+  signals: BacktestSignal[];
+  trades: BacktestTrade[];
+  stats: BacktestStats;
+  equity_curve: { ts: string; cumulative_pnl: number }[];
+};
+
+// Strategy live state — generic shape; trade_strat_v1 populates the optional
+// fields below. Strategies without `dump_state` return an empty `state` object.
+export type StrategyStatePosition = {
+  side: "LONG" | "SHORT";
+  entry_price: number;
+  entry_ts: string;
+};
+
+export type StrategyState = {
+  name: string;
+  symbol: string;
+  state: {
+    daily_confidence_long?: number;
+    daily_confidence_short?: number;
+    daily_last_bucket?: string | null;
+    cooldown_left?: number;
+    position?: StrategyStatePosition | null;
+  };
+};
+
 const base = "/api";
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -184,6 +257,16 @@ export const api = {
 
   postInsight: (body: InsightRequest) =>
     fetchJson<InsightResponse>("/insights/strategy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  getStrategyState: (name: string) =>
+    fetchJson<StrategyState>(`/strategies/${encodeURIComponent(name)}/state`),
+
+  runBacktest: (body: BacktestRequest) =>
+    fetchJson<BacktestResponse>("/backtest/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

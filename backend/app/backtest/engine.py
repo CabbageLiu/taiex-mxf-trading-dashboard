@@ -1,0 +1,396 @@
+"""TradingView-style strategy backtest engine.
+
+Replays a registered strategy across closed historical bars and produces
+trades + Pine-Script-Strategy-Tester-style stats. Pure replay — does NOT
+write to the live ``trades`` / ``signals`` tables, does NOT mutate live
+in-process state (module-level ``_STATE`` dicts on stateful strategies are
+saved-and-restored around the run).
+
+v1 deviations from a full Pine-Script strategy:
+  * Fills at signal-bar close (no ``next_bar_open``).
+  * No commission / slippage / position sizing — 1 contract, points-only PnL.
+  * No intraday TP/SL via tick replay — exits are evaluated on the same
+    schedule as the strategy ``on_bar`` callbacks (the strategy must encode
+    its TP/SL checks in ``on_bar`` for them to fire during a backtest).
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from types import SimpleNamespace
+from typing import Any
+
+import pandas as pd
+from pydantic import BaseModel
+
+from app.api.routes.bars import load_bars
+from app.api.routes.trades import compute_stats
+from app.indicators.service import cache as indicator_cache
+from app.ingest.runner import RESOLUTIONS as ALL_RESOLUTIONS
+from app.strategies.base import BarEvent, Signal, Strategy
+from app.strategies.registry import all_strategies
+
+# Tie-break order when multiple resolutions close at the exact same ts.
+# Smaller resolutions fire first so finer-grained logic runs ahead of
+# coarser-grained logic on a shared bucket boundary.
+_RES_RANK = {res: i for i, res in enumerate(ALL_RESOLUTIONS)}
+
+
+class BacktestSignalOut(BaseModel):
+    ts: datetime
+    side: str
+    price: float
+    resolution: str
+    reason: str
+    payload: dict[str, Any]
+
+
+class BacktestTrade(BaseModel):
+    id: int
+    side: str  # "LONG" | "SHORT"
+    entry_ts: datetime
+    entry_price: float
+    exit_ts: datetime
+    exit_price: float
+    pnl_points: float
+    hold_seconds: float
+    bars_held: int
+    entry_reason: str
+    exit_reason: str
+
+
+class BacktestResult(BaseModel):
+    strategy: str
+    symbol: str
+    start: datetime
+    end: datetime
+    params: dict[str, Any]
+    resolutions: list[str]
+    bar_counts: dict[str, int]
+    signals: list[BacktestSignalOut]
+    trades: list[BacktestTrade]
+    stats: dict[str, Any]
+    equity_curve: list[dict[str, Any]]
+
+
+@dataclass
+class _OpenPosition:
+    side: str
+    entry_ts: datetime
+    entry_price: float
+    entry_reason: str
+    entry_resolution: str
+
+
+def _swap_state(strategy_name: str, symbol: str, cls: type[Strategy]) -> Any:
+    """Save and clear a strategy's module-level state for (name, symbol).
+
+    Convention: a strategy module may define ``_STATE: dict`` keyed by
+    ``(strategy_name, symbol)``. If present, replace the entry with a fresh
+    factory-built one for the duration of the backtest, then restore.
+    """
+    mod = sys.modules.get(cls.__module__)
+    if mod is None:
+        return None
+    state = getattr(mod, "_STATE", None)
+    if state is None or not isinstance(state, dict):
+        return None
+    key = (strategy_name, symbol)
+    saved = state.pop(key, None)
+    return (state, key, saved)
+
+
+def _restore_state(saved: Any) -> None:
+    if saved is None:
+        return
+    state, key, prev = saved
+    state.pop(key, None)
+    if prev is not None:
+        state[key] = prev
+
+
+def pair_into_trades(
+    signals: list[Signal],
+    bar_indexes: dict[str, pd.DatetimeIndex],
+) -> list[BacktestTrade]:
+    """Walk signals chronologically, pair entries with exits.
+
+    Mirrors the live PositionTracker rules: same-direction signals are
+    no-ops while a position is open; opposite-direction closes the open
+    trade and opens a new one at the same price/ts; EXIT/FLAT closes any
+    open position. Same-id replays are not a concern here — the engine
+    feeds each signal exactly once.
+    """
+    trades: list[BacktestTrade] = []
+    open_pos: _OpenPosition | None = None
+    next_id = 1
+
+    def _bars_held_for(open_pos: _OpenPosition, exit_ts: datetime) -> int:
+        idx = bar_indexes.get(open_pos.entry_resolution)
+        if idx is None:
+            return 0
+        # Count bar boundaries strictly inside [entry_ts, exit_ts).
+        mask = (idx >= open_pos.entry_ts) & (idx < exit_ts)
+        return int(mask.sum())
+
+    def _close(exit_ts: datetime, exit_price: float, exit_reason: str) -> None:
+        nonlocal open_pos, next_id
+        if open_pos is None:
+            return
+        sign = 1.0 if open_pos.side == "LONG" else -1.0
+        pnl = sign * (exit_price - open_pos.entry_price)
+        hold = (exit_ts - open_pos.entry_ts).total_seconds()
+        trades.append(
+            BacktestTrade(
+                id=next_id,
+                side=open_pos.side,
+                entry_ts=open_pos.entry_ts,
+                entry_price=open_pos.entry_price,
+                exit_ts=exit_ts,
+                exit_price=exit_price,
+                pnl_points=pnl,
+                hold_seconds=hold,
+                bars_held=_bars_held_for(open_pos, exit_ts),
+                entry_reason=open_pos.entry_reason,
+                exit_reason=exit_reason,
+            )
+        )
+        next_id += 1
+        open_pos = None
+
+    for s in signals:
+        side = s.side
+        if side == "LONG" or side == "SHORT":
+            if open_pos is None:
+                open_pos = _OpenPosition(
+                    side=side,
+                    entry_ts=s.ts,
+                    entry_price=s.price,
+                    entry_reason=s.reason,
+                    entry_resolution=s.resolution,
+                )
+            elif open_pos.side != side:
+                _close(s.ts, s.price, f"reverse->{side}")
+                open_pos = _OpenPosition(
+                    side=side,
+                    entry_ts=s.ts,
+                    entry_price=s.price,
+                    entry_reason=s.reason,
+                    entry_resolution=s.resolution,
+                )
+            # same-direction signal while open → no-op.
+        elif side in ("EXIT", "FLAT"):
+            if open_pos is not None:
+                _close(s.ts, s.price, s.reason or side)
+        # any other side label is ignored.
+    return trades
+
+
+def compute_backtest_stats(trades: list[BacktestTrade]) -> dict[str, Any]:
+    """Reuse compute_stats for shared fields, then add Pine-Script extras."""
+    rows = [
+        SimpleNamespace(
+            id=t.id,
+            entry_ts=t.entry_ts,
+            exit_ts=t.exit_ts,
+            pnl_points=t.pnl_points,
+        )
+        for t in trades
+    ]
+    base = compute_stats(rows)
+
+    pnls = [t.pnl_points for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    gross_win = sum(wins)
+    gross_loss = -sum(losses)  # positive magnitude
+    profit_factor: float | None
+    if gross_loss > 0:
+        profit_factor = gross_win / gross_loss
+    elif gross_win > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = None
+
+    largest_win = max(pnls) if pnls else None
+    largest_loss = min(pnls) if pnls else None
+    avg_bars_in_trade = (
+        sum(t.bars_held for t in trades) / len(trades) if trades else None
+    )
+
+    base["profit_factor"] = profit_factor
+    base["largest_win"] = largest_win
+    base["largest_loss"] = largest_loss
+    base["avg_bars_in_trade"] = avg_bars_in_trade
+    return base
+
+
+def build_equity_curve(trades: list[BacktestTrade]) -> list[dict[str, Any]]:
+    """Cumulative PnL curve, one point per closed trade exit."""
+    closed = sorted(trades, key=lambda t: t.exit_ts)
+    out: list[dict[str, Any]] = []
+    cum = 0.0
+    for t in closed:
+        cum += t.pnl_points
+        out.append(
+            {
+                "ts": t.exit_ts.isoformat(),
+                "cumulative_pnl": cum,
+            }
+        )
+    return out
+
+
+def _build_indicators(
+    cls: type[Strategy], bars_per_res: dict[str, pd.DataFrame], symbol: str
+) -> dict[str, dict[str, pd.DataFrame]]:
+    out: dict[str, dict[str, pd.DataFrame]] = {res: {} for res in bars_per_res}
+    for res, bars in bars_per_res.items():
+        if bars.empty:
+            continue
+        for label, spec in cls.indicator_specs.items():
+            kind = spec["kind"]
+            params = spec.get("params", {})
+            out[res][label] = indicator_cache.get(symbol, res, kind, params, bars)
+    return out
+
+
+def _schedule(bars_per_res: dict[str, pd.DataFrame]) -> list[tuple[pd.Timestamp, str]]:
+    items: list[tuple[pd.Timestamp, str]] = []
+    for res, bars in bars_per_res.items():
+        for ts in bars.index:
+            items.append((ts, res))
+    items.sort(key=lambda p: (p[0], _RES_RANK.get(p[1], 99)))
+    return items
+
+
+@dataclass
+class _RunInputs:
+    cls: type[Strategy]
+    params: BaseModel
+    symbol: str
+    start: datetime
+    end: datetime
+    bars_per_res: dict[str, pd.DataFrame] = field(default_factory=dict)
+    inds_per_res: dict[str, dict[str, pd.DataFrame]] = field(default_factory=dict)
+
+
+async def _gather_inputs(
+    cls: type[Strategy], symbol: str, start: datetime, end: datetime
+) -> _RunInputs:
+    bars_per_res: dict[str, pd.DataFrame] = {}
+    for res in cls.resolutions:
+        df = await load_bars(symbol, res, start=start, end=end, limit=None)
+        bars_per_res[res] = df
+    return _RunInputs(
+        cls=cls,
+        params=cls.params_schema(),  # placeholder; caller overwrites
+        symbol=symbol,
+        start=start,
+        end=end,
+        bars_per_res=bars_per_res,
+    )
+
+
+async def run_backtest(
+    *,
+    strategy_name: str,
+    symbol: str | None,
+    start: datetime,
+    end: datetime,
+    params_override: dict[str, Any] | None = None,
+) -> BacktestResult:
+    cls = all_strategies().get(strategy_name)
+    if cls is None:
+        raise KeyError(strategy_name)
+    if not cls.resolutions:
+        raise ValueError(f"strategy {strategy_name} declares no resolutions")
+    if start >= end:
+        raise ValueError("start must be before end")
+
+    from app.config import get_settings
+
+    sym = symbol or get_settings().symbol_display
+
+    try:
+        params = cls.params_schema(**(params_override or {}))
+    except Exception as e:  # pydantic validation
+        raise ValueError(f"invalid params: {e}") from None
+
+    bars_per_res: dict[str, pd.DataFrame] = {}
+    for res in cls.resolutions:
+        df = await load_bars(sym, res, start=start, end=end, limit=None)
+        bars_per_res[res] = df
+
+    if all(df.empty for df in bars_per_res.values()):
+        return BacktestResult(
+            strategy=strategy_name,
+            symbol=sym,
+            start=start,
+            end=end,
+            params=params.model_dump(),
+            resolutions=list(cls.resolutions),
+            bar_counts={r: 0 for r in cls.resolutions},
+            signals=[],
+            trades=[],
+            stats=compute_backtest_stats([]),
+            equity_curve=[],
+        )
+
+    inds_per_res = _build_indicators(cls, bars_per_res, sym)
+    schedule = _schedule(bars_per_res)
+    bar_indexes = {r: df.index for r, df in bars_per_res.items()}
+
+    saved = _swap_state(strategy_name, sym, cls)
+    signals: list[Signal] = []
+    try:
+        for ts, res in schedule:
+            bars_slice = bars_per_res[res].loc[:ts]
+            inds_slice = {
+                k: df.loc[:ts] for k, df in inds_per_res.get(res, {}).items()
+            }
+            ev = BarEvent(
+                symbol=sym,
+                resolution=res,
+                bucket=ts.to_pydatetime(),
+                bars=bars_slice,
+                indicators=inds_slice,
+            )
+            strat = cls(params=params)
+            sig = strat.on_bar(ev)
+            if sig is not None:
+                signals.append(sig)
+    finally:
+        _restore_state(saved)
+
+    trades = pair_into_trades(signals, bar_indexes)
+    stats = compute_backtest_stats(trades)
+    equity = build_equity_curve(trades)
+
+    sig_out = [
+        BacktestSignalOut(
+            ts=s.ts,
+            side=s.side,
+            price=s.price,
+            resolution=s.resolution,
+            reason=s.reason,
+            payload=s.payload or {},
+        )
+        for s in signals
+    ]
+
+    return BacktestResult(
+        strategy=strategy_name,
+        symbol=sym,
+        start=start,
+        end=end,
+        params=params.model_dump(),
+        resolutions=list(cls.resolutions),
+        bar_counts={r: len(df) for r, df in bars_per_res.items()},
+        signals=sig_out,
+        trades=trades,
+        stats=stats,
+        equity_curve=equity,
+    )

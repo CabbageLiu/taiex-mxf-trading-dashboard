@@ -51,9 +51,15 @@ class IngestRunner:
         self._settings = get_settings()
         self._adapter: MarketDataAdapter = adapter or FinMindTaiexAdapter()
         self._task: asyncio.Task[None] | None = None
+        self._watchdog_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._subscribers: dict[str, set[asyncio.Queue]] = defaultdict(set)
         self._open_buckets: dict[str, datetime] = {}
+        # Tombstones: bucket starts that have already been bar_close'd, kept
+        # per-resolution so a delayed tick for an already-retired bucket can
+        # be ignored instead of re-seeding `_open_buckets` and producing a
+        # second close on the next bucket boundary.
+        self._closed_buckets: dict[str, list[datetime]] = defaultdict(list)
         self._last_tick: Tick | None = None
 
     async def start(self) -> None:
@@ -61,6 +67,9 @@ class IngestRunner:
             return
         self._stop.clear()
         self._task = asyncio.create_task(self._run(), name="ingest-runner")
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(), name="ingest-watchdog"
+        )
 
     async def stop(self) -> None:
         self._stop.set()
@@ -71,6 +80,13 @@ class IngestRunner:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._watchdog_task = None
 
     def subscribe(self, resolution: str) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1024)
@@ -114,11 +130,60 @@ class IngestRunner:
         await self._persist([tick])
         for res in RESOLUTIONS:
             bucket = _bucket_start(tick.ts, res)
+            # If the watchdog already retired this bucket, ignore the tick —
+            # otherwise we'd re-seed `_open_buckets[res]` and emit a duplicate
+            # bar_close when the next boundary crosses.
+            if bucket in self._closed_buckets[res]:
+                continue
             prev = self._open_buckets.get(res)
             if prev is not None and bucket != prev:
                 await self._emit_close(res, prev)
+                self._mark_closed(res, prev)
             self._open_buckets[res] = bucket
             await self._emit_update(res, bucket, tick)
+
+    async def _watchdog_tick(self) -> None:
+        """Force-close any open bucket that is clearly stale.
+
+        During quiet trading periods (night session, day-night gap, end of
+        session) the regular close path waits for the *next* tick to cross a
+        boundary. If no tick arrives, the bucket would stay "open" forever.
+
+        Threshold: ``3 * delta`` covers FinMind's typical reconnect/backoff
+        latency (the live stream pauses up to ~10s on transient errors plus
+        the adapter's own retry); two buckets of grace is enough breathing
+        room before we declare a bucket stale, while still catching the
+        long-quiet case before subscribers notice the freeze.
+        """
+        now = datetime.now(self._settings.tz)
+        for res, bucket in list(self._open_buckets.items()):
+            delta = RESOLUTION_DELTAS[res]
+            if now - bucket >= 3 * delta:
+                await self._emit_close(res, bucket)
+                # Remove so we don't re-emit on the next pass. Tombstone the
+                # bucket so a delayed tick for the same bucket cannot re-seed
+                # _open_buckets and trigger a second bar_close.
+                self._open_buckets.pop(res, None)
+                self._mark_closed(res, bucket)
+
+    def _mark_closed(self, res: str, bucket: datetime) -> None:
+        """Record ``bucket`` as already-closed for ``res``; bound history to 4 entries."""
+        tombstones = self._closed_buckets[res]
+        if bucket in tombstones:
+            return
+        tombstones.append(bucket)
+        if len(tombstones) > 4:
+            tombstones.pop(0)
+
+    async def _watchdog_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(5)
+                await self._watchdog_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("watchdog tick failed; continuing")
 
     async def _persist(self, ticks: list[Tick]) -> None:
         if not ticks:

@@ -81,7 +81,7 @@ export function TradeFilterBar({ filter, onChange }: Props) {
           display: "inline-flex",
           alignItems: "center",
           gap: 8,
-          fontSize: 12,
+          fontSize: "var(--fs-caption)",
           color: "var(--ink-muted)",
           letterSpacing: "0.06em",
         }}
@@ -104,7 +104,7 @@ export function TradeFilterBar({ filter, onChange }: Props) {
 
       <span
         style={{
-          fontSize: 12,
+          fontSize: "var(--fs-caption)",
           color: "var(--ink-muted)",
           letterSpacing: "0.06em",
         }}

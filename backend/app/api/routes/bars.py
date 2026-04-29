@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from app.config import get_settings
 from app.db.engine import session_scope
+from app.ingest.runner import _bucket_start
 
 router = APIRouter(prefix="/bars", tags=["bars"])
 
@@ -38,6 +39,15 @@ async def load_bars(
     if end is not None:
         where.append("bucket <= :end")
         params["end"] = end
+    # Exclude the current in-progress bucket — the continuous aggregate
+    # refreshes every ~30 s, so the in-progress bucket is up to 30 s stale.
+    # The live WebSocket stream is the sole source of the in-progress bar.
+    now_utc = datetime.now(UTC)
+    cutoff = _bucket_start(now_utc, resolution)
+    where.append("bucket < :cutoff")
+    params["cutoff"] = cutoff
+    where.append("low > 0")
+    where.append("high > 0")
     sql = f"SELECT bucket, open, high, low, close, tick_count FROM {view} WHERE " + " AND ".join(
         where
     ) + " ORDER BY bucket"
@@ -66,7 +76,7 @@ async def get_bars(
 ) -> dict:
     sym = symbol or get_settings().symbol_display
     if end is None:
-        end = datetime.now(timezone.utc)
+        end = datetime.now(UTC)
     if start is None and limit is None:
         start = end - timedelta(days=2)
     df = await load_bars(sym, res, start=start, end=end, limit=limit)

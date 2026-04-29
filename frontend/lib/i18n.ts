@@ -37,6 +37,27 @@ export const dict = {
   // V2 — navigation
   "nav.trading": "交易",
   "nav.analysis": "分析",
+  "nav.backtest": "回測",
+
+  // Backtest
+  "bt.title": "策略回測",
+  "bt.strategy": "策略",
+  "bt.start": "起始日",
+  "bt.end": "結束日",
+  "bt.run": "執行回測",
+  "bt.running": "執行中…",
+  "bt.empty": "選擇策略與區間後點擊執行。",
+  "bt.error": "回測失敗：",
+  "bt.equity": "淨值曲線",
+  "bt.tradesTitle": "交易明細",
+  "bt.cols.entry": "進場",
+  "bt.cols.exit": "出場",
+  "bt.cols.bars": "K 棒數",
+  "bt.cols.reason": "原因",
+  "kpi.profitFactor": "獲利因子",
+  "kpi.avgBars": "平均持倉 K 棒",
+  "kpi.largestWin": "最大單筆獲利",
+  "kpi.largestLoss": "最大單筆虧損",
 
   // V2 — status pill
   "status.ok": "連線正常",

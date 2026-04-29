@@ -109,7 +109,7 @@ export function IndicatorToggleBar({ state, onChange }: Props) {
               }
               onClick={(e) => e.stopPropagation()}
               style={{
-                fontSize: 11, padding: "1px 4px", minHeight: 22,
+                fontSize: "var(--fs-meta)", padding: "1px 4px", minHeight: 22,
                 background: "var(--panel)", color: "var(--ink)",
               }}
               aria-label="MA kind"

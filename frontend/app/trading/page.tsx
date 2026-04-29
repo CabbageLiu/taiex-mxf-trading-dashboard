@@ -1,7 +1,8 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useMemo, useState } from "react";
 
 import { Chart, type IndicatorState } from "@/components/Chart";
 import { TopBar } from "@/components/TopBar";
@@ -17,15 +18,33 @@ const DEFAULT_INDICATORS: IndicatorState = {
   dmi: { enabled: false },
 };
 
-export default function TradingPage() {
+function TradingPageInner() {
+  const sp = useSearchParams();
+  const strategy = sp.get("s");
   const [res, setRes] = useState<Resolution>("1m");
   const [ind, setInd] = useState<IndicatorState>(DEFAULT_INDICATORS);
   const [signals, setSignals] = useState<SignalRow[]>([]);
+  const qc = useQueryClient();
+  const [refreshing, setRefreshing] = useState(false);
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["bars", res] }),
+        qc.invalidateQueries({ queryKey: ["indicators"] }),
+      ]);
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const barsQ = useQuery({
     queryKey: ["bars", res],
     queryFn: () => api.bars({ res, limit: 500 }),
-    refetchInterval: 30_000,
+    // Refetch is a recovery mechanism (catch missed WS messages, recover
+    // after sleep). The WS is the primary update path for the in-progress
+    // bar; refetching every 30 s caused a visible reset of the live candle.
+    refetchInterval: 300_000,
   });
 
   const enabledKinds = useMemo(() => {
@@ -47,7 +66,8 @@ export default function TradingPage() {
     queryKey: ["indicators", res, enabledKinds, indicatorParams],
     queryFn: () => api.indicators({ res, kinds: enabledKinds, paramSpecs: indicatorParams }),
     enabled: enabledKinds.length > 0,
-    refetchInterval: 30_000,
+    // See note on barsQ — refetch is recovery only, not the primary path.
+    refetchInterval: 300_000,
   });
 
   return (
@@ -58,6 +78,8 @@ export default function TradingPage() {
           onResolutionChange={setRes}
           indicators={ind}
           onIndicatorsChange={setInd}
+          onRefresh={handleRefresh}
+          isRefreshing={refreshing}
         />
         <div style={{ flex: 1, minHeight: 0 }}>
           <Chart
@@ -65,6 +87,7 @@ export default function TradingPage() {
             bars={barsQ.data?.bars ?? []}
             indicators={indQ.data?.series ?? {}}
             state={ind}
+            strategy={strategy}
             onSignal={(m) => {
               if (m.type !== "signal") return;
               setSignals((prev) => [...prev, {
@@ -80,5 +103,13 @@ export default function TradingPage() {
         <AlertLog liveSignals={signals} />
       </aside>
     </div>
+  );
+}
+
+export default function TradingPage() {
+  return (
+    <Suspense fallback={null}>
+      <TradingPageInner />
+    </Suspense>
   );
 }

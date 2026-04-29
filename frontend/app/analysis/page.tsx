@@ -86,6 +86,7 @@ function AnalysisContent() {
 
   const stats = statsQuery.data;
   const trades = tradesQuery.data;
+  const statsLoading = statsQuery.isLoading || statsQuery.isPending;
 
   const winRateTone =
     stats?.win_rate == null
@@ -126,6 +127,7 @@ function AnalysisContent() {
                 : "—"
             }
             tone={winRateTone}
+            isLoading={statsLoading}
           />
           <KpiCard
             label={t("kpi.trades")}
@@ -136,6 +138,7 @@ function AnalysisContent() {
                 : undefined
             }
             tone="neutral"
+            isLoading={statsLoading}
           />
           <KpiCard
             label={t("kpi.pnl")}
@@ -146,6 +149,7 @@ function AnalysisContent() {
             }
             sub={t("kpi.unit.points")}
             tone={pnlTone}
+            isLoading={statsLoading}
           />
           <KpiCard
             label={t("kpi.drawdown")}
@@ -160,6 +164,7 @@ function AnalysisContent() {
                 ? "down"
                 : "neutral"
             }
+            isLoading={statsLoading}
           />
         </div>
 
@@ -174,7 +179,12 @@ function AnalysisContent() {
       </div>
 
       <aside style={{ position: "sticky", top: 24 }}>
-        <TradeInsightPanel filter={filter} stats={stats} trades={trades} />
+        <TradeInsightPanel
+          filter={filter}
+          stats={stats}
+          trades={trades}
+          isLoading={statsLoading || tradesQuery.isLoading || tradesQuery.isPending}
+        />
       </aside>
     </div>
   );

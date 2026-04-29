@@ -18,6 +18,42 @@
   --rule: #e2dccf;
   --accent: #a8773d;         /* sumi gold */
   --radius-panel: 2px;
+
+  /* V2.5 typography scale */
+  --fs-caption: 12px;
+  --fs-meta: 13px;
+  --fs-body: 16px;
+  --fs-subhead: 17px;
+  --fs-head: 19px;
+  --fs-num-lg: 30px;
+
+  /* V2.6 (Track C) editorial typography + motion tokens */
+  --fs-section: 22px;
+  --fs-display: 32px;
+  --fs-num-xl: 36px;
+  --fw-semi: 600;
+  --fw-bold: 700;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  --ease-out: cubic-bezier(.2,.8,.2,1);
+  --ease-in: cubic-bezier(.4,0,1,1);
+  --ease-spring: cubic-bezier(.34,1.56,.64,1);
+  --dur-fast: 140ms;
+  --dur-base: 220ms;
+  --dur-slow: 320ms;
+
+  /* V2.5 elevation */
+  --shadow-sm: 0 1px 2px rgba(31, 29, 26, 0.04);
+  --shadow-md: 0 2px 8px rgba(31, 29, 26, 0.06);
+  --shadow-card: 0 1px 3px rgba(31, 29, 26, 0.05), 0 0 0 1px var(--rule);
+  --shadow-pop: 0 8px 24px rgba(31, 29, 26, 0.10);
 }
 
 * { box-sizing: border-box; }
@@ -28,8 +64,9 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: "Noto Sans TC", ui-sans-serif, system-ui, -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif;
-  font-size: 14px;
+  font-size: var(--fs-body);
   font-weight: 400;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   font-feature-settings: "tnum" on, "lnum" on;
@@ -57,14 +94,17 @@ h1, h2, h3, h4, .brand {
   padding: 0 24px;
   height: 56px;
   border-bottom: 1px solid var(--rule);
+  box-shadow: var(--shadow-sm);
   background: var(--panel);
   flex: 0 0 auto;
 }
 
 .shell-header .brand {
-  font-size: 16px;
+  font-size: var(--fs-section);
+  font-weight: var(--fw-bold);
   color: var(--ink);
-  letter-spacing: 0.04em;
+  letter-spacing: -0.01em;
+  font-family: "Noto Serif TC", "Songti TC", "PingFang TC", serif;
 }
 
 .shell-nav {
@@ -81,16 +121,27 @@ h1, h2, h3, h4, .brand {
   min-height: 44px;
   color: var(--ink-muted);
   text-decoration: none;
-  font-size: 14px;
-  border-bottom: 2px solid transparent;
-  transition: color 120ms ease, border-color 120ms ease;
+  font-size: var(--fs-body);
+  position: relative;
+  transition: color var(--dur-fast) var(--ease-out);
 }
 
 .nav-link:hover { color: var(--ink); }
 
 .nav-link.active {
   color: var(--ink);
-  border-bottom-color: var(--accent);
+  font-weight: var(--fw-semi);
+}
+.nav-link.active::after {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 0;
+  height: 2px;
+  background: var(--accent);
+  transform-origin: left;
+  animation: underlineGrow var(--dur-slow) var(--ease-out) both;
 }
 
 .shell-spacer { flex: 1 1 auto; }
@@ -160,7 +211,7 @@ h1, h2, h3, h4, .brand {
   border: 1px solid var(--rule);
   border-radius: var(--radius-panel);
   padding: 6px 12px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   font-family: inherit;
   cursor: pointer;
   min-height: 32px;
@@ -186,7 +237,7 @@ h1, h2, h3, h4, .brand {
   background: transparent;
   color: var(--ink);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   letter-spacing: 0.04em;
   cursor: pointer;
 }
@@ -199,7 +250,7 @@ h1, h2, h3, h4, .brand {
 .indicator-pill .period-input {
   width: 42px;
   padding: 1px 4px;
-  font-size: 11px;
+  font-size: var(--fs-caption);
   border: 1px solid var(--rule);
   background: var(--panel);
   color: var(--ink);
@@ -216,7 +267,7 @@ h1, h2, h3, h4, .brand {
   border-radius: 999px;
   background: transparent;
   color: var(--ink-muted);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   cursor: pointer;
 }
 .filter-pill:hover { border-color: var(--accent); color: var(--accent); }
@@ -231,12 +282,9 @@ h1, h2, h3, h4, .brand {
   padding: 16px 20px;
   border-bottom: 1px solid var(--rule);
 }
-.panel h3 {
-  margin: 0 0 12px;
-  font-size: 13px;
-  color: var(--ink-muted);
-  letter-spacing: 0.08em;
-}
+/* `.panel h3` styling intentionally removed — h3 elements in panels now
+   use `.section-title` (see Track C §section-title) for editorial
+   typography with the accent underline. */
 
 .row {
   display: flex;
@@ -246,13 +294,13 @@ h1, h2, h3, h4, .brand {
   padding: 6px 0;
 }
 
-.alerts { font-size: 13px; }
+.alerts { font-size: var(--fs-meta); }
 .alerts .ok  { color: var(--down); }   /* delivery-ok: muted green */
 .alerts .err { color: var(--up); }      /* delivery-error: muted red */
 
 .tag {
   display: inline-block;
-  font-size: 11px;
+  font-size: var(--fs-caption);
   padding: 2px 8px;
   border-radius: 999px;
   background: var(--panel-2);
@@ -270,7 +318,7 @@ input[type="number"], input[type="date"], select, input[type="text"] {
   border: 1px solid var(--rule);
   border-radius: var(--radius-panel);
   padding: 5px 8px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   font-family: inherit;
   min-height: 32px;
 }
@@ -291,7 +339,7 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   border-radius: 999px;
   background: var(--panel);
   color: var(--ink-muted);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   letter-spacing: 0.04em;
   position: relative;
 }
@@ -316,7 +364,7 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   border: 1px solid var(--rule);
   border-radius: var(--radius-panel);
   color: var(--ink);
-  font-size: 11px;
+  font-size: var(--fs-caption);
   line-height: 1.5;
   white-space: nowrap;
   display: none;
@@ -348,6 +396,7 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   background: var(--panel);
   border: 1px solid var(--rule);
   border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-pop);
   z-index: 20;
   list-style: none;
   margin: 0;
@@ -359,7 +408,7 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   justify-content: space-between;
   gap: 8px;
   padding: 6px 10px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   cursor: pointer;
   min-height: 36px;
 }
@@ -367,7 +416,7 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   background: rgba(168, 119, 61, 0.08);
   color: var(--accent);
 }
-.combo-row .meta { font-size: 11px; color: var(--ink-muted); }
+.combo-row .meta { font-size: var(--fs-caption); color: var(--ink-muted); }
 .combo-row .controls { display: flex; align-items: center; gap: 4px; }
 .combo-row.is-active {
   border-left: 2px solid var(--accent);
@@ -384,7 +433,7 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 14px;
+  font-size: var(--fs-body);
 }
 .icon-btn:hover { color: var(--accent); border-color: var(--rule); }
 
@@ -398,11 +447,11 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   border-radius: var(--radius-panel);
   padding: 12px 14px;
   z-index: 25;
-  box-shadow: none;
+  box-shadow: var(--shadow-pop);
 }
 .popover h4 {
   margin: 0 0 10px;
-  font-size: 13px;
+  font-size: var(--fs-subhead);
   color: var(--ink-muted);
   letter-spacing: 0.08em;
 }
@@ -433,43 +482,58 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   border-radius: var(--radius-panel);
   padding: 14px 16px;
   background: var(--panel);
+  box-shadow: var(--shadow-card);
+  transition: transform var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
+}
+.kpi-card:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
 }
 .kpi-card .label {
-  font-size: 11px;
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-semi);
   color: var(--ink-muted);
-  letter-spacing: 0.12em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
 }
 .kpi-card .num {
   font-family: "Noto Serif TC", serif;
-  font-weight: 500;
-  font-size: 28px;
+  font-weight: var(--fw-semi);
+  font-size: var(--fs-num-lg);
   margin-top: 6px;
   color: var(--ink);
   font-variant-numeric: tabular-nums;
 }
 .kpi-card .delta {
   margin-top: 4px;
-  font-size: 11px;
+  font-size: var(--fs-caption);
   color: var(--ink-muted);
   font-variant-numeric: tabular-nums;
 }
 .kpi-card .delta.up   { color: var(--up); }
 .kpi-card .delta.down { color: var(--down); }
 
+/* Stagger entry for the four KPI cards on the analysis strip
+   (per §7 stagger-sequence — 30-50 ms per item). */
+.kpi-strip > .kpi-card.card-enter:nth-child(1) { animation-delay: 0ms; }
+.kpi-strip > .kpi-card.card-enter:nth-child(2) { animation-delay: 40ms; }
+.kpi-strip > .kpi-card.card-enter:nth-child(3) { animation-delay: 80ms; }
+.kpi-strip > .kpi-card.card-enter:nth-child(4) { animation-delay: 120ms; }
+
 /* ─── Trades table ────────────────────────────────────────────────────────── */
 
 .trades-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: var(--fs-meta);
 }
 .trades-table thead th {
   text-align: left;
   padding: 10px 12px;
   border-bottom: 1px solid var(--rule);
-  font-weight: 500;
-  font-size: 11px;
+  font-weight: var(--fw-semi);
+  font-size: var(--fs-caption);
   color: var(--ink-muted);
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -479,8 +543,12 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   border-bottom: 1px solid var(--rule);
   color: var(--ink);
 }
+.trades-table tbody tr {
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
 .trades-table tbody tr:hover { background: rgba(168, 119, 61, 0.04); }
 .trades-table td.num { font-variant-numeric: tabular-nums; text-align: right; }
+.trades-table td.tnum { font-variant-numeric: tabular-nums; }
 .trades-table td.win  { color: var(--up); }
 .trades-table td.loss { color: var(--down); }
 .trades-table .empty {
@@ -506,30 +574,27 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   border-radius: var(--radius-panel);
   padding: 16px;
   background: var(--panel);
+  box-shadow: var(--shadow-card);
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
-.insight-panel h4 {
-  margin: 0 0 8px;
-  font-size: 13px;
-  color: var(--ink-muted);
-  letter-spacing: 0.08em;
-}
+/* h4 → h3 promotion: section headings in the insight panel now use
+   `.section-title` instead of the legacy muted-uppercase look. */
 .insight-panel ul {
   margin: 0;
   padding: 0 0 0 18px;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   line-height: 1.7;
   color: var(--ink);
 }
 .insight-panel .empty {
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--ink-muted);
   line-height: 1.6;
 }
 .insight-panel .meta {
-  font-size: 11px;
+  font-size: var(--fs-caption);
   color: var(--ink-muted);
   margin-top: 8px;
   font-variant-numeric: tabular-nums;
@@ -546,7 +611,7 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   background: rgba(251, 247, 238, 0.92);
   border: 1px solid var(--rule);
   border-radius: var(--radius-panel);
-  font-size: 11px;
+  font-size: var(--fs-caption);
   color: var(--ink);
   pointer-events: none;
   z-index: 5;
@@ -576,6 +641,86 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   to   { transform: rotate(360deg); }
 }
 
+/* ─── V2.6 (Track C) editorial polish ────────────────────────────────────── */
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes underlineGrow {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+
+@keyframes pulseAccent {
+  0%   { box-shadow: 0 0 0 0 rgba(168, 119, 61, 0.55); }
+  60%  { box-shadow: 0 0 0 6px rgba(168, 119, 61, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(168, 119, 61, 0); }
+}
+
+.section-title {
+  font-family: "Noto Serif TC", "Songti TC", "PingFang TC", serif;
+  font-size: var(--fs-section);
+  font-weight: var(--fw-bold);
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  color: var(--ink);
+  position: relative;
+  padding-bottom: var(--space-2);
+  margin: 0 0 var(--space-3) 0;
+}
+.section-title::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 32px;
+  height: 2px;
+  background: var(--accent);
+  transform-origin: left;
+  animation: underlineGrow var(--dur-slow) var(--ease-out) both;
+}
+
+.card-enter {
+  animation: fadeInUp var(--dur-base) var(--ease-out) both;
+}
+
+.pulse-success {
+  animation: pulseAccent var(--dur-slow) var(--ease-out) 1;
+}
+
+/* ─── Focus visibility (a11y) ─────────────────────────────────────────────── */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[role="button"]:focus-visible,
+[role="combobox"]:focus-visible,
+[role="option"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-panel);
+}
+
+/* Hover lift on primary action surfaces — transform/box-shadow only
+   per §7 transform-performance (never animate width/height/top/left). */
+.btn, .icon-btn, .filter-pill, .indicator-pill {
+  transition: transform var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              color var(--dur-fast) var(--ease-out),
+              background-color var(--dur-fast) var(--ease-out);
+}
+.btn:hover, .icon-btn:hover, .filter-pill:hover, .indicator-pill:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
+}
+.btn:active, .icon-btn:active, .filter-pill:active, .indicator-pill:active {
+  transform: translateY(0);
+}
+
 /* ─── Reduced motion ──────────────────────────────────────────────────────── */
 
 @media (prefers-reduced-motion: reduce) {
@@ -586,4 +731,215 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+  /* Explicit override for Track C custom keyframes (§7 reduced-motion HIGH). */
+  .section-title::after,
+  .card-enter,
+  .pulse-success,
+  .nav-link.active::after,
+  .confidence-badge {
+    animation: none !important;
+  }
+}
+
+.spinning {
+  animation: spin 1s linear infinite;
+}
+
+.refresh-btn {
+  width: 44px;
+  height: 44px;
+  font-size: var(--fs-body);
+}
+.refresh-btn:disabled { opacity: 0.6; cursor: wait; }
+
+/* ─── Backtest page ───────────────────────────────────────────────────────── */
+
+.bt-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  max-width: 1280px;
+  margin: 0 auto;
+}
+.bt-title { margin-bottom: var(--space-2); }
+.bt-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 220px) 160px 160px auto;
+  gap: var(--space-3);
+  align-items: end;
+  padding: var(--space-4);
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  box-shadow: var(--shadow-card);
+}
+.bt-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fs-meta);
+}
+.bt-field-label {
+  font-size: var(--fs-caption);
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+  font-weight: var(--fw-semi);
+}
+.bt-input {
+  height: 36px;
+  padding: 0 var(--space-2);
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  font-size: var(--fs-body);
+  font-family: inherit;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.bt-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.bt-submit {
+  height: 44px;
+  min-width: 120px;
+  padding: 0 var(--space-4);
+  background: var(--accent);
+  color: var(--panel);
+  border: none;
+  border-radius: 4px;
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semi);
+  cursor: pointer;
+  transition:
+    transform var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+  box-shadow: var(--shadow-sm);
+}
+.bt-submit:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+.bt-submit:active:not(:disabled) { transform: translateY(0); }
+.bt-submit:disabled { opacity: 0.55; cursor: wait; }
+.bt-submit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.bt-loading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.bt-error {
+  padding: var(--space-3) var(--space-4);
+  background: #f6e6e2;
+  color: #8a3520;
+  border: 1px solid #e2b9ac;
+  border-radius: 4px;
+  font-size: var(--fs-meta);
+}
+.bt-empty {
+  padding: var(--space-5);
+  text-align: center;
+  font-size: var(--fs-meta);
+}
+
+.bt-meta {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  font-size: var(--fs-meta);
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+.bt-meta .muted { color: var(--ink-muted); }
+
+.bt-results {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.bt-equity-section, .bt-trades-section { display: flex; flex-direction: column; gap: var(--space-3); }
+.bt-equity {
+  height: 280px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+.bt-equity-canvas { height: 100%; }
+
+.bt-reason {
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--fs-caption);
+}
+.pnl-up { color: var(--up); font-weight: var(--fw-semi); }
+.pnl-down { color: var(--down); font-weight: var(--fw-semi); }
+
+@media (max-width: 720px) {
+  .bt-form { grid-template-columns: 1fr; gap: var(--space-2); }
+  .bt-submit { width: 100%; }
+}
+
+/* ─── Daily Confidence badge (chart top-right overlay) ─────────────────────── */
+
+.confidence-badge {
+  position: absolute;
+  top: 28px;
+  right: 10px;
+  min-width: 140px;
+  padding: var(--space-2) var(--space-3);
+  border-radius: 6px;
+  background: rgba(251, 247, 238, 0.92);
+  border: 1px solid var(--rule);
+  box-shadow: var(--shadow-sm);
+  font-size: var(--fs-meta);
+  color: var(--ink);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 4;
+  animation: fadeInUp var(--dur-base) var(--ease-out) both;
+  font-variant-numeric: tabular-nums;
+}
+.conf-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.conf-label {
+  font-family: "Noto Serif TC", serif;
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.04em;
+  width: 18px;
+}
+.conf-num {
+  margin-left: auto;
+  color: var(--ink-muted);
+  font-size: var(--fs-caption);
+}
+.conf-dots {
+  display: inline-flex;
+  gap: 4px;
+}
+.conf-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  display: inline-block;
+}
+.conf-pos {
+  border-top: 1px solid var(--rule);
+  padding-top: 4px;
+  margin-top: 2px;
+  font-size: var(--fs-caption);
+  color: var(--ink-muted);
 }

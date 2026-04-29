@@ -6,9 +6,10 @@ import { usePathname } from "next/navigation";
 import { dict, t } from "@/lib/i18n";
 import { StatusPill } from "./StatusPill";
 
-const NAV: { href: string; key: "nav.trading" | "nav.analysis" }[] = [
+const NAV: { href: string; key: "nav.trading" | "nav.analysis" | "nav.backtest" }[] = [
   { href: "/trading", key: "nav.trading" },
   { href: "/analysis", key: "nav.analysis" },
+  { href: "/backtest", key: "nav.backtest" },
 ];
 
 export function ShellHeader() {

@@ -5,18 +5,24 @@ import {
   CandlestickSeries,
   HistogramSeries,
   LineSeries,
+  LineStyle,
   TickMarkType,
   createChart,
+  createSeriesMarkers,
   type IChartApi,
   type IPaneApi,
+  type IPriceLine,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
   type CandlestickData,
   type LineData,
   type HistogramData,
   type MouseEventParams,
+  type SeriesMarker,
   type Time,
 } from "lightweight-charts";
 import type { Bar } from "@/lib/api";
+import { useTrades } from "@/lib/queries";
 import { useStream, type WsMessage } from "@/lib/ws";
 import { t } from "@/lib/i18n";
 import {
@@ -24,6 +30,7 @@ import {
   type CrosshairData,
   type CrosshairIndicators,
 } from "./ChartCrosshairTooltip";
+import { DailyConfidenceBadge } from "./DailyConfidenceBadge";
 
 export type IndicatorState = {
   ma: { enabled: boolean; period: number; kind: "sma" | "ema" };
@@ -39,6 +46,7 @@ type Props = {
   indicators: Record<string, Array<{ time: number } & Record<string, number | null>>>;
   state: IndicatorState;
   onSignal?: (m: WsMessage) => void;
+  strategy?: string | null;
 };
 
 // TW market convention: red = up 漲, green = down 跌
@@ -55,7 +63,7 @@ type PaneRefs = {
   series: ISeriesApi<any>[];
 };
 
-export function Chart({ res, bars, indicators, state, onSignal }: Props) {
+export function Chart({ res, bars, indicators, state, onSignal, strategy }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
@@ -78,6 +86,21 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   } | null>(null);
 
   const [tooltip, setTooltip] = useState<CrosshairData | null>(null);
+
+  // Strategy plot overlays — markers (entry/exit) accumulate in markersListRef
+  // and are flushed via markersRef.setMarkers(). Active SL/TP/entry lines are
+  // recreated per LONG/SHORT signal and torn down on the matching EXIT.
+  const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const markersListRef = useRef<SeriesMarker<Time>[]>([]);
+  const entryLineRef = useRef<IPriceLine | null>(null);
+  const tpLineRef = useRef<IPriceLine | null>(null);
+  const slLineRef = useRef<IPriceLine | null>(null);
+  const seenSignalIdsRef = useRef<Set<number>>(new Set());
+  // Single LineSeries holding all entry→exit segments. Segments are joined
+  // by `whitespace` entries (a LineData point with `value: undefined`) — the
+  // chart breaks the line at those gaps so the segments don't visually
+  // connect across unrelated trades.
+  const connectorRef = useRef<ISeriesApi<"Line"> | null>(null);
 
   // Lookup tables — time(epoch s) → indicator values. Updated whenever the
   // upstream `indicators` payload changes; the crosshair handler reads from
@@ -171,6 +194,7 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     if (reduceMotion) {
       candleRef.current.applyOptions({ priceLineVisible: false });
     }
+    markersRef.current = createSeriesMarkers(candleRef.current, []);
 
     const onMove = (param: MouseEventParams<Time>) => {
       if (!param.point || param.time == null) {
@@ -219,12 +243,34 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       rsiRef.current = null;
       kdRef.current = null;
       dmiRef.current = null;
+      markersRef.current = null;
+      markersListRef.current = [];
+      entryLineRef.current = null;
+      tpLineRef.current = null;
+      slLineRef.current = null;
+      seenSignalIdsRef.current = new Set();
+      connectorRef.current = null;
     };
   }, []);
 
   // ─── Push bars ─────────────────────────────────────────────────────────
+  // After Track B, `bars` is closed-history only — the WS owns the live
+  // in-progress bar. Refetches must NOT clobber `lastBarRef`; instead, we
+  // setData the historical array, then re-overlay the live bar (if any) via
+  // `update(...)` so the in-progress candle keeps growing smoothly.
+  //
+  // EXCEPT on resolution change: a 1m bucket time can be > the 5m bucket time
+  // for the same instant (e.g. 13:42 > 13:40), so a stale `lastBarRef` from
+  // the previous resolution would pass the `live.time > lastHistTime` check
+  // and paint a 1m candle into the 5m series. Detect res transitions via a
+  // separate ref and clear `lastBarRef` BEFORE the overlay logic runs.
+  const prevResRef = useRef<string | null>(null);
   useEffect(() => {
     if (!candleRef.current) return;
+    if (prevResRef.current !== null && prevResRef.current !== res) {
+      lastBarRef.current = null;
+    }
+    prevResRef.current = res;
     const data: CandlestickData<Time>[] = bars.map((b) => ({
       time: b.time as Time,
       open: b.open, high: b.high, low: b.low, close: b.close,
@@ -233,8 +279,53 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
 
     const map = new Map<number, { open: number; high: number; low: number; close: number }>();
     for (const b of bars) map.set(b.time, { open: b.open, high: b.high, low: b.low, close: b.close });
+
+    // Re-overlay the live bar if it sits strictly after the last historical
+    // bar (i.e. it represents the still-open bucket). On resolution change,
+    // the time-axis is different and the previous live bar is meaningless —
+    // detect that by checking whether `lastBarRef.current.time` falls inside
+    // the new bars range; if so but it doesn't match the latest bar, drop it.
+    const live = lastBarRef.current;
+    const lastHistTime = bars.length ? bars[bars.length - 1].time : null;
+    if (live) {
+      if (lastHistTime != null && live.time > lastHistTime) {
+        // Live bar is newer than all closed bars — overlay it.
+        candleRef.current.update({
+          time: live.time as Time,
+          open: live.open,
+          high: live.high,
+          low: live.low,
+          close: live.close,
+        });
+        map.set(live.time, {
+          open: live.open,
+          high: live.high,
+          low: live.low,
+          close: live.close,
+        });
+      } else if (lastHistTime == null) {
+        // Empty history but we have a live bar (rare: fresh WS-only start).
+        // Re-apply it so setData([]) above doesn't blank the chart.
+        candleRef.current.update({
+          time: live.time as Time,
+          open: live.open,
+          high: live.high,
+          low: live.low,
+          close: live.close,
+        });
+        map.set(live.time, {
+          open: live.open,
+          high: live.high,
+          low: live.low,
+          close: live.close,
+        });
+      }
+      // Otherwise: live.time <= lastHistTime — likely a resolution change or
+      // the backend caught up and now includes what was the live bar. Let the
+      // re-seed effect below pick a fresh `lastBarRef` from the new bars.
+    }
     lookups.current.bars = map;
-  }, [bars]);
+  }, [bars, res]);
 
   const wantMA = state.ma.enabled && !!indicators.ma;
   const wantMACD = state.macd.enabled && !!indicators.macd;
@@ -415,14 +506,203 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     lookups.current.dmi = m;
   }, [indicators.dmi, wantDMI]);
 
+  // ─── Entry → exit connector lines ─────────────────────────────────────
+  // Pulls closed trades for the active strategy and renders one dashed
+  // segment per pair on the price pane. Segments are separated by a
+  // whitespace data point (no `value` field) so lightweight-charts breaks
+  // the line between unrelated trades. Out-of-window segments simply
+  // hide; lightweight-charts requires monotonic time, so trades are sorted.
+  const tradesQ = useTrades({
+    strategy: strategy ?? undefined,
+    result: "all",
+    limit: 100,
+  });
+  const trades = tradesQ.data;
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (!strategy || !trades || trades.length === 0) {
+      if (connectorRef.current) {
+        chart.removeSeries(connectorRef.current);
+        connectorRef.current = null;
+      }
+      return;
+    }
+    if (!connectorRef.current) {
+      connectorRef.current = chart.addSeries(
+        LineSeries,
+        {
+          color: "#8a8175",
+          lineWidth: 1,
+          lineStyle: LineStyle.Dashed,
+          priceLineVisible: false,
+          lastValueVisible: false,
+        },
+        0,
+      );
+    }
+    type Pt = { time: Time; value?: number };
+    const closed = trades.filter((tr) => tr.exit_ts && tr.exit_price != null);
+    closed.sort(
+      (a, b) =>
+        new Date(a.entry_ts).getTime() - new Date(b.entry_ts).getTime(),
+    );
+    const data: Pt[] = [];
+    for (const tr of closed) {
+      const tEntry = Math.floor(new Date(tr.entry_ts).getTime() / 1000);
+      const tExit = Math.floor(new Date(tr.exit_ts as string).getTime() / 1000);
+      if (tExit <= tEntry) continue;
+      data.push({ time: tEntry as Time, value: tr.entry_price });
+      data.push({ time: tExit as Time, value: tr.exit_price as number });
+      // whitespace separator: time strictly after exit but before any next
+      // entry; +1 second is enough since LWC requires strictly monotonic time.
+      data.push({ time: (tExit + 1) as Time });
+    }
+    connectorRef.current.setData(data);
+  }, [strategy, trades]);
+
   // ─── Live updates from WS ─────────────────────────────────────────────
   const lastBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);
+  // Re-seed only when:
+  //   (a) we have nothing yet, or
+  //   (b) the new history's last bar is strictly newer than the live state
+  //       (e.g. resolution changed and we got a fresh time-axis), or
+  //   (c) the new history is empty (nothing to seed from — leave WS to fill).
+  // Same-time refetches (lastHist.time === live.time) MUST keep the live
+  // ref intact so the WS-accumulated O/H/L/C is not stomped back to the
+  // stale cagg snapshot. Older live-than-history (resolution change) is
+  // also a hard reset.
   useEffect(() => {
-    lastBarRef.current = bars.length ? { ...bars[bars.length - 1] } : null;
+    if (bars.length === 0) {
+      if (lastBarRef.current === null) return;
+      // New empty history while we have a live bar from a previous resolution
+      // — clear it so the WS handler treats the next update as a fresh bar.
+      lastBarRef.current = null;
+      return;
+    }
+    const lastHist = bars[bars.length - 1];
+    const live = lastBarRef.current;
+    if (live === null || lastHist.time > live.time || lastHist.time < live.time) {
+      // (a) no live state yet, or (b) history advanced past live (rare —
+      // WS missed a bar boundary), or (c) live points to a time outside the
+      // new bars range (resolution change). In all three cases adopt the
+      // new history's last bar as the seed.
+      lastBarRef.current = { ...lastHist };
+    }
+    // lastHist.time === live.time — refetch arrived for the same bucket the
+    // WS is accumulating. Keep `lastBarRef.current` (WS data is authoritative).
   }, [bars]);
 
+  // ─── Strategy plot overlay (markers + SL/TP/entry price lines) ────────
+  // Idempotent on signal id so a refetch / re-broadcast cannot double-mark.
+  // LONG / SHORT — paint entry marker + entry/TP/SL price lines.
+  // EXIT          — paint exit marker (color by exit_reason) + tear down lines.
+  function drawSignalOverlay(m: Extract<WsMessage, { type: "signal" }>) {
+    const series = candleRef.current;
+    const markers = markersRef.current;
+    if (!series || !markers) return;
+    if (m.id != null) {
+      if (seenSignalIdsRef.current.has(m.id)) return;
+      seenSignalIdsRef.current.add(m.id);
+    }
+    const t = Math.floor(new Date(m.ts).getTime() / 1000) as Time;
+    const side = m.side;
+    const payload = (m.payload ?? {}) as Record<string, unknown>;
+
+    if (side === "LONG" || side === "SHORT") {
+      const isLong = side === "LONG";
+      // TW convention: red = up = profitable direction for LONG.
+      const arrowColor = isLong ? UP : DOWN;
+      const marker: SeriesMarker<Time> = {
+        time: t,
+        position: isLong ? "belowBar" : "aboveBar",
+        color: arrowColor,
+        shape: isLong ? "arrowUp" : "arrowDown",
+        text: side,
+      };
+      markersListRef.current.push(marker);
+      markers.setMarkers(markersListRef.current);
+
+      // Tear down any leftover lines from a stale prior position before
+      // drawing fresh ones (defensive — strategy guards against pyramiding
+      // but ws replay or reload could leave lines around).
+      removePositionLines();
+      const tpPts = Number(payload.tp_points ?? 0);
+      const slPts = Number(payload.sl_points ?? 0);
+      const entry = m.price;
+      const tp = isLong ? entry + tpPts : entry - tpPts;
+      const sl = isLong ? entry - slPts : entry + slPts;
+      entryLineRef.current = series.createPriceLine({
+        price: entry,
+        color: "#8a8175",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `entry ${side}`,
+      });
+      tpLineRef.current = series.createPriceLine({
+        price: tp,
+        color: UP,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: `TP +${tpPts}`,
+      });
+      slLineRef.current = series.createPriceLine({
+        price: sl,
+        color: DOWN,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: `SL -${slPts}`,
+      });
+      return;
+    }
+
+    if (side === "EXIT") {
+      const reason = String(payload.exit_reason ?? "");
+      const pnl = Number(payload.pnl_points ?? 0);
+      // TP win → red (TW up). SL loss → green (TW down). DI flip → accent.
+      const color =
+        reason === "TP" ? UP : reason === "SL" ? DOWN : ACCENT;
+      const marker: SeriesMarker<Time> = {
+        time: t,
+        position: pnl >= 0 ? "aboveBar" : "belowBar",
+        color,
+        shape: "circle",
+        text: `${reason} ${pnl >= 0 ? "+" : ""}${pnl.toFixed(0)}`,
+      };
+      markersListRef.current.push(marker);
+      markers.setMarkers(markersListRef.current);
+      removePositionLines();
+    }
+  }
+
+  function removePositionLines() {
+    const series = candleRef.current;
+    if (!series) return;
+    if (entryLineRef.current) {
+      series.removePriceLine(entryLineRef.current);
+      entryLineRef.current = null;
+    }
+    if (tpLineRef.current) {
+      series.removePriceLine(tpLineRef.current);
+      tpLineRef.current = null;
+    }
+    if (slLineRef.current) {
+      series.removePriceLine(slLineRef.current);
+      slLineRef.current = null;
+    }
+  }
+
   const connected = useStream(res, (m) => {
-    if (m.type === "signal") { onSignal?.(m); return; }
+    if (m.type === "signal") {
+      onSignal?.(m);
+      drawSignalOverlay(m);
+      return;
+    }
+    if (!candleRef.current) return;
+    if (m.type !== "bar_update") return;
     if (!candleRef.current) return;
     if (m.type !== "bar_update") return;
     const ts = Math.floor(new Date(m.bucket).getTime() / 1000);
@@ -451,6 +731,7 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       <div style={{ position: "absolute", top: 6, right: 10, fontSize: 11, color: connected ? "var(--down)" : "var(--warn)" }}>
         {status}
       </div>
+      <DailyConfidenceBadge strategy={strategy ?? null} />
     </div>
   );
 }

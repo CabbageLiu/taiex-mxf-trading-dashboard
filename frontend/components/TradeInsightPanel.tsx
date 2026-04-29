@@ -5,12 +5,14 @@ import { useMemo } from "react";
 import type { Trade, TradeStats } from "@/lib/api";
 import { t } from "@/lib/i18n";
 import { useInsight } from "@/lib/queries";
+import { Skeleton } from "./Skeleton";
 import type { TradeFilterValue } from "./TradeFilterBar";
 
 type Props = {
   filter: TradeFilterValue;
   stats: TradeStats | undefined;
   trades: Trade[] | undefined;
+  isLoading?: boolean;
 };
 
 function fmtPoints(n: number | null | undefined, opts?: { signed?: boolean }): string | null {
@@ -129,13 +131,15 @@ function isMissingApiKeyError(err: Error | null): boolean {
   return /^503\b/.test(msg) || /ANTHROPIC_API_KEY/.test(msg);
 }
 
-export function TradeInsightPanel({ filter, stats, trades }: Props) {
+export function TradeInsightPanel({ filter, stats, trades, isLoading = false }: Props) {
   const insight = useInsight();
 
   const patternLines = useMemo(
     () => buildPatternLines(stats, trades),
     [stats, trades],
   );
+
+  const patternsBusy = isLoading && patternLines.length === 0;
 
   const bullets = useMemo(() => {
     if (!insight.data?.content) return [] as string[];
@@ -164,9 +168,19 @@ export function TradeInsightPanel({ filter, stats, trades }: Props) {
   return (
     <div className="insight-panel">
       {/* Section A — pattern analysis (deterministic, no AI) */}
-      <section>
-        <h4>{t("patterns.title")}</h4>
-        {patternLines.length === 0 ? (
+      <section aria-busy={patternsBusy}>
+        <h3 className="section-title">{t("patterns.title")}</h3>
+        {patternsBusy ? (
+          <div
+            style={{ display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" }}
+            aria-hidden="true"
+          >
+            <Skeleton width="60%" height={14} />
+            <Skeleton width="48%" height={14} />
+            <Skeleton width="54%" height={14} />
+            <Skeleton width="40%" height={14} />
+          </div>
+        ) : patternLines.length === 0 ? (
           <div className="empty">{t("trades.empty")}</div>
         ) : (
           <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
@@ -178,7 +192,7 @@ export function TradeInsightPanel({ filter, stats, trades }: Props) {
                   justifyContent: "space-between",
                   gap: 12,
                   padding: "4px 0",
-                  fontSize: 13,
+                  fontSize: "var(--fs-meta)",
                 }}
               >
                 <span style={{ color: "var(--ink-muted)" }}>{line.label}</span>
@@ -203,22 +217,36 @@ export function TradeInsightPanel({ filter, stats, trades }: Props) {
 
       {/* Section B — AI insight (manual button) */}
       <section>
-        <h4>{t("insight.title")}</h4>
+        <h3 className="section-title">{t("insight.title")}</h3>
 
         {showLoading && (
-          <div
-            className="empty"
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              justifyContent: "center",
-              padding: "12px 0",
-            }}
-          >
-            <Spinner />
-            <span>{t("insight.loading")}</span>
-          </div>
+          <>
+            <div
+              className="empty"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "4px 0 10px",
+              }}
+            >
+              <Spinner />
+              <span>{t("insight.loading")}</span>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+                padding: "0 0 4px 18px",
+              }}
+              aria-hidden="true"
+            >
+              <Skeleton width="92%" height={13} />
+              <Skeleton width="78%" height={13} />
+              <Skeleton width="85%" height={13} />
+            </div>
+          </>
         )}
 
         {showResult && (
@@ -253,7 +281,7 @@ export function TradeInsightPanel({ filter, stats, trades }: Props) {
             {!canGenerate && (
               <div
                 className="empty"
-                style={{ marginTop: 8, fontSize: 11 }}
+                style={{ marginTop: 8, fontSize: "var(--fs-caption)" }}
               >
                 先在頂部選擇策略
               </div>
