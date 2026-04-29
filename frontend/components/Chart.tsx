@@ -5,6 +5,7 @@ import {
   CandlestickSeries,
   HistogramSeries,
   LineSeries,
+  TickMarkType,
   createChart,
   type IChartApi,
   type IPaneApi,
@@ -45,6 +46,7 @@ const UP = "#c0392b";
 const DOWN = "#3a7d4f";
 const INK = "#1f1d1a";
 const ACCENT = "#a8773d";
+const TZ = "Asia/Taipei";
 
 type IndKey = "macd" | "rsi" | "kd" | "dmi";
 
@@ -104,7 +106,56 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       autoSize: true,
       layout: { background: { color: "#fbf7ee" }, textColor: INK },
       grid: { vertLines: { color: "#ece5d6" }, horzLines: { color: "#ece5d6" } },
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#e3dccf" },
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: false,
+        borderColor: "#e3dccf",
+        // lightweight-charts has no native tz option — we render every tick
+        // mark via Intl.DateTimeFormat pinned to Asia/Taipei so the x-axis
+        // matches local trading hours (08:45–13:45 CST).
+        tickMarkFormatter: (time: Time, tickMarkType: TickMarkType) => {
+          const epochSec = typeof time === "number" ? time : 0;
+          const d = new Date(epochSec * 1000);
+          const opts: Intl.DateTimeFormatOptions = { timeZone: TZ };
+          switch (tickMarkType) {
+            case TickMarkType.Year:
+              opts.year = "numeric";
+              break;
+            case TickMarkType.Month:
+              opts.year = "numeric";
+              opts.month = "short";
+              break;
+            case TickMarkType.DayOfMonth:
+              opts.month = "numeric";
+              opts.day = "numeric";
+              break;
+            case TickMarkType.Time:
+            case TickMarkType.TimeWithSeconds:
+            default:
+              opts.hour = "2-digit";
+              opts.minute = "2-digit";
+              opts.hour12 = false;
+              if (tickMarkType === TickMarkType.TimeWithSeconds) opts.second = "2-digit";
+              break;
+          }
+          return new Intl.DateTimeFormat("zh-Hant-TW", opts).format(d);
+        },
+      },
+      localization: {
+        locale: "zh-Hant-TW",
+        timeFormatter: (time: Time) => {
+          const epochSec = typeof time === "number" ? time : 0;
+          return new Date(epochSec * 1000).toLocaleString("zh-Hant-TW", {
+            timeZone: TZ,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+          });
+        },
+      },
       rightPriceScale: { borderColor: "#e3dccf" },
       crosshair: { vertLine: { color: "#8a8175" }, horzLine: { color: "#8a8175" } },
     });

@@ -53,7 +53,13 @@ export function AlertLog({ liveSignals }: { liveSignals: SignalRow[] }) {
               {a.http_code != null && <span style={{ color: "var(--muted)" }}> ({a.http_code})</span>}
             </div>
             <div style={{ color: "var(--muted)", fontSize: 11 }}>
-              {new Date(a.ts).toLocaleTimeString()}
+              {new Date(a.ts).toLocaleTimeString("zh-Hant-TW", {
+                timeZone: "Asia/Taipei",
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+                hour12: false,
+              })}
             </div>
           </div>
         ))}
