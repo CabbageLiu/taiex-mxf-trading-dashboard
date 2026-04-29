@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 docker compose up           # db + backend + frontend, hot-reload all three
 docker compose up --build   # first run, or after dependency changes
 docker compose down         # clean stop (data preserved)
-docker compose down -v      # also nuke ticks/signals/alerts
+docker compose down -v      # also nuke ticks/signals/alerts/trades
 ```
 
 Browser → `http://localhost:3000`. Backend on `:8000`. DB on `:5432`. Source is bind-mounted; both servers hot-reload on file edits.
@@ -25,7 +25,7 @@ Use this when you want pytest, ruff, or alembic revisions outside containers.
 docker compose up -d db          # TimescaleDB on 127.0.0.1:5432, volume taiex-pg
 docker compose ps                # wait for STATUS=healthy
 docker compose stop              # keep data
-docker compose down -v           # nuke ticks/signals/alerts
+docker compose down -v           # nuke ticks/signals/alerts/trades
 ```
 
 #### Backend (uv-managed; venv lives in `backend/.venv`)
@@ -76,7 +76,7 @@ Both servers bind 127.0.0.1 by design. Tailscale Serve exposes only the Next dev
 FinMind 5-sec TAIEX
        │
        ▼
-MarketDataAdapter (adapters/finmind_taiex.py)   ← swap point for shioaji/MXF feed
+MarketDataAdapter (adapters/finmind_taiex.py)   ← swap point for shioaji feed
        │  Tick(ts, symbol, price, source)
        ▼
 IngestRunner (ingest/runner.py)
@@ -93,11 +93,19 @@ IngestRunner (ingest/runner.py)
                                           │ concurrent gather()
                                           ├─► DiscordNotifier
                                           ├─► N8nNotifier
-                                          └─► InAppNotifier ─► WS
+                                          └─► InAppNotifier ─► WS + PositionTracker
                        (every attempt logged to alerts table)
+
+PositionTracker (runner/position_tracker.py, V2)
+   subscribes to InAppNotifier queue (same fan-out as WS — one source of
+   signal events, no parallel queue). Pairs LONG↔EXIT/SHORT into rows in
+   the `trades` table with `pnl_points`. Idempotent on signal id.
+   Rehydrates open positions from DB on startup.
 ```
 
 The **ingest runner is the single source of bar events**. Strategies and the WebSocket both subscribe to its in-process `asyncio.Queue` fan-out via `IngestRunner.subscribe(resolution)`. There is no separate scheduler — bar timing is derived from tick `ts` rounded into resolution buckets in `ingest/runner.py:_bucket_start`.
+
+The **InAppNotifier queue is the single source of signal events** (V2). Both the WebSocket endpoint and the position tracker subscribe to it. Adding a new consumer of signals → call `hub.inapp.subscribe()`; do NOT add a parallel queue. The hub threads `signal_id` through the inapp payload so consumers can attribute their derived rows back to a `signals.id`.
 
 ### TimescaleDB schema
 
@@ -107,6 +115,8 @@ The **ingest runner is the single source of bar events**. Strategies and the Web
 - **1w, 1mo** — plain views built on top of `bars_1d` (continuous-aggregate-of-continuous-aggregate has restrictions, so the long buckets fall back to views).
 
 The `/bars` endpoint in `app/api/routes/bars.py` reads whichever view matches the requested resolution. **There is no `bars` table.** Adding a new resolution means: add to `RESOLUTIONS` in `ingest/runner.py`, add to `VALID_RES` in `api/routes/bars.py`, and add the matching view to migration `0001_init`.
+
+V2 added a plain Postgres `trades` table (migration `0002_trades.py`), populated by the position tracker. It is **not** a hypertable (low row volume) and has a partial unique index `ux_trades_open_position` on `(strategy, symbol) WHERE exit_ts IS NULL` so a double-open race between the strategy loop and a tracker restart cannot land two open rows for the same pair. Closed rows are unconstrained. FKs to `signals.id` use `ON DELETE SET NULL` so signal purges don't cascade-delete trade history.
 
 ### Indicator service
 
@@ -121,24 +131,63 @@ Five hand-rolled indicators in `app/indicators/`: MA, MACD, RSI (Wilder), KD (TW
 
 A strategy declares `resolutions: list[str]` and an optional `indicator_specs: dict[label, {kind, params}]`; the runner precomputes those indicators and passes them in via `BarEvent.indicators`. Per-strategy `enabled`, `params`, and `channels` live in the `strategy_config` table and are managed via `/strategies` REST endpoints.
 
+V2 changed the downstream consequences of a `Signal`: alongside the notifier fan-out, the position tracker pairs LONG/SHORT/EXIT/FLAT into rows in the `trades` table. Same-direction signals are no-ops (no stacking); opposite-direction signals atomically close the open trade and open a fresh one at the same price/timestamp; same-id replays are idempotent. **Strategies that only emit `LONG` (like the V1 `always_long` example) never close a trade, so they never contribute to win-rate or PnL** — pair entries with an exit rule unless you specifically want a watchdog signal. The full pairing truth table and a worked LONG↔SHORT example live in `NOTES.md` §7.
+
+### V2 REST routes (additions only)
+
+- `GET /trades?strategy=&start=&end=&result=win|loss|all&limit=` — list. Date-only `end` strings are interpreted as start-of-next-day exclusive (so a `today` filter does not silently drop intraday trades).
+- `GET /trades/stats?strategy=&start=&end=` — aggregate (`trade_count`, `open_count`, `win_count`, `loss_count`, `win_rate`, `pnl_total`, `pnl_avg_win`, `pnl_avg_loss`, `max_drawdown`, `avg_hold_seconds`). Drawdown is reported as a positive magnitude (peak − cum); UI negates for display.
+- `GET /status` — `{ ok, ingest_running, last_tick_ts, ingest_lag_seconds, strategy_loop_running, position_tracker_running, db_ok, notifiers: { discord, n8n, inapp } }`. Powers the status pill.
+- `POST /insights/strategy` — body `{ strategy, start, end, filter }`, returns `{ cached, generated_at, content }`. 503 when `ANTHROPIC_API_KEY` is unset; 429 when rate-limited (with `Retry-After` header).
+
 ### Notifier hub
 
 `NotifierHub.dispatch()` runs all configured notifiers in `asyncio.gather` and writes one `alerts` row per channel attempt. Failures are caught per-notifier; one bad webhook never starves the others. The `InAppNotifier` is in-process and publishes onto a queue that the WebSocket endpoint subscribes to — operators see signals in the dashboard even when both webhooks are misconfigured.
 
 ### Configuration
 
-`app/config.py` uses `pydantic-settings` with `env_file=("../.env", ".env")`, so the same `.env` at repo root works whether commands run from `backend/` or the project root. Settings are cached via `@lru_cache` on `get_settings`. The display symbol (`MXF`) is decoupled from the source (`TAIEX`) — the adapter labels every tick with `symbol_display`, so swapping the data feed changes only the adapter file.
+`app/config.py` uses `pydantic-settings` with `env_file=("../.env", ".env")`, so the same `.env` at repo root works whether commands run from `backend/` or the project root. Settings are cached via `@lru_cache` on `get_settings`. The display symbol (`SYMBOL_DISPLAY`, default `MXF`) is decoupled from the source (`SYMBOL_SOURCE`, default `MXF` — flipped from `TXF` in V2) — the adapter labels every tick with `symbol_display`, so swapping the data feed changes only the adapter file.
+
+V2 added optional Anthropic settings (`anthropic_api_key: SecretStr | None`, `anthropic_model: str = "claude-sonnet-4-6"`, `insights_cache_ttl_seconds`, `insights_cache_max_entries`). When `anthropic_api_key` is unset, `POST /insights/strategy` returns 503 and the frontend AI panel degrades cleanly — the rest of the app works.
+
+### AI insights service (V2)
+
+`app/services/insights.py` calls Sonnet 4.6 via the Anthropic SDK with prompt caching (`cache_control: ephemeral` on the system prompt). The user message JSON-encodes the trade payload — never f-string interpolated — so a malicious `Signal.payload.reason` from a future strategy cannot break out of JSON and inject instructions. The system prompt also explicitly tells the model to treat trade-row data as non-executable. Tests assert this escape behaviour. **When editing the system prompt, ensure the `cache_control` marker stays on the *last* system content block and the prompt remains a true module-level constant** — any byte change (including a stray `datetime.now()` interpolation) silently invalidates the prefix cache. The minimum cacheable prefix on Sonnet 4.6 is 2048 tokens; the current prompt is shorter, so caching is wired but currently a no-op in practice.
+
+`app/services/insights_cache.py` is an in-process bounded TTL+LRU on `OrderedDict`, monotonic-time for DST safety. Key fingerprint hashes sorted `(trade_id, pnl_points)` tuples plus the filter so two distinct distributions with the same count and total PnL still get distinct cache slots. Restart drops the cache — intentional, no Redis dependency.
+
+`POST /insights/strategy` enforces a 5/min/(strategy, ip) token bucket inside an LRU dict capped at 1024 keys (so a unique-IP spray cannot grow it unboundedly). Honours `X-Forwarded-For`. Behind a reverse proxy that strips it, the limit collapses to a single bucket — flagged in V3.
 
 ### Frontend
 
-Next.js 15 App Router. Single page, single locale (`zh-Hant-TW`); `lib/i18n.ts` is a tiny dict + `t()` helper. **Indicator names stay English** by design — never wrapped in `t()`.
+Next.js 15 App Router, single locale (`zh-Hant-TW`). `lib/i18n.ts` is a tiny dict + `t()` helper. **Indicator names stay English** by design — never wrapped in `t()`.
 
-The chart (`components/Chart.tsx`) uses **TradingView Lightweight Charts v5**. Each indicator pane is a separate `priceScaleId` (`macd` / `rsi` / `kd` / `dmi`) on the same chart, with `scaleMargins: {top: 0.7, bottom: 0}` to stack them under the price pane. **Candle convention is TW: red = up 漲 (#c0392b), green = down 跌 (#3a7d4f)** — opposite of the US convention. Histograms and DMI lines follow the same colour grammar.
+V2 split the dashboard into two routes under one shared layout (`app/layout.tsx` → `ShellHeader.tsx` with brand + nav + status pill):
 
-Live updates merge into the chart in `Chart.tsx`: every `bar_update` WS message either appends a new bar or extends the in-progress one (high/low/close mutate, open is sticky). Bar history is fetched once via `/api/bars` on resolution change; ongoing bars come from the WS only.
+- **`/trading`** — `app/trading/page.tsx`. TopBar (resolution + StrategySelector combobox + IndicatorToggleBar) + Chart + AlertLog right rail.
+- **`/analysis`** — `app/analysis/page.tsx`. KPI strip + TradeFilterBar + TradesTable + TradeInsightPanel (deterministic 模式分析 + manual `生成洞察` AI button).
+- `app/page.tsx` is a server-side `redirect("/trading")`.
+
+Active strategy is propagated across pages via the URL query param `?s=<name>` (read with `useSearchParams`); both pages stay in sync without context plumbing. Anything that reads `useSearchParams` must be wrapped in `<Suspense>` for Next 15's prerender pass.
+
+The chart (`components/Chart.tsx`) uses **TradingView Lightweight Charts v5**. V2 refactored from `priceScaleId` stacking to true panes via `chart.addPane()` + `chart.addSeries(..., paneIndex)`; MACD / RSI / KD / DMI each get their own pane (MA stays on the price pane because that's where moving averages belong). **Candle convention is TW: red = up 漲 (#c0392b), green = down 跌 (#3a7d4f)** — opposite of the US convention. Histograms and DMI lines follow the same colour grammar.
+
+`ChartCrosshairTooltip.tsx` is a separate React overlay subscribed to `chart.subscribeCrosshairMove`. It reads from a `Map<time, values>` lookup populated alongside `series.setData` and patched on bar updates — **no network call on hover**. When toggling indicators on/off, that map must be cleared/rebuilt for the affected series.
+
+Time on the chart axis and built-in tooltip is rendered through `Intl.DateTimeFormat({ timeZone: "Asia/Taipei", locale: "zh-Hant-TW" })` via `localization.timeFormatter` and `timeScale.tickMarkFormatter`. lightweight-charts has no native timezone option — these formatters are the only way to show CST on the axis. **Don't pass UTC-shifted epoch seconds to the chart** as a workaround; it breaks crosshair lookups, since the lookup map keys are the original (UTC) `time` values.
+
+Live updates merge into the chart in `Chart.tsx`: every `bar_update` WS message either appends a new bar or extends the in-progress one (high/low/close mutate, open is sticky). Bar history is fetched once via `/api/bars` on resolution change; ongoing bars come from the WS only. The InAppNotifier signal payload now carries `id` (the `signals.id`) so the position tracker can attribute and the WS consumers can deduplicate.
 
 `lib/ws.ts` derives the WebSocket URL from `window.location` (not from an env var) so the same code works on `127.0.0.1:3000` and on a Tailscale Serve hostname without configuration. The `next.config.mjs` rewrite for `/ws/:path*` is what makes that work.
 
+`lib/queries.ts` (V2) is the single home for TanStack Query hooks: `useStatus`, `useTrades`, `useTradeStats`, `useInsight` (mutation, manual trigger). Components import from there rather than calling `fetch` directly.
+
 ### Tests
 
-`backend/tests/` covers indicator math (against straight-uptrend fixtures), notifier hub fan-out + per-channel failure isolation + channel filter, and FinMind adapter dedupe + invalid-row tolerance. **None of the tests require a live database.** When adding a feature that needs DB I/O, mock at the `session_scope()` boundary or extract the SQL-touching logic into a function the test can patch.
+`backend/tests/` covers indicator math (against straight-uptrend fixtures), notifier hub fan-out + per-channel failure isolation + channel filter, FinMind adapter dedupe + invalid-row tolerance, V2 position tracker (open/close/flip/idempotency/rehydrate), V2 trades API (`compute_stats` win rate / drawdown / avg hold extracted as a pure function specifically so tests can call it without DB), V2 insights cache (TTL + LRU + key sensitivity), and V2 insights service (system-prompt persona, `cache_control` marker, JSON-encoded payload escapes a known prompt-injection string). 44 tests as of V2.
+
+**None of the tests require a live database.** When adding a feature that needs DB I/O, mock at the `session_scope()` boundary or extract the SQL-touching logic into a pure function the test can patch directly (this is what `compute_stats` does — the SQL part is in `_query_trades`, the math is separate).
+
+### Backlog and security
+
+V2 deferred several gaps to V3 (documented in `V3_plan.md`): CORS still wide open, mutating endpoints unauthenticated, no global Anthropic spend cap, reverse-proxy IP gap on the rate limiter, no backtest mode, no per-trade fees/slippage, no auth/multi-user. **Do not silently re-introduce these as if they were new ideas — check `V3_plan.md` first.** When working on V3 items, that file is the canonical scope reference.
