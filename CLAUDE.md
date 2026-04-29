@@ -146,7 +146,7 @@ V2 changed the downstream consequences of a `Signal`: alongside the notifier fan
 
 ### Configuration
 
-`app/config.py` uses `pydantic-settings` with `env_file=("../.env", ".env")`, so the same `.env` at repo root works whether commands run from `backend/` or the project root. Settings are cached via `@lru_cache` on `get_settings`. The display symbol (`SYMBOL_DISPLAY`, default `MXF`) is decoupled from the source (`SYMBOL_SOURCE`, default `MXF` — flipped from `TXF` in V2) — the adapter labels every tick with `symbol_display`, so swapping the data feed changes only the adapter file.
+`app/config.py` uses `pydantic-settings` with `env_file=("../.env", ".env")`, so the same `.env` at repo root works whether commands run from `backend/` or the project root. Settings are cached via `@lru_cache` on `get_settings`. The display symbol (`SYMBOL_DISPLAY`, default `MXF`) is decoupled from the source (`SYMBOL_SOURCE`, default `TXF`) — the adapter labels every tick with `symbol_display`, so the chart can read "MXF" while the data comes from TXF. **Important:** the FinMind sponsor `taiwan_futures_snapshot` endpoint serves `TXF / TMF / CDF` only; `data_id=MXF` returns zero rows and silently freezes the feed. We briefly tried `SYMBOL_SOURCE=MXF` early in V2 — it broke the live feed mid-session — and reverted. TXF and MXF both track the same TAIEX index, so labelling TXF data as MXF in the UI is semantically fine.
 
 V2 added optional Anthropic settings (`anthropic_api_key: SecretStr | None`, `anthropic_model: str = "claude-sonnet-4-6"`, `insights_cache_ttl_seconds`, `insights_cache_max_entries`). When `anthropic_api_key` is unset, `POST /insights/strategy` returns 503 and the frontend AI panel degrades cleanly — the rest of the app works.
 

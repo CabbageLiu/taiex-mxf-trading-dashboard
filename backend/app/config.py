@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     market_close: time = Field(default=time(13, 45), alias="MARKET_CLOSE")
     poll_interval_sec: float = Field(default=5.0, alias="POLL_INTERVAL_SEC")
     symbol_display: str = Field(default="MXF", alias="SYMBOL_DISPLAY")
-    symbol_source: str = Field(default="MXF", alias="SYMBOL_SOURCE")
+    # FinMind taiwan_futures_snapshot only serves TXF / TMF / CDF on the
+    # sponsor tier — MXF (小台) returns 0 rows. Keep source = TXF so the feed
+    # stays alive; SYMBOL_DISPLAY decouples the UI label.
+    symbol_source: str = Field(default="TXF", alias="SYMBOL_SOURCE")
 
     # AI insights (Anthropic Claude Sonnet) — V2 strategy analysis page
     anthropic_api_key: SecretStr | None = Field(default=None, alias="ANTHROPIC_API_KEY")

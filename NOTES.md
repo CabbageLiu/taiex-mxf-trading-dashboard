@@ -48,8 +48,8 @@ cd ../frontend && npm install
 | `DISCORD_WEBHOOK_URL`     | —                        | Empty disables Discord notifier                                  |
 | `N8N_WEBHOOK_URL`         | —                        | Empty disables n8n notifier                                      |
 | `ALERT_SECRET`            | —                        | Sent as `X-Alert-Secret` header on n8n webhook calls             |
-| `SYMBOL_SOURCE`           | `MXF`                    | Contract pulled from FinMind (`TXF` / `MXF` / `TMF` / `CDF`)     |
-| `SYMBOL_DISPLAY`          | `MXF`                    | Label shown in the UI and stamped on every tick                  |
+| `SYMBOL_SOURCE`           | `TXF`                    | Contract pulled from FinMind sponsor `taiwan_futures_snapshot`. Supported `data_id` values are **`TXF` / `TMF` / `CDF`** — `MXF` returns 0 rows on this endpoint and freezes the feed. |
+| `SYMBOL_DISPLAY`          | `MXF`                    | Label shown in the UI and stamped on every tick. Decoupled from `SYMBOL_SOURCE` so the chart can read "MXF" while the data comes from TXF (both track the same TAIEX index). |
 | `POLL_INTERVAL_SEC`       | `5`                      | FinMind poll cadence                                             |
 | `TIMEZONE`                | `Asia/Taipei`            | Used everywhere — never set anything else                        |
 | `MARKET_OPEN/CLOSE`       | `08:45` / `13:45`        | Adapter sleeps outside this window                               |
@@ -236,7 +236,8 @@ tailscale down
 | `relation "ticks" does not exist` | Migration didn't run | `docker compose logs backend` — check the alembic line. To force: `docker compose run --rm backend uv run alembic upgrade head` |
 | `relation "trades" does not exist` (V2) | Migration `0002_trades` skipped | Same fix; alembic should include it automatically. Check `alembic current` matches `head` |
 | FinMind 400 / 401 | Token expired or wrong tier | Check `FINMIND_TOKEN` in `.env`. Sponsor tier required for `taiwan_futures_snapshot` |
-| Chart empty during market hours | First bar hasn't closed yet, or wrong `SYMBOL_SOURCE` | Wait one minute. Confirm `.env` has `SYMBOL_SOURCE=MXF` (or TXF / TMF / CDF) |
+| Chart empty during market hours | First bar hasn't closed yet, or `SYMBOL_SOURCE` set to a `data_id` the FinMind sponsor endpoint doesn't serve | Wait one minute. Confirm `.env` has `SYMBOL_SOURCE=TXF` (or `TMF` / `CDF`). **`MXF` returns 0 rows from `taiwan_futures_snapshot` and freezes the feed** — keep source = TXF, change only `SYMBOL_DISPLAY` if you want a different label. |
+| Price stuck at a specific time during the day | FinMind sponsor endpoint stopped returning new rows for the configured `data_id` | Hit the endpoint manually: `curl -s -H "Authorization: Bearer $FINMIND_TOKEN" "https://api.finmindtrade.com/api/v4/taiwan_futures_snapshot?data_id=TXF" \| jq '.data \| length'`. Zero rows = wrong `data_id` or sponsor tier expired. |
 | Status pill stays red | Backend down, DB unreachable, or FinMind throwing | Hover the pill for which subsystem is failing; tail `docker compose logs backend` |
 | `/analysis` AI panel says `伺服器尚未設定 ANTHROPIC_API_KEY` | Key not set in `.env` | Add `ANTHROPIC_API_KEY=sk-ant-…` to `.env`, then `docker compose restart backend` |
 | `/analysis` says rate-limited | More than 5 insights/min/(strategy, ip) | Wait the `Retry-After` seconds shown in the toast; cache hits are free, so reusing a recent filter avoids the limit |
