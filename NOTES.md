@@ -15,6 +15,12 @@ The dashboard has two pages, both 繁體中文:
   最大回撤), filterable trade list (date range + 全部 / 獲利 / 虧損),
   pattern-analysis panel, and a `生成洞察` button that calls Claude Sonnet
   4.6 for 繁體中文 bullet-point coaching against the current filter.
+  Trades table columns (V5): `編號 / 日期 / 方向 / 策略 / 進場 / 開倉指標
+  / 出場 / 出場指標 / 持倉時長 / 損益`. The two indicator columns render
+  KD / MACD / +DI / -DI snapshots captured at entry and exit by the
+  position tracker (compact form `K54 D51 / MACD+9 / +DI33 -DI19`). Older
+  trades pre-V5 render `—` in both columns. Hovering the strategy cell
+  exposes the canonical `name` via `title=`.
 
 ---
 
@@ -362,7 +368,8 @@ appears in the StrategySelector dropdown.
 
 ```python
 class Strategy(ABC):
-    name: ClassVar[str]                                    # required
+    name: ClassVar[str]                                    # required — DB key
+    display_name: ClassVar[str | None] = None              # optional — UI label
     resolutions: ClassVar[list[str]] = ["1m"]              # which bar sizes to fire on
     params_schema: ClassVar[type[BaseModel]] = EmptyParams # pydantic model — drives the UI
     indicator_specs: ClassVar[dict[str, dict]] = {}        # precomputed per bar close
@@ -372,6 +379,12 @@ class Strategy(ABC):
     @abstractmethod
     def on_bar(self, ev: BarEvent) -> Signal | None: ...
 ```
+
+`name` is the canonical DB key — it lives in `trades.strategy`,
+`signals.strategy`, `strategy_config.name`, and the `?s=` URL param.
+**Never accept `display_name` as input on `/strategies/{name}/*` routes**
+— it is render-only. UI components render `display_name ?? name`, with
+`title={name}` on hover so power users can recover the canonical key.
 
 #### `BarEvent`
 
@@ -403,6 +416,17 @@ class Signal:
     reason: str = ""
     payload: dict = field(default_factory=dict)
 ```
+
+V5 indicator-snapshot persistence: when a strategy emits its open / close
+`Signal`, it can stash an 8-key snapshot (`{k, d, macd, signal, hist,
+plus_di, minus_di, adx}`) in `payload.entry_ind` / `payload.exit_ind`
+respectively. The position tracker copies both into the `Trade.payload`
+JSONB column at open and close (the close-side write is a
+`payload || jsonb_build_object('exit_ind', …)` merge so the pre-existing
+`entry_ind` is not clobbered). Snapshot values are 2-decimal-rounded
+floats, NaN / missing rendered as `None`. Strategies should always emit
+the full 8-key shape (use `dict.fromkeys(...)` + a NaN-safe coercion
+helper) so the frontend `TradeIndicators` type stays stable.
 
 V2 trade-pairing semantics (in `PositionTracker`):
 
@@ -640,15 +664,20 @@ spend.
 cd backend && uv run pytest -q
 ```
 
-44 tests as of V2:
+179 tests as of V5:
 
 - Indicator math (MA / MACD / RSI / KD / DMI) against straight-uptrend fixtures
-- FinMind snapshot adapter — dedupe + invalid-row tolerance
+- FinMind snapshot adapter — dedupe + invalid-row tolerance + sub-floor rejection + front-month picker + day/night `_market_open` boundaries
 - Notifier hub — fan-out + per-channel failure isolation + channel filter
-- V2 position tracker — open/close/flip/idempotency/rehydrate
+- V2 position tracker — open/close/flip/idempotency/rehydrate, plus V5 entry_ind/exit_ind payload pass-through (including JSONB merge that preserves entry_ind on close)
 - V2 trades API — `compute_stats` win-rate / drawdown / avg-hold
 - V2 insights cache — TTL + LRU + key sensitivity
 - V2 insights service — system-prompt persona, cache_control marker, JSON-encoded payload (prompt-injection defence)
+- V2.5 backfill — trading-day filter, FinMind quota path, `_missing_days` threshold, today-skip
+- V2.6 dominant-contract filter, spread/floor guards
+- V3 watchdog tick + tombstone double-emit guard, backtest engine pair logic + stats math + state isolation, `/strategies/{name}/state` route
+- V4 lens URL/localStorage round-trip, `GET /backtest/run` parity with POST, backtest LRU hit/miss with module_mtime invalidation, `/insights/strategy` compare mode
+- V5 strategy spec compliance: `trade_strat_v1` (30m entry, 3m -DI > 23 exit assist, MACD rising-edge, +DI > -DI, TP=220 / SL=60), `trade_strat_v2` (5m entry, 3m -DI ≥ 23 exit assist, 1m TP=70 / SL=50, symmetric SHORT MACD falling-edge, no 5m TP/SL leak); `_ind_snapshot` 8-key shape; `bars_3m` cagg + RESOLUTIONS / RESOLUTION_DELTAS / VALID_RES wiring; `display_name` ClassVar surfaced via `StrategyOut`
 
 None require a live database. When you add a strategy, write a quick
 test that feeds synthetic `BarEvent`s through `your_strategy.on_bar()`
@@ -707,3 +736,96 @@ where `exit_ts IS NULL` makes "two open trades for the same pair"
 impossible at the DB layer. If you see a UniqueViolation in the backend
 logs, the most likely cause is a strategy emitting LONG twice in rapid
 succession after a backend restart — the second one is correctly rejected.
+
+---
+
+## 11. V5 — strategy spec compliance + chart marker hardening
+
+### 11.1 The two example strategies
+
+**`trade_strat_v1`** (display name `30分鐘線策略`) — see
+`v1_trade.md` for the source-of-truth.
+
+| facet | rule |
+|---|---|
+| resolutions | `["3m", "30m", "1d"]` |
+| entry tf | 30m bar close |
+| entry conditions (LONG) | `KD > 20` AND MACD just-turned-positive (`macd[-3] <= 0 AND macd[-2] > 0 AND macd[-1] > macd[-2]`) AND `+DI > 21` AND `+DI > -DI` |
+| entry conditions (SHORT) | symmetric: KD < 20-ceiling, MACD just-turned-negative (mirrored via `-macd`), `-DI > 21` AND `-DI > +DI` |
+| exit assist tf | 3m bar close |
+| exit assist | `-DI > 23` (strict `>`) closes LONG; `+DI > 23` closes SHORT |
+| TP / SL | 220 / 60 points, eval on entry-tf bar close |
+| daily 1d display | counts how many of the 3 entry conditions hold long/short side; shown as 0..3 dots in `DailyConfidenceBadge` |
+| cooldown | 5 × 30m bars after exit |
+
+**`trade_strat_v2`** (display name `5分鐘策略`) — see
+`v2_trade.md`.
+
+| facet | rule |
+|---|---|
+| resolutions | `["1m", "3m", "5m", "1d"]` |
+| entry tf | 5m bar close |
+| entry conditions | identical shape to v1, on 5m |
+| exit assist tf | 3m bar close |
+| exit assist | `-DI ≥ 23` (note: `>=`, not `>` — this is the v2 spec's distinction from v1) |
+| TP / SL | 70 / 50 points, eval on **1m** bar close (separate code path with no entry logic — `_check_tp_sl_minute`); 5m bar close does NOT evaluate TP/SL |
+| daily 1d display | same as v1 |
+| cooldown | 5 × 5m bars after exit |
+
+Both strategies emit `Signal.payload.entry_ind` and
+`payload.exit_ind` with the full 8-key snapshot (`{k, d, macd, signal,
+hist, plus_di, minus_di, adx}`, 2-decimal-rounded, NaN → None). The
+position tracker copies these into `Trade.payload` so the analysis log
+renders the conditions side-by-side.
+
+### 11.2 `bars_3m` continuous aggregate
+
+Migration `0004_bars_3m.py` (mirrors `0003_bars_2m_10m.py`) adds a
+`bars_3m` continuous aggregate with the same 30 s
+`add_continuous_aggregate_policy`. `RESOLUTIONS`,
+`RESOLUTION_DELTAS`, and `VALID_RES` are extended with `3m`. The
+`/bars` endpoint serves it like any other resolution. Run
+`docker compose down -v && docker compose up -d --build` (or
+`uv run alembic upgrade head` on the host) to apply.
+
+### 11.3 Chart marker behavior
+
+- **Pane-relative y clamp** in `frontend/components/Chart.tsx`. When
+  `series.priceToCoordinate(price)` returns null OR returns a y outside
+  the candle pane's height (fetched via `chart.paneSize(0).height` with
+  a defensive fallback to container height), the marker's y is clamped
+  into `[8, paneHeight - 8]` and a directional `▲` / `▼` chevron is
+  painted beside the disc so users see the off-screen exit.
+- **Hover hit-test cache** keyed on the same pixel coords the paint loop
+  used (`paintedCoordsRef: Map<TradeEvent, {x, y, outOfRange}>`). Clamped
+  exit dots are now hoverable; the tooltip shows the `#tradeId` chip.
+- **`window.__taiexMarkerStats`** exposes
+  `{events, drewOpen, drewClose, skipped, clamped, retryScheduled,
+  hitTestable}` for browser-console debugging.
+- **MarkerFilterPills** in TopBar gate which strategies render markers.
+  `全部` / `30分鐘線策略` / `5分鐘策略`. Local component state, no URL
+  persistence. `<Chart>` accepts a new
+  `markerStrategies?: Set<string> | null` prop (null = show all).
+
+### 11.4 What to do when a strategy spec changes
+
+1. Edit the strategy module under `backend/app/strategies/examples/`.
+2. Update the matching `backend/tests/test_<strategy>.py` cases — lock
+   the new condition with both positive and negative test fixtures.
+3. If the spec adds a new resolution, write an alembic migration that
+   adds the corresponding `bars_<N>` continuous aggregate and extend
+   `RESOLUTIONS` / `RESOLUTION_DELTAS` / `VALID_RES`. Mirror the latest
+   `0004_bars_3m.py` template.
+4. If the spec changes the indicator-snapshot shape, update both
+   strategies' `_ind_snapshot` helpers AND the frontend
+   `TradeIndicators` type in `frontend/lib/api.ts` AND the
+   `formatIndicators` rendering helper in
+   `frontend/components/TradesTable.tsx` — keep the fixed-key shape in
+   sync everywhere.
+5. After a strategy code edit, `module_mtime` invalidates the
+   per-strategy backtest LRU cache so subsequent `/backtest/run` calls
+   re-compute against the new code (V4 phase 1).
+6. Live trades from the previous spec remain in `trades` with
+   `payload.entry_ind` / `payload.exit_ind` matching the old shape. The
+   frontend renders missing fields as `—`, so historical rows don't
+   crash; manual cleanup is optional.

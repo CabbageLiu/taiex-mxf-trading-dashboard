@@ -2,8 +2,14 @@
 
 Real-time TAIEX cash-index dashboard (proxy for 小台指期 MXF) with togglable
 indicators (MACD, DMI, KD, RSI, MA), multi-resolution bars
-(1m/5m/15m/30m/1h/4h/12h/1d/1w/1mo), a plug-in strategy framework, and
+(1m/2m/3m/5m/10m/15m/30m/1h/4h/12h/1d/1w/1mo), a plug-in strategy framework, and
 fan-out alerting to Discord + n8n.
+
+Two example strategies ship in-tree (`trade_strat_v1` / `trade_strat_v2`)
+with Traditional-Chinese display names (`30分鐘線策略` / `5分鐘策略`)
+backed by the canonical DB key for cache stability. Each closed trade
+carries a KD / MACD / DMI snapshot at entry and exit so the analysis
+log shows the full conditions side-by-side.
 
 ```
 [FinMind 5-sec TAIEX] ──► [adapter] ──► [ingest loop] ──► TimescaleDB
@@ -113,7 +119,13 @@ cd backend && uv run pytest -q
   cash index from FinMind's free `TaiwanVariousIndicators5Seconds` dataset.
   Swap to a real MXF feed (Shioaji, paid FinMind) by writing a new
   `MarketDataAdapter` in `backend/app/adapters/`; nothing else changes.
-- Continuous aggregates exist for 1m–1d. 1w and 1mo are plain views over
+- Continuous aggregates exist for 1m–1d (including the 2m / 3m / 10m
+  buckets the example strategies use). 1w and 1mo are plain views over
   the 1d aggregate to keep the migration simple.
 - `1m` continuous aggregate refresh policy runs every 30 s with a 1m
   end-offset, so the most recent finalised bar lags the present by ≤ 1m.
+- Strategies expose an optional `display_name: ClassVar[str]` so the UI
+  can render a human-friendly label while the canonical `name` remains
+  the DB key for `trades.strategy`, `signals.strategy`, and
+  `strategy_config.name`. UI components fall back to `name` whenever
+  `display_name` is unset.
