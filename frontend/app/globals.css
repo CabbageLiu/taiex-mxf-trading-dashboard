@@ -12,6 +12,13 @@
   --down: #3a7d4f;           /* 苔綠 */
   --warn: #a4793a;
 
+  /* V4 Phase 3 — per-strategy chart marker palette. Used to disambiguate
+     overlapping plot layers (live vs backtest, v1 vs v2). The hex literals
+     are mirrored in `Chart.tsx::STRATEGY_COLORS` because lightweight-charts
+     does not resolve `var(--…)` for canvas-painted markers. */
+  --strategy-1: #4a7ba6;     /* indigo blue */
+  --strategy-2: #b87333;     /* copper orange */
+
   /* V2 design tokens — additive, do not remove existing vars */
   --ink: #1f1d1a;
   --ink-muted: #6b655c;
@@ -888,16 +895,18 @@ textarea:focus-visible,
   .bt-submit { width: 100%; }
 }
 
-/* ─── Daily Confidence badge (chart top-right overlay) ─────────────────────── */
+/* ─── Daily Confidence badge (rail panel) ──────────────────────────────────── */
+/* V4 Phase 3 Slice B: relocated from chart top-right overlay to the
+   trading-side rail. The base `.confidence-badge` is now a normal-flow
+   panel; the legacy overlay positioning lives behind `--overlay` if
+   anyone wants to bring it back. */
 
 .confidence-badge {
-  position: absolute;
-  top: 28px;
-  right: 10px;
+  margin: var(--space-3) var(--space-4);
   min-width: 140px;
   padding: var(--space-2) var(--space-3);
   border-radius: 6px;
-  background: rgba(251, 247, 238, 0.92);
+  background: var(--panel);
   border: 1px solid var(--rule);
   box-shadow: var(--shadow-sm);
   font-size: var(--fs-meta);
@@ -905,9 +914,17 @@ textarea:focus-visible,
   display: flex;
   flex-direction: column;
   gap: 4px;
-  z-index: 4;
   animation: fadeInUp var(--dur-base) var(--ease-out) both;
   font-variant-numeric: tabular-nums;
+}
+
+.confidence-badge.confidence-badge--overlay {
+  position: absolute;
+  top: 28px;
+  right: 10px;
+  margin: 0;
+  background: rgba(251, 247, 238, 0.92);
+  z-index: 4;
 }
 .conf-row {
   display: flex;
@@ -943,3 +960,38 @@ textarea:focus-visible,
   font-size: var(--fs-caption);
   color: var(--ink-muted);
 }
+
+/* ─── Visible-window hi/lo badge (chart top-left overlay) ──────────────────── */
+
+.hi-lo-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 8;
+  background: rgba(251, 247, 238, 0.92);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: var(--fs-meta);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-shadow: var(--shadow-sm);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.hi-lo-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.hi-lo-label {
+  color: var(--ink-muted);
+  font-size: var(--fs-caption);
+  min-width: 16px;
+}
+.hi-lo-num {
+  font-weight: var(--fw-semi);
+}
+.hi-lo-num.up { color: var(--up); }
+.hi-lo-num.down { color: var(--down); }

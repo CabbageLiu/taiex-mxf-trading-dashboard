@@ -21,6 +21,7 @@ export type CrosshairIndicators = {
 export type CrosshairData = {
   ohlc: CrosshairOhlc;
   indicators: CrosshairIndicators;
+  cursorPrice?: number | null;
 };
 
 type Props = {
@@ -63,6 +64,12 @@ export function ChartCrosshairTooltip({ data }: Props) {
   return (
     <div className="crosshair-tooltip" role="status" aria-live="off">
       <dl>
+        {data.cursorPrice != null && (
+          <>
+            <dt>{t("crosshair.cursor")}</dt>
+            <dd className="v">{fmtPrice(data.cursorPrice)}</dd>
+          </>
+        )}
         <dt>{t("crosshair.time")}</dt>
         <dd className="v">{fmtTime(ohlc.time)}</dd>
         <dt>{t("crosshair.ohlc")}</dt>

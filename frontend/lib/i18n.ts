@@ -110,6 +110,11 @@ export const dict = {
   // V2 — chart crosshair
   "crosshair.time": "時間",
   "crosshair.ohlc": "OHLC",
+  "crosshair.cursor": "游標",
+
+  // V4 — chart hi/lo badge
+  "hilo.high": "高",
+  "hilo.low": "低",
 } as const;
 
 export type DictKey = keyof typeof dict;

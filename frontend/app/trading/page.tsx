@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Suspense, useMemo, useState } from "react";
 
 import { Chart } from "@/components/Chart";
+import { DailyConfidenceBadge } from "@/components/DailyConfidenceBadge";
 import { TopBar } from "@/components/TopBar";
 import { AlertLog, type SignalRow } from "@/components/AlertLog";
 import { api } from "@/lib/api";
@@ -94,6 +95,7 @@ function TradingPageInner() {
       </div>
 
       <aside className="trading-side">
+        <DailyConfidenceBadge strategy={strategy ?? null} />
         <AlertLog liveSignals={signals} />
       </aside>
     </div>
