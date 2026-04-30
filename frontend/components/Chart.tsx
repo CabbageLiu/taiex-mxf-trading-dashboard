@@ -312,9 +312,36 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     recomputeHiLoRef.current = () =>
       onVisibleRangeChange(chart.timeScale().getVisibleLogicalRange() ?? null);
 
+    // V4 Phase 5 — global "scroll chart to time" hook. AlertLog rows dispatch
+    // a `chart-scroll-to` CustomEvent with `{ time: epochSeconds }`; we
+    // recenter the visible range on that timestamp using a ±3-hour window.
+    // lightweight-charts has no direct `scrollTo(time)`; setVisibleRange is
+    // the v5-supported equivalent.
+    const onScrollTo = (e: Event) => {
+      const ev = e as CustomEvent<{ time: number }>;
+      const time = ev.detail?.time;
+      if (typeof time !== "number" || !Number.isFinite(time) || !chartRef.current) return;
+      const halfWindow = 3600 * 3;
+      try {
+        chartRef.current.timeScale().setVisibleRange({
+          from: (time - halfWindow) as Time,
+          to: (time + halfWindow) as Time,
+        });
+      } catch {
+        // setVisibleRange throws if the requested range falls entirely
+        // outside the data — silently ignore; the user can re-scroll.
+      }
+    };
+    if (typeof window !== "undefined") {
+      window.addEventListener("chart-scroll-to", onScrollTo);
+    }
+
     return () => {
       chart.unsubscribeCrosshairMove(onMove);
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange);
+      if (typeof window !== "undefined") {
+        window.removeEventListener("chart-scroll-to", onScrollTo);
+      }
       recomputeHiLoRef.current = null;
       chart.remove();
       chartRef.current = null;

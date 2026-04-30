@@ -120,6 +120,11 @@ export const dict = {
   "compare.title": "回測比較",
   "compare.toggle": "比較模式",
   "compare.lensSubtitle": "回測：",
+
+  // V4 Phase 5 — alert log channel chips + signal seed
+  "alerts.test_send": "測試發送",
+  "alerts.none_signals": "尚無觸發訊號",
+  "alerts.none_alerts": "尚無遞送紀錄",
 } as const;
 
 export type DictKey = keyof typeof dict;

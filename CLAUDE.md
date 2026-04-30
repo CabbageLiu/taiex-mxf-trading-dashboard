@@ -297,7 +297,7 @@ Engine details:
 - `pair_into_trades` is a pure function mirroring `PositionTracker` (LONG/SHORT/EXIT/FLAT, reverse-on-opposite, no-op same-direction).
 - `compute_backtest_stats` reuses `app.api.routes.trades.compute_stats` via `SimpleNamespace` adapters and adds Pine-Script extras: `profit_factor`, `largest_win`, `largest_loss`, `avg_bars_in_trade`.
 
-Frontend `/backtest` page (`app/backtest/page.tsx`, App Router, Suspense-wrapped) renders form (strategy selector, start/end dates) → KPI strip (8 cards: pnl_total / win_rate / profit_factor / max_drawdown / trade_count / avg_bars_in_trade / largest_win / largest_loss) → equity curve `LineSeries` → trades table. **V4 plans to retire this as a top-level route — see `v4_plan.md`.**
+Frontend `/backtest` page was a standalone route in V3 (form → KPI strip → equity curve → trades table). **Retired in V4** — `app/backtest/page.tsx` is now a server-side `redirect("/analysis?compare=1&s=trade_strat_v1&s2=trade_strat_v2")` for old bookmarks; the same KPI / equity / trades surface is now lens-driven inside `/analysis` (compare mode renders side-by-side). The backtest *engine* and `/backtest/run` REST route are unchanged.
 
 ### Tests
 
@@ -319,3 +319,41 @@ V3 introduced new known-issue items, addressed in `v4_plan.md`:
 - `_STATE` swap convention is module-introspection-based. Reasonable for v1 stateful strategies but brittle if a strategy uses a non-`_STATE` name. Document the convention in any new strategy template.
 
 **`v4_plan.md` is the canonical scope reference for the next session.** It defines the strategy-as-lens model, the right-rail composition on `/trading`, the lens-driven `/analysis`, working alert plumbing (`/alerts/stats`, `/admin/test-webhook`, channel chips), and a 5-phase rollout. Read it before starting V4 work.
+
+### V4 — Strategy as global lens + alert plumbing + chart polish
+
+#### Strategy + window as a global lens
+
+`frontend/lib/lens.ts` is the canonical state hook. URL params `?s=&s2=&start=&end=&res=&ind=&compare=` are the source of truth; `localStorage` key `taiex.lens.v1` mirrors them and seeds on cold mount when the URL has no params. `s` is the primary strategy, `s2` is the comparison strategy (compare mode), `start`/`end` are ISO dates, `res` is the chart resolution, `ind` is a comma-joined indicator allow-list, `compare=1` flips compare mode on. Both `/trading` and `/analysis` consume the same hook; resolution + indicator selections persist across navigation. `ShellHeader` nav links forward the current querystring (existing behaviour, retained).
+
+#### Backtest engine LRU
+
+`app.backtest.engine` adds an in-process LRU keyed on `(strategy, params_hash, symbol, start, end, module_mtime)`. Both `POST /backtest/run` (existing) and the new `GET /backtest/run` (idempotent, query-param form for the lens `useBacktest` hook) share the cache. `module_mtime` of the strategy module file invalidates the cache after a strategy code edit so a hot-reloaded strategy never serves stale results.
+
+#### `trade_strat_v2`
+
+Clone of `trade_strat_v1` with the entry / TP / SL timeframe shifted from 30m → 10m and the exit-assist timeframe shifted from 5m → 2m; daily confidence on 1d unchanged. Declares `resolutions = ["2m", "10m", "1d"]`. New alembic migration `0003_bars_2m_10m.py` adds the `bars_2m` and `bars_10m` continuous aggregates with the same 30 s `add_continuous_aggregate_policy` as the V1 buckets. `RESOLUTIONS` in `ingest/runner.py` and `VALID_RES` in `api/routes/bars.py` updated accordingly.
+
+#### Chart polish
+
+Cursor-price line in `ChartCrosshairTooltip.tsx` via `series.coordinateToPrice` (shows the price at the crosshair Y, not just the bar OHLC). Top-left `HiLoBadge.tsx` overlay subscribes to `chart.timeScale().subscribeVisibleLogicalRangeChange` and reports the high/low of the *visible* range — recomputes only when the visible range moves. CSS strategy color tokens `--strategy-1` / `--strategy-2` drive marker / connector / equity-line colours so primary vs comparison strategies are visually disambiguated everywhere. Live + backtest marker layers coexist on the chart: live markers are filled, backtest markers are half-opacity dotted to keep them legible without competing for attention. `DailyConfidenceBadge` moved out of the chart overlay into the right rail on `/trading` so it doesn't overlap with the new `HiLoBadge` corner real estate.
+
+#### `/analysis` lens-driven KPI / trades / insight
+
+When the lens has a window selected, `useBacktest()` feeds the KPI strip and trades table — `/analysis` now shows backtest results for the same `(strategy, start, end)` lens that `/trading` is plotting. With `compare=1`, two `useBacktest` calls run in parallel and the page renders side-by-side `1fr 1fr` columns (left primary, right comparison). The AI insight panel posts trades + stats inline; comparison mode posts `compare_a` / `compare_b` payloads, and the backend appends a second `cache_control: ephemeral` system block (`COMPARE_SYSTEM_TAIL`) — the original `SYSTEM_PROMPT` constant stays byte-unchanged so the live-mode prefix cache survives.
+
+#### Working alert plumbing
+
+`GET /signals?strategy=&since=&limit=` seeds the 即時訊號 panel on mount (previously cold-started empty until a new signal fired). `GET /alerts/stats` aggregates per channel: `{ channel: {sent, failed, last_ts} }`, powering the channel chips. `POST /admin/test-webhook?channel=discord|n8n` fires a synthetic `Signal` through one notifier; returns 503 if the channel's env var is unset, 200 with `{ok}` on success. Right-rail 通知遞送 panel shows channel health chips with a 測試發送 button per channel. Click on a 即時訊號 row dispatches a `chart-scroll-to` `CustomEvent` that the chart on `/trading` listens for and pans the time scale to the bar.
+
+#### `/backtest` retired
+
+`frontend/app/backtest/page.tsx` is now a server-side `redirect("/analysis?compare=1&s=trade_strat_v1&s2=trade_strat_v2")` (Next 15 idiomatic). `ShellHeader.tsx` `NAV` array no longer includes the entry; the `"nav.backtest"` key remains in `lib/i18n.ts` (harmless, no callers). Old bookmarks resolve via the redirect. The backtest *engine* (`app/backtest/engine.py`) and the `POST /backtest/run` REST route are unchanged — only the standalone UI page is gone.
+
+#### Tests
+
+V4 added tests for: lens URL/localStorage round-trip, `GET /backtest/run` shape parity with `POST`, backtest LRU hit/miss with module_mtime invalidation, `trade_strat_v2` (entry/exit/TP/SL on the 10m/2m timeframes, dump_state shape), `bars_2m` + `bars_10m` route presence, `GET /signals` filter by `strategy`/`since`/`limit`, `GET /alerts/stats` aggregation, `POST /admin/test-webhook` 503-when-unset / 200-success / channel-routing, `/insights/strategy` compare mode (`compare_a`/`compare_b` payload, `COMPARE_SYSTEM_TAIL` tail block, original `SYSTEM_PROMPT` constant unchanged so prefix cache survives). **145 tests as of V4.** Confirm via `cd backend && uv run pytest -q | tail -1`.
+
+#### Backlog still deferred
+
+V4 did not address: CORS still wide open, mutating endpoints unauthenticated (`/strategies/*`, `/insights/strategy`, `/admin/backfill`, `/admin/test-webhook`, `/backtest/run`), no global Anthropic spend cap, reverse-proxy IP gap on the rate limiter, no TW holiday calendar, `/admin/backfill` synchronous, no per-trade fees / slippage / position sizing in the backtest engine, no auth / multi-user, backtest engine still fills at signal-bar close (no `next_bar_open` mode), `_STATE` swap convention is module-introspection-based and brittle to non-`_STATE` naming, `wipe_and_rebackfill.py` still has no env guard.
