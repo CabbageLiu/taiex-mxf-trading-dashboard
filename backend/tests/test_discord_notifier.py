@@ -83,12 +83,13 @@ async def test_discord_embed_contains_display_name():
     body = _StubClient.last_body
     assert body is not None
     title = body["embeds"][0]["title"]
-    # display_name for trade_strat_v1 = "30分鐘線策略"
+    # display_name for trade_strat_v1 = "30分鐘線策略"; side LONG → 多單
     assert "30分鐘線策略" in title
-    # canonical name appears in Strategy field when display differs
+    assert "多單" in title
+    # canonical name appears in 策略 field (TC label) when display differs
     fields = {f["name"]: f["value"] for f in body["embeds"][0]["fields"]}
-    assert "Strategy" in fields
-    assert "trade_strat_v1" in fields["Strategy"]
+    assert "策略" in fields
+    assert "trade_strat_v1" in fields["策略"]
 
 
 async def test_discord_embed_contains_entry_ind_when_present():
@@ -153,9 +154,14 @@ async def test_discord_embed_close_signal_carries_exit_reason_and_pnl():
     with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
         await n.send(sig)
     fields = {f["name"]: f["value"] for f in _StubClient.last_body["embeds"][0]["fields"]}
-    assert fields.get("出場原因") == "DI_FLIP_10M"
+    # exit_reason field uses TC translation
+    assert fields.get("出場原因") == "10 分鐘 DMI 翻轉 (-DI > +DI)"
     assert fields.get("損益") == "+87.5 點"
     assert "出場指標" in fields
+    # description carries the exit reason + signed pnl
+    desc = _StubClient.last_body["embeds"][0]["description"]
+    assert "10 分鐘 DMI 翻轉" in desc
+    assert "+87.5" in desc
 
 
 async def test_discord_embed_pnl_negative_renders_signed():
@@ -173,10 +179,10 @@ async def test_discord_embed_time_is_taipei():
     with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
         await n.send(sig)
     fields = {f["name"]: f["value"] for f in _StubClient.last_body["embeds"][0]["fields"]}
-    assert "Time" in fields
+    assert "時間" in fields
     # 05:30 UTC = 13:30 CST
-    assert "13:30" in fields["Time"]
-    assert "CST" in fields["Time"]
+    assert "13:30" in fields["時間"]
+    assert "CST" in fields["時間"]
 
 
 async def test_discord_embed_footer_carries_signal_id():
@@ -185,7 +191,7 @@ async def test_discord_embed_footer_carries_signal_id():
     with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
         await n.send(sig, signal_id=4242)
     embed = _StubClient.last_body["embeds"][0]
-    assert embed.get("footer", {}).get("text") == "signal #4242"
+    assert embed.get("footer", {}).get("text") == "訊號 #4242"
 
 
 async def test_discord_skips_post_when_no_url():
@@ -210,6 +216,88 @@ async def test_fmt_ind_returns_none_for_all_null_snapshot():
 
 async def test_display_name_unknown_strategy_falls_back_to_name():
     assert _display_name_for("__not_a_real_strategy__") == "__not_a_real_strategy__"
+
+
+async def test_discord_embed_side_short_renders_as_kong_dan():
+    n = DiscordNotifier(url="https://discord.example/webhook")
+    sig = _make_signal(side="SHORT")
+    with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
+        await n.send(sig)
+    title = _StubClient.last_body["embeds"][0]["title"]
+    assert "空單" in title
+    assert "SHORT" not in title
+
+
+async def test_discord_embed_side_exit_renders_as_ping_cang():
+    n = DiscordNotifier(url="https://discord.example/webhook")
+    sig = _make_signal(side="EXIT", payload={"exit_reason": "TP", "pnl_points": 150.0})
+    with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
+        await n.send(sig)
+    title = _StubClient.last_body["embeds"][0]["title"]
+    assert "平倉" in title
+
+
+async def test_discord_embed_open_description_lists_entry_conditions():
+    n = DiscordNotifier(url="https://discord.example/webhook")
+    sig = _make_signal(side="LONG")  # trade_strat_v1
+    with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
+        await n.send(sig)
+    desc = _StubClient.last_body["embeds"][0]["description"]
+    assert desc is not None
+    assert "進場訊號" in desc
+    # Indicator names stay English
+    assert "KD" in desc
+    assert "MACD" in desc
+    assert "+DI" in desc and "-DI" in desc
+
+
+async def test_discord_embed_close_description_translates_exit_reason():
+    n = DiscordNotifier(url="https://discord.example/webhook")
+    cases = [
+        ("TP", "達到停利"),
+        ("SL", "觸及停損"),
+        ("DI_FLIP_10M", "10 分鐘 DMI 翻轉"),
+        ("MACD_DOWN_30M", "30 分鐘 MACD 下彎"),
+    ]
+    for code, expected_substr in cases:
+        sig = _make_signal(side="EXIT", payload={"exit_reason": code, "pnl_points": 25.0})
+        with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
+            await n.send(sig)
+        fields = {
+            f["name"]: f["value"]
+            for f in _StubClient.last_body["embeds"][0]["fields"]
+        }
+        assert expected_substr in fields["出場原因"], (
+            f"{code} should translate via {expected_substr}"
+        )
+
+
+async def test_discord_embed_unknown_exit_reason_passes_through():
+    n = DiscordNotifier(url="https://discord.example/webhook")
+    sig = _make_signal(side="EXIT", payload={"exit_reason": "WEIRD_CODE", "pnl_points": 0.0})
+    with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
+        await n.send(sig)
+    fields = {f["name"]: f["value"] for f in _StubClient.last_body["embeds"][0]["fields"]}
+    assert fields["出場原因"] == "WEIRD_CODE"
+
+
+async def test_discord_embed_field_names_are_traditional_chinese():
+    n = DiscordNotifier(url="https://discord.example/webhook")
+    sig = _make_signal()
+    with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
+        await n.send(sig)
+    field_names = {f["name"] for f in _StubClient.last_body["embeds"][0]["fields"]}
+    assert "商品" in field_names
+    assert "週期" in field_names
+    assert "價格" in field_names
+    assert "時間" in field_names
+    assert "策略" in field_names
+    # No English field-name leak
+    assert "Symbol" not in field_names
+    assert "Resolution" not in field_names
+    assert "Price" not in field_names
+    assert "Time" not in field_names
+    assert "Strategy" not in field_names
 
 
 async def test_discord_send_handles_http_error():
