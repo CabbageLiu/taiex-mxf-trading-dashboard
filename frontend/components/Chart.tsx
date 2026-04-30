@@ -206,6 +206,45 @@ type PaneRefs = {
   series: ISeriesApi<any>[];
 };
 
+// V5.1 — pane height persistence. lightweight-charts v5 has
+// `IPaneApi.getHeight()` / `setHeight(number)` (typings.d.ts L2019/L2025) and
+// `IChartApi.panes()` (L1779). The user can drag pane separators to resize
+// (`panes.enableResize: true` in the chart options below). Without
+// persistence, every indicator-effect rerun called `pane.setHeight(<literal>)`
+// which silently discarded the user's drag-resize. We snapshot heights on
+// every render via a 2 s polling interval and on cleanup just before
+// `removePane`, hydrate from localStorage on mount, and apply the saved
+// value when (re)creating each pane.
+type PaneKey = "candle" | "macd" | "rsi" | "kd" | "dmi";
+const PANE_LS_KEY = "taiex.pane.heights.v1";
+const DEFAULT_PANE_HEIGHTS: Record<PaneKey, number> = {
+  candle: 320,
+  macd: 120,
+  rsi: 100,
+  kd: 100,
+  dmi: 100,
+};
+
+function loadPaneHeights(): Partial<Record<PaneKey, number>> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(PANE_LS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: Partial<Record<PaneKey, number>> = {};
+    for (const k of ["candle", "macd", "rsi", "kd", "dmi"] as PaneKey[]) {
+      const v = (parsed as Record<string, unknown>)[k];
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+        out[k] = v;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 // `strategy` is still part of the Props contract (callers like
 // `trading/page.tsx` keep passing it), but the chart itself no longer
 // reads it directly — live trades render for ALL strategies (color-coded)
@@ -265,6 +304,44 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
   // refs avoid re-subscribing the handler on every state change.
   const stateRef = useRef(state);
   stateRef.current = state;
+
+  // V5.1 — per-pane height ref. Hydrated from localStorage on mount, written
+  // on cleanup-before-removePane and on a 2 s polling cadence. Indicator
+  // effects read this ref when (re)creating a pane so user-dragged heights
+  // survive indicator toggle off/on, resolution change, and page reload.
+  const paneHeightsRef = useRef<Partial<Record<PaneKey, number>>>({});
+  const persistPaneHeights = useCallback(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        PANE_LS_KEY,
+        JSON.stringify(paneHeightsRef.current),
+      );
+    } catch {
+      // localStorage may be disabled (private mode, quota); silent fail keeps
+      // the chart functional — heights still live in memory for this session.
+    }
+  }, []);
+  const snapshotPaneHeight = useCallback(
+    (key: PaneKey, pane: IPaneApi<Time> | null | undefined) => {
+      if (!pane) return;
+      try {
+        const h = pane.getHeight();
+        if (Number.isFinite(h) && h > 0 && paneHeightsRef.current[key] !== h) {
+          paneHeightsRef.current[key] = h;
+          persistPaneHeights();
+        }
+      } catch {
+        // pane may already be detached during cleanup — swallow.
+      }
+    },
+    [persistPaneHeights],
+  );
+
+  // Hydrate once on mount.
+  useEffect(() => {
+    paneHeightsRef.current = loadPaneHeights();
+  }, []);
 
   // ─── Init chart ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -352,6 +429,24 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     });
     if (reduceMotion) {
       candleRef.current.applyOptions({ priceLineVisible: false });
+    }
+
+    // V5.1 — restore candle pane height from localStorage on chart create.
+    // The candle pane (index 0) has no removable lifecycle, so the periodic
+    // snapshot below is what catches subsequent user drags; this just seeds
+    // the saved value on cold mount / page reload. Pane API confirmed in
+    // lightweight-charts/dist/typings.d.ts: `IChartApi.panes(): IPaneApi[]`
+    // (L1779) and `IPaneApi.setHeight(number)` (L2025).
+    try {
+      const savedCandle = paneHeightsRef.current.candle;
+      if (savedCandle != null && savedCandle > 0) {
+        const panes = chart.panes();
+        if (panes.length > 0) {
+          panes[0].setHeight(savedCandle);
+        }
+      }
+    } catch {
+      // Defensive — chart may not have panes() if API surface changes.
     }
 
     const onMove = (param: MouseEventParams<Time>) => {
@@ -559,6 +654,10 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     if (!chart) return;
     const teardown = () => {
       if (macdRef.current) {
+        // V5.1 — capture user-dragged height before the pane is destroyed so
+        // a re-enable later restores it. Wrapped in try/catch (snapshotPaneHeight
+        // already does, but we double-shield since pane may be detached).
+        snapshotPaneHeight("macd", macdRef.current.pane);
         chart.removeSeries(macdRef.current.line);
         chart.removeSeries(macdRef.current.sig);
         chart.removeSeries(macdRef.current.hist);
@@ -570,7 +669,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     if (!wantMACD) { teardown(); return; }
     if (!macdRef.current) {
       const pane = chart.addPane();
-      pane.setHeight(120);
+      pane.setHeight(paneHeightsRef.current.macd ?? DEFAULT_PANE_HEIGHTS.macd);
       const idx = pane.paneIndex();
       const opts = { priceFormat: { type: "price", precision: 2, minMove: 0.01 } } as const;
       const hist = chart.addSeries(HistogramSeries, { ...opts, color: "#8a8175" }, idx);
@@ -607,6 +706,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     if (!chart) return;
     const teardown = () => {
       if (rsiRef.current) {
+        snapshotPaneHeight("rsi", rsiRef.current.pane);
         chart.removeSeries(rsiRef.current.line);
         try { chart.removePane(rsiRef.current.pane.paneIndex()); } catch {}
         rsiRef.current = null;
@@ -616,7 +716,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     if (!wantRSI) { teardown(); return; }
     if (!rsiRef.current) {
       const pane = chart.addPane();
-      pane.setHeight(100);
+      pane.setHeight(paneHeightsRef.current.rsi ?? DEFAULT_PANE_HEIGHTS.rsi);
       const idx = pane.paneIndex();
       const line = chart.addSeries(LineSeries, { color: "#5d3f6e", lineWidth: 1 }, idx);
       rsiRef.current = { pane, line };
@@ -635,6 +735,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     if (!chart) return;
     const teardown = () => {
       if (kdRef.current) {
+        snapshotPaneHeight("kd", kdRef.current.pane);
         chart.removeSeries(kdRef.current.k);
         chart.removeSeries(kdRef.current.d);
         try { chart.removePane(kdRef.current.pane.paneIndex()); } catch {}
@@ -645,7 +746,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     if (!wantKD) { teardown(); return; }
     if (!kdRef.current) {
       const pane = chart.addPane();
-      pane.setHeight(100);
+      pane.setHeight(paneHeightsRef.current.kd ?? DEFAULT_PANE_HEIGHTS.kd);
       const idx = pane.paneIndex();
       const k = chart.addSeries(LineSeries, { color: "#2a6f5a", lineWidth: 1 }, idx);
       const d = chart.addSeries(LineSeries, { color: ACCENT, lineWidth: 1 }, idx);
@@ -668,6 +769,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     if (!chart) return;
     const teardown = () => {
       if (dmiRef.current) {
+        snapshotPaneHeight("dmi", dmiRef.current.pane);
         chart.removeSeries(dmiRef.current.plus);
         chart.removeSeries(dmiRef.current.minus);
         chart.removeSeries(dmiRef.current.adx);
@@ -679,7 +781,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     if (!wantDMI) { teardown(); return; }
     if (!dmiRef.current) {
       const pane = chart.addPane();
-      pane.setHeight(100);
+      pane.setHeight(paneHeightsRef.current.dmi ?? DEFAULT_PANE_HEIGHTS.dmi);
       const idx = pane.paneIndex();
       // +DI = 漲 = 紅; −DI = 跌 = 綠 (TW); ADX = sumi-gold
       const plus = chart.addSeries(LineSeries, { color: UP, lineWidth: 1 }, idx);
@@ -1102,6 +1204,34 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     // lastHist.time === live.time — refetch arrived for the same bucket the
     // WS is accumulating. Keep `lastBarRef.current` (WS data is authoritative).
   }, [bars]);
+
+  // ─── Periodic pane-height snapshot ────────────────────────────────────
+  // The user can drag the pane separators at any time. Rather than wiring a
+  // bespoke onResize event for every pane (lightweight-charts v5 doesn't
+  // expose one — `panes.enableResize: true` is fire-and-forget), poll every
+  // 2 s and persist on change. Cheap: 5 `getHeight()` reads + a localStorage
+  // write only when something actually moved. snapshotPaneHeight no-ops
+  // when the height hasn't changed.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handle = window.setInterval(() => {
+      const chart = chartRef.current;
+      if (!chart) return;
+      try {
+        const panes = chart.panes();
+        if (panes.length > 0) snapshotPaneHeight("candle", panes[0]);
+      } catch {
+        // chart.panes() shape is stable in v5 but guard for safety.
+      }
+      if (macdRef.current) snapshotPaneHeight("macd", macdRef.current.pane);
+      if (rsiRef.current) snapshotPaneHeight("rsi", rsiRef.current.pane);
+      if (kdRef.current) snapshotPaneHeight("kd", kdRef.current.pane);
+      if (dmiRef.current) snapshotPaneHeight("dmi", dmiRef.current.pane);
+    }, 2000);
+    return () => {
+      window.clearInterval(handle);
+    };
+  }, [snapshotPaneHeight]);
 
   // ─── Strategy plot overlay (markers + SL/TP/entry price lines) ────────
   // Idempotent on signal id so a refetch / re-broadcast cannot double-mark.

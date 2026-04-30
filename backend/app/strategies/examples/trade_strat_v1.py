@@ -1,7 +1,7 @@
 """TAIEX Multi-Timeframe Strategy v1 (30分鐘線策略).
 
 Entry layer  : 30m (KD>20, MACD rising-edge positive, +DI>21 AND +DI>-DI).
-Exit assist  : 3m -DI > 23 (short-term momentum flip).
+Exit assist  : 10m DMI flip (-DI > +DI for LONG; +DI > -DI for SHORT).
 Trend layer  : Daily — display-only "Daily Confidence" badge (0/3..3/3),
                does not block entry.
 
@@ -30,12 +30,18 @@ Discipline:
   * Fill at signal bar close (framework cannot delay to next-bar open;
     documented deviation from spec).
 
-Exits:
-  * +220 pt take-profit
-  * -60 pt stop-loss
-  * 3m -DI > 23 (short-term momentum flip)
+Exits (any one fires → close):
+  * +150 pt take-profit (30m bar close).
+  * -60 pt stop-loss (30m bar close).
+  * 10m DMI flip: -DI > +DI closes LONG, +DI > -DI closes SHORT
+    (reason `DI_FLIP_10M`).
+  * 30m MACD-falling: macd[-2] > macd[-1] closes LONG, macd[-2] < macd[-1]
+    closes SHORT (reason `MACD_DOWN_30M`).
 
-R:R = 220 : 60 = 3.67:1.
+Priority on a single 30m bar close: TP/SL > MACD-falling > entry eval. If
+TP and falling-MACD both fire on the same bar, only TP is emitted.
+
+R:R = 150 : 60 = 2.5:1.
 
 Strategy instance is rebuilt per bar_close, so position / cooldown state
 lives in the module-level _STATE dict keyed by (strategy_name, symbol).
@@ -73,9 +79,8 @@ class TradeStratV1Params(BaseModel):
     dmi_period: int = 14
     di_long_threshold: float = 21.0
     di_short_threshold: float = 21.0
-    exit_di_threshold: float = 23.0
 
-    tp_points: float = 220.0
+    tp_points: float = 150.0
     sl_points: float = 60.0
 
     cooldown_bars: int = Field(default=5, ge=0)
@@ -197,7 +202,7 @@ def _ind_snapshot(
 class TradeStratV1(Strategy):
     name: ClassVar[str] = "trade_strat_v1"
     display_name: ClassVar[str] = "30分鐘線策略"
-    resolutions: ClassVar[list[str]] = ["3m", "30m", "1d"]
+    resolutions: ClassVar[list[str]] = ["10m", "30m", "1d"]
     params_schema: ClassVar[type[BaseModel]] = TradeStratV1Params
     indicator_specs: ClassVar[dict[str, dict]] = {
         "kd": {"kind": "kd", "params": {"period": 9, "k_smooth": 3, "d_smooth": 3}},
@@ -236,8 +241,8 @@ class TradeStratV1(Strategy):
         if ev.resolution == "1d":
             self._update_daily_confidence(ev, st, params)
             return None
-        if ev.resolution == "3m":
-            return self._exit_assist(ev, st, params)
+        if ev.resolution == "10m":
+            return self._exit_assist_10m(ev, st, params)
         if ev.resolution == "30m":
             return self._on_30m(ev, st, params)
         return None
@@ -320,9 +325,16 @@ class TradeStratV1(Strategy):
             and minus_curr > plus_curr
         )
 
-        # Evaluate exit on existing position before any new entry.
+        # Evaluate exit on existing position before any new entry. TP/SL
+        # has highest priority; MACD-falling fires only when neither TP
+        # nor SL triggered on this bar.
         if st.position is not None:
             sig = self._check_tp_sl(ev, st, p, close_curr)
+            if sig is not None:
+                st.last_long_ready = long_now
+                st.last_short_ready = short_now
+                return sig
+            sig = self._macd_falling_exit(ev, st, p)
             if sig is not None:
                 st.last_long_ready = long_now
                 st.last_short_ready = short_now
@@ -369,9 +381,9 @@ class TradeStratV1(Strategy):
             return self._close_position(ev, st, close, "SL", pnl)
         return None
 
-    # ─── 3m exit assist (-DI flip) ───────────────────────────────────────
+    # ─── 10m exit assist (DMI flip) ──────────────────────────────────────
 
-    def _exit_assist(
+    def _exit_assist_10m(
         self, ev: BarEvent, st: _StratState, p: TradeStratV1Params
     ) -> Signal | None:
         if st.position is None:
@@ -384,17 +396,39 @@ class TradeStratV1(Strategy):
         minus = _scalar(dmi["minus_di"])
         if plus is None or minus is None:
             return None
+        if st.position.side == "LONG" and minus > plus:
+            pnl = close - st.position.entry_price
+            return self._close_position(ev, st, close, "DI_FLIP_10M", pnl)
+        if st.position.side == "SHORT" and plus > minus:
+            pnl = st.position.entry_price - close
+            return self._close_position(ev, st, close, "DI_FLIP_10M", pnl)
+        return None
 
-        # LONG → exit when -DI flips strong (downside momentum).
-        # SHORT → exit when +DI flips strong (upside momentum).
-        flip_ind = minus if st.position.side == "LONG" else plus
-        if flip_ind > p.exit_di_threshold:
-            pnl = (
-                close - st.position.entry_price
-                if st.position.side == "LONG"
-                else st.position.entry_price - close
-            )
-            return self._close_position(ev, st, close, "DI_FLIP", pnl)
+    # ─── 30m MACD-falling exit ───────────────────────────────────────────
+
+    def _macd_falling_exit(
+        self, ev: BarEvent, st: _StratState, p: TradeStratV1Params
+    ) -> Signal | None:
+        if st.position is None:
+            return None
+        macd = ev.indicators.get("macd")
+        close = _scalar(ev.bars["close"])
+        if macd is None or close is None or len(macd) < 2:
+            return None
+        prev_macd = (
+            float(macd["macd"].iloc[-2]) if pd.notna(macd["macd"].iloc[-2]) else None
+        )
+        curr_macd = (
+            float(macd["macd"].iloc[-1]) if pd.notna(macd["macd"].iloc[-1]) else None
+        )
+        if prev_macd is None or curr_macd is None:
+            return None
+        if st.position.side == "LONG" and prev_macd > curr_macd:
+            pnl = close - st.position.entry_price
+            return self._close_position(ev, st, close, "MACD_DOWN_30M", pnl)
+        if st.position.side == "SHORT" and prev_macd < curr_macd:
+            pnl = st.position.entry_price - close
+            return self._close_position(ev, st, close, "MACD_DOWN_30M", pnl)
         return None
 
     # ─── helpers ─────────────────────────────────────────────────────────
