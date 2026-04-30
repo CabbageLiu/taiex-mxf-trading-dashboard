@@ -237,14 +237,15 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       layout: {
         background: { color: "#fbf7ee" },
         textColor: INK,
-        // Make the pane separator visible + draggable. Default lightweight
-        // separator is barely visible (1 px ~ rule color); user couldn't tell
-        // where one indicator pane ended and the next began. Bump to a strong
-        // ink-muted line with a sumi-gold hover accent so the drag handle
-        // signals affordance.
+        // Make the pane separator visible + draggable. lightweight-charts'
+        // default 1 px separator is near-invisible on the paper background.
+        // Static color = sumi gold (high contrast against panel), hover =
+        // ink (clear "grabbable" cue). Thickness is bumped to 6 px via a
+        // CSS attribute-selector override in globals.css since the library
+        // hard-codes the row height with no API.
         panes: {
-          separatorColor: "#8a8175",
-          separatorHoverColor: "#a8773d",
+          separatorColor: "#a8773d",
+          separatorHoverColor: "#1f1d1a",
           enableResize: true,
         },
       },
