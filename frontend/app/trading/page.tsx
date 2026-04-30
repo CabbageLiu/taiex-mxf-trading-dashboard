@@ -1,28 +1,22 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "next/navigation";
 import { Suspense, useMemo, useState } from "react";
 
-import { Chart, type IndicatorState } from "@/components/Chart";
+import { Chart } from "@/components/Chart";
 import { TopBar } from "@/components/TopBar";
-import { type Resolution } from "@/components/ResolutionSelector";
 import { AlertLog, type SignalRow } from "@/components/AlertLog";
 import { api } from "@/lib/api";
-
-const DEFAULT_INDICATORS: IndicatorState = {
-  ma: { enabled: true, period: 20, kind: "sma" },
-  macd: { enabled: true },
-  rsi: { enabled: false, period: 14 },
-  kd: { enabled: false },
-  dmi: { enabled: false },
-};
+import { useLens } from "@/lib/lens";
 
 function TradingPageInner() {
-  const sp = useSearchParams();
-  const strategy = sp.get("s");
-  const [res, setRes] = useState<Resolution>("1m");
-  const [ind, setInd] = useState<IndicatorState>(DEFAULT_INDICATORS);
+  const lens = useLens();
+  const res = lens.resolution;
+  const setRes = lens.setResolution;
+  const ind = lens.indicators;
+  const setInd = lens.setIndicators;
+  const strategy = lens.strategy;
+
   const [signals, setSignals] = useState<SignalRow[]>([]);
   const qc = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);

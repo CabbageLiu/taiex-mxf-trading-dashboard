@@ -1,7 +1,6 @@
 "use client";
 
 import { Suspense, useEffect, useState } from "react";
-import { useSearchParams } from "next/navigation";
 
 import { KpiCard } from "@/components/KpiCard";
 import { TradesTable } from "@/components/TradesTable";
@@ -10,6 +9,7 @@ import {
   type TradeFilterValue,
 } from "@/components/TradeFilterBar";
 import { TradeInsightPanel } from "@/components/TradeInsightPanel";
+import { useLens } from "@/lib/lens";
 import { useTrades, useTradeStats } from "@/lib/queries";
 import { t } from "@/lib/i18n";
 
@@ -56,8 +56,8 @@ export default function AnalysisPage() {
 }
 
 function AnalysisContent() {
-  const search = useSearchParams();
-  const strategyFromUrl = search.get("s");
+  const lens = useLens();
+  const strategyFromUrl = lens.strategy;
 
   const [filter, setFilter] = useState<TradeFilterValue>(() =>
     defaultFilter(strategyFromUrl),

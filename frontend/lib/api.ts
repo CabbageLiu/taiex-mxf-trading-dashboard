@@ -101,6 +101,56 @@ export type InsightResponse = {
   content: string;
 };
 
+// V4 — extends InsightRequest with optional inline trade payload + stats so
+// callers can pre-supply rows instead of forcing the server to re-query.
+// Both fields stay optional for backward compatibility with the V2 wrapper.
+export type InsightRequestExtended = InsightRequest & {
+  trades?: Array<{
+    id: number;
+    side: string;
+    entry_ts: string;
+    exit_ts?: string | null;
+    entry_price: number;
+    exit_price?: number | null;
+    pnl_points: number;
+  }>;
+  stats?: TradeStats;
+};
+
+// V4 — signals (raw signal stream, distinct from `alerts` which is per-channel
+// notifier delivery attempts).
+export type SignalRow = {
+  id: number;
+  ts: string;
+  symbol: string;
+  resolution: string;
+  strategy: string;
+  side: "LONG" | "SHORT" | "EXIT" | "FLAT";
+  price: number | null;
+  payload: Record<string, unknown>;
+};
+
+export type SignalsQuery = {
+  strategy?: string;
+  since?: string;
+  limit?: number;
+};
+
+// V4 — alerts/stats: per-channel rollup counters keyed by channel name.
+export type AlertStats = Record<
+  string,
+  { sent: number; failed: number; last_ts: string | null }
+>;
+
+// V4 — admin/test-webhook: synchronous test-fire of a notifier channel.
+export type TestWebhookChannel = "discord" | "n8n" | "inapp";
+export type TestWebhookResponse = {
+  channel: string;
+  ok: boolean;
+  http_code: number | null;
+  error: string | null;
+};
+
 // Backtest engine response — Pine-Script-style strategy tester payload.
 export type BacktestSignal = {
   ts: string;
@@ -255,7 +305,7 @@ export const api = {
     return fetchJson<TradeStats>(`/trades/stats${q}`);
   },
 
-  postInsight: (body: InsightRequest) =>
+  postInsight: (body: InsightRequest | InsightRequestExtended) =>
     fetchJson<InsightResponse>("/insights/strategy", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -271,10 +321,33 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+
+  // V4 — raw signal feed (distinct from /alerts which is delivery attempts).
+  getSignals: (params: SignalsQuery = {}) => {
+    const q = buildQuery({
+      strategy: params.strategy,
+      since: params.since,
+      limit: params.limit ?? 50,
+    });
+    return fetchJson<SignalRow[]>(`/signals${q}`);
+  },
+
+  // V4 — per-channel notifier rollup.
+  getAlertStats: () => fetchJson<AlertStats>("/alerts/stats"),
+
+  // V4 — fire a test webhook against the named channel.
+  testWebhook: (body: { channel: TestWebhookChannel }) =>
+    fetchJson<TestWebhookResponse>("/admin/test-webhook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
 };
 
 // Standalone exports for direct ergonomic use (Agent D)
 export function getStatus() { return api.getStatus(); }
 export function getTrades(params: TradesQuery = {}) { return api.getTrades(params); }
 export function getTradeStats(params: StatsQuery = {}) { return api.getTradeStats(params); }
-export function postInsight(body: InsightRequest) { return api.postInsight(body); }
+export function postInsight(body: InsightRequest | InsightRequestExtended) {
+  return api.postInsight(body);
+}

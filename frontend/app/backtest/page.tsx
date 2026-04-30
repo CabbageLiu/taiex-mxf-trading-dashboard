@@ -14,7 +14,7 @@ import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 
 import { KpiCard } from "@/components/KpiCard";
 import { Skeleton } from "@/components/Skeleton";
-import { api, type BacktestStats, type BacktestTrade } from "@/lib/api";
+import { api, type BacktestRequest, type BacktestStats, type BacktestTrade } from "@/lib/api";
 import { dict, t, tSide } from "@/lib/i18n";
 import { useBacktest } from "@/lib/queries";
 
@@ -266,10 +266,11 @@ function BacktestPageInner() {
     };
   }, [stratsQ]);
 
-  const bt = useBacktest();
+  const [submitted, setSubmitted] = useState<BacktestRequest | null>(null);
+  const bt = useBacktest(submitted);
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    bt.mutate({
+    setSubmitted({
       strategy,
       start: new Date(`${start}T00:00:00+08:00`).toISOString(),
       end: new Date(`${end}T00:00:00+08:00`).toISOString(),
@@ -317,13 +318,13 @@ function BacktestPageInner() {
         <button
           type="submit"
           className="bt-submit"
-          disabled={bt.isPending}
+          disabled={bt.isFetching}
         >
-          {bt.isPending ? t("bt.running") : t("bt.run")}
+          {bt.isFetching ? t("bt.running") : t("bt.run")}
         </button>
       </form>
 
-      {bt.isPending && (
+      {bt.isFetching && (
         <div className="bt-loading card-enter">
           <Skeleton width="100%" height={120} />
           <Skeleton width="100%" height={280} />
@@ -337,7 +338,7 @@ function BacktestPageInner() {
         </div>
       )}
 
-      {bt.data && !bt.isPending && (
+      {bt.data && !bt.isFetching && (
         <div className="bt-results">
           <div className="bt-meta">
             <span>{bt.data.strategy}</span>
@@ -367,7 +368,7 @@ function BacktestPageInner() {
         </div>
       )}
 
-      {!bt.data && !bt.isPending && !bt.isError && (
+      {!bt.data && !bt.isFetching && !bt.isError && (
         <div className="bt-empty muted">{t("bt.empty")}</div>
       )}
     </div>

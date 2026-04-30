@@ -4,13 +4,18 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 
 import {
   api,
+  type AlertStats,
   type BacktestRequest,
   type BacktestResponse,
   type InsightRequest,
   type InsightResponse,
+  type SignalRow,
+  type SignalsQuery,
   type StatsQuery,
   type StatusResponse,
   type StrategyState,
+  type TestWebhookChannel,
+  type TestWebhookResponse,
   type TradeStats,
   type Trade,
   type TradesQuery,
@@ -57,10 +62,62 @@ export function useStrategyState(name: string | null | undefined) {
   });
 }
 
-// Backtest — manual mutation, run on form submit.
-export function useBacktest() {
-  return useMutation<BacktestResponse, Error, BacktestRequest>({
-    mutationFn: (body) => api.runBacktest(body),
+// Backtest — V4 lens-driven query. Pass null to disable; passing the same
+// (strategy, symbol, start, end, params) re-uses the cached result so
+// /trading and /analysis don't re-run the engine on navigation.
+export function useBacktest(req: BacktestRequest | null) {
+  return useQuery<BacktestResponse>({
+    queryKey: [
+      "backtest",
+      req?.strategy,
+      req?.symbol,
+      req?.start,
+      req?.end,
+      paramsHash(req?.params),
+    ],
+    queryFn: () => api.runBacktest(req!), // safe: gated by `enabled`
+    enabled: req != null && !!req.strategy && !!req.start && !!req.end,
+    staleTime: 60_000,
+    gcTime: 300_000,
+  });
+}
+
+function paramsHash(p: Record<string, unknown> | undefined): string {
+  if (!p || Object.keys(p).length === 0) return "";
+  // Stable JSON; backend cache uses sorted-keys hash for the same purpose.
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(p).sort(([a], [b]) => a.localeCompare(b)),
+    ),
+  );
+}
+
+export function useSignals(params: SignalsQuery = {}) {
+  return useQuery<SignalRow[]>({
+    queryKey: [
+      "signals",
+      params.strategy ?? null,
+      params.since ?? null,
+      params.limit ?? 50,
+    ],
+    queryFn: () => api.getSignals(params),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+}
+
+export function useAlertStats() {
+  return useQuery<AlertStats>({
+    queryKey: ["alert-stats"],
+    queryFn: api.getAlertStats,
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+}
+
+export function useTestWebhook() {
+  return useMutation<TestWebhookResponse, Error, { channel: TestWebhookChannel }>({
+    mutationFn: (body) => api.testWebhook(body),
   });
 }
 
