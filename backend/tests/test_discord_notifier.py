@@ -21,7 +21,14 @@ from app.notify.discord import DiscordNotifier, _display_name_for, _fmt_ind
 from app.strategies.base import Signal
 from app.strategies.registry import discover
 
-discover()
+
+@pytest.fixture(scope="module", autouse=True)
+def _ensure_strategies_registered() -> None:
+    """Lazy-load the strategy registry once per test module so the
+    ``_display_name_for`` lookup resolves real example strategies. Module
+    scope keeps it idempotent without polluting other test modules.
+    """
+    discover()
 
 
 class _Resp:
@@ -182,7 +189,9 @@ async def test_discord_embed_footer_carries_signal_id():
 
 
 async def test_discord_skips_post_when_no_url():
-    n = DiscordNotifier(url=None)
+    # Explicit empty string bypasses the get_settings() fallback so this test
+    # exercises the no-url branch independent of the test environment's .env.
+    n = DiscordNotifier(url="")
     sig = _make_signal()
     result = await n.send(sig)
     assert result.ok is False
