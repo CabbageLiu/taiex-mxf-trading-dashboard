@@ -24,6 +24,31 @@ type FieldSpec = {
  * into a flat list of fields the popover can render. Falls back to the
  * existing param keys when the schema is sparse.
  */
+// Traditional Chinese labels for known parameter keys. Technical-indicator
+// names (DI, MACD, KD, RSI, MA) stay in English by design — they're the
+// universal reference. Unknown keys fall through to the raw key as a
+// last-resort label so newly-added params still render something.
+const PARAM_LABELS: Record<string, string> = {
+  enable_short: "啟用做空",
+  kd_period: "KD 週期",
+  kd_long_floor: "KD 做多門檻",
+  kd_short_ceiling: "KD 做空門檻",
+  macd_fast: "MACD 快線週期",
+  macd_slow: "MACD 慢線週期",
+  macd_signal: "MACD 訊號線週期",
+  dmi_period: "DMI 週期",
+  di_long_threshold: "+DI 做多門檻",
+  di_short_threshold: "−DI 做空門檻",
+  exit_di_threshold: "DI 離場門檻",
+  tp_points: "停利點數",
+  sl_points: "停損點數",
+  cooldown_bars: "出場後冷卻 K 棒數",
+};
+
+function paramLabel(key: string): string {
+  return PARAM_LABELS[key] ?? key;
+}
+
 function buildFields(strategy: StrategyOut): FieldSpec[] {
   const schema = strategy.params_schema ?? {};
   const props: Record<string, any> = schema.properties ?? {};
@@ -99,14 +124,18 @@ export function StrategyParamsPopover({ strategy, onClose }: Props) {
 
   return (
     <div className="popover" ref={ref} role="dialog" aria-label={`${strategy.name} params`}>
-      <h4>{strategy.name} · {t("label_period")}</h4>
+      <h4>{strategy.name} · 參數設定</h4>
       {fields.length === 0 && (
         <div style={{ color: "var(--ink-muted)", fontSize: 12 }}>{t("state_none")}</div>
       )}
       {fields.map((f) => (
         <div key={f.key} className="form-row">
-          <label htmlFor={`p-${strategy.name}-${f.key}`} style={{ color: "var(--ink-muted)", fontSize: 12 }}>
-            {f.key}
+          <label
+            htmlFor={`p-${strategy.name}-${f.key}`}
+            title={f.key}
+            style={{ color: "var(--ink-muted)", fontSize: 12 }}
+          >
+            {paramLabel(f.key)}
           </label>
           {f.type === "boolean" ? (
             <input

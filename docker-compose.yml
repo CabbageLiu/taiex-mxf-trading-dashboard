@@ -48,8 +48,13 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    # Bind on all interfaces (was 127.0.0.1) so other devices on the LAN can
+    # reach the dashboard at http://<host-lan-ip>:3000. The Next dev server
+    # already listens on 0.0.0.0 inside the container; this exposes the host
+    # port. Backend stays on 127.0.0.1 — only the rewrite proxy from Next is
+    # public, no direct DB / FastAPI exposure.
     ports:
-      - "127.0.0.1:3000:3000"
+      - "0.0.0.0:3000:3000"
     volumes:
       - ./frontend:/app
       - /app/node_modules
