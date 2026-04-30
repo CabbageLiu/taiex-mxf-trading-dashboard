@@ -766,6 +766,10 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   }, [hoveredEvent]);
   const overlayFrameRef = useRef<number | null>(null);
 
+  // Retry handle for paint deferred when priceToCoordinate returns null
+  // before the chart's first layout pass finishes.
+  const retryRef = useRef<number | null>(null);
+
   const drawOverlay = useCallback(() => {
     const canvas = overlayRef.current;
     const container = containerRef.current;
@@ -774,6 +778,7 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     if (!canvas || !container || !chart || !series) return;
     const w = container.clientWidth;
     const h = container.clientHeight;
+    if (w <= 0 || h <= 0) return;
     const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
     if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
       canvas.width = Math.round(w * dpr);
@@ -786,13 +791,46 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
 
     const ts = chart.timeScale();
     const hovered = hoveredEventRef.current;
+    // Two passes so a CLOSE marker is never painted under its own OPEN marker
+    // when the trade lives on adjacent bars; OPEN paints first, CLOSE on top.
+    const opens: TradeEvent[] = [];
+    const closes: TradeEvent[] = [];
     for (const ev of tradeEventsRef.current) {
+      (ev.kind === "OPEN" ? opens : closes).push(ev);
+    }
+    let drewOpen = 0;
+    let drewClose = 0;
+    let skipped = 0;
+    for (const ev of [...opens, ...closes]) {
       const xRaw = ts.timeToCoordinate(ev.time as Time);
       const y = series.priceToCoordinate(ev.price);
-      if (xRaw == null || y == null) continue;
+      if (xRaw == null || y == null) {
+        // Common during the chart's initial layout pass: priceToCoordinate
+        // returns null until the price scale auto-fits the visible bars.
+        // We mark for retry below.
+        skipped += 1;
+        continue;
+      }
       const x = xRaw + MARKER_X_OFFSET;
       const isHovered = hovered === ev;
       paintMarker(ctx, ev, x, y, isHovered);
+      if (ev.kind === "OPEN") drewOpen += 1;
+      else drewClose += 1;
+    }
+    if (skipped > 0 && typeof window !== "undefined" && retryRef.current == null) {
+      retryRef.current = window.setTimeout(() => {
+        retryRef.current = null;
+        drawOverlay();
+      }, 250);
+    }
+    if (typeof window !== "undefined") {
+      // dev visibility — `window.__taiexMarkerStats` from devtools console
+      (window as unknown as { __taiexMarkerStats?: unknown }).__taiexMarkerStats = {
+        events: tradeEventsRef.current.length,
+        drewOpen,
+        drewClose,
+        skipped,
+      };
     }
   }, []);
 
@@ -868,6 +906,10 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       if (overlayFrameRef.current != null) {
         window.cancelAnimationFrame(overlayFrameRef.current);
         overlayFrameRef.current = null;
+      }
+      if (retryRef.current != null) {
+        window.clearTimeout(retryRef.current);
+        retryRef.current = null;
       }
     };
   }, [scheduleOverlayDraw]);
