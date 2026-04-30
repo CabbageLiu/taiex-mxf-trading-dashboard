@@ -16,7 +16,11 @@ v1 deviations from a full Pine-Script strategy:
 
 from __future__ import annotations
 
+import inspect
+import json
+import os
 import sys
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
@@ -36,6 +40,67 @@ from app.strategies.registry import all_strategies
 # Smaller resolutions fire first so finer-grained logic runs ahead of
 # coarser-grained logic on a shared bucket boundary.
 _RES_RANK = {res: i for i, res in enumerate(ALL_RESOLUTIONS)}
+
+
+_BACKTEST_CACHE_MAX = 64
+_backtest_cache: OrderedDict[tuple, BacktestResult] = OrderedDict()
+
+
+def _module_mtime(cls: type[Strategy]) -> float:
+    """File mtime of the strategy module — fingerprint for cache invalidation
+    on hot-reload of edited strategy code."""
+    src = inspect.getsourcefile(cls)
+    if src is None:
+        return 0.0
+    try:
+        return os.path.getmtime(src)
+    except OSError:
+        return 0.0
+
+
+def _params_hash(params_override: dict[str, Any] | None) -> str:
+    """Stable hash of the params override dict (or empty)."""
+    if not params_override:
+        return ""
+    return json.dumps(params_override, sort_keys=True, default=str)
+
+
+def _cache_key(
+    *,
+    strategy_name: str,
+    params_override: dict[str, Any] | None,
+    symbol: str | None,
+    start: datetime,
+    end: datetime,
+    mtime: float,
+) -> tuple:
+    return (
+        strategy_name,
+        _params_hash(params_override),
+        symbol or "",
+        start.isoformat(),
+        end.isoformat(),
+        round(mtime, 3),
+    )
+
+
+def _cache_get(key: tuple) -> BacktestResult | None:
+    res = _backtest_cache.get(key)
+    if res is not None:
+        _backtest_cache.move_to_end(key)
+    return res
+
+
+def _cache_put(key: tuple, value: BacktestResult) -> None:
+    _backtest_cache[key] = value
+    _backtest_cache.move_to_end(key)
+    while len(_backtest_cache) > _BACKTEST_CACHE_MAX:
+        _backtest_cache.popitem(last=False)
+
+
+def clear_backtest_cache() -> None:
+    """Test/utility hook — drop all cached results."""
+    _backtest_cache.clear()
 
 
 class BacktestSignalOut(BaseModel):
@@ -319,13 +384,26 @@ async def run_backtest(
     except Exception as e:  # pydantic validation
         raise ValueError(f"invalid params: {e}") from None
 
+    mtime = _module_mtime(cls)
+    key = _cache_key(
+        strategy_name=strategy_name,
+        params_override=params_override,
+        symbol=sym,
+        start=start,
+        end=end,
+        mtime=mtime,
+    )
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
     bars_per_res: dict[str, pd.DataFrame] = {}
     for res in cls.resolutions:
         df = await load_bars(sym, res, start=start, end=end, limit=None)
         bars_per_res[res] = df
 
     if all(df.empty for df in bars_per_res.values()):
-        return BacktestResult(
+        empty = BacktestResult(
             strategy=strategy_name,
             symbol=sym,
             start=start,
@@ -338,6 +416,8 @@ async def run_backtest(
             stats=compute_backtest_stats([]),
             equity_curve=[],
         )
+        _cache_put(key, empty)
+        return empty
 
     inds_per_res = _build_indicators(cls, bars_per_res, sym)
     schedule = _schedule(bars_per_res)
@@ -381,7 +461,7 @@ async def run_backtest(
         for s in signals
     ]
 
-    return BacktestResult(
+    result = BacktestResult(
         strategy=strategy_name,
         symbol=sym,
         start=start,
@@ -394,3 +474,5 @@ async def run_backtest(
         stats=stats,
         equity_curve=equity,
     )
+    _cache_put(key, result)
+    return result

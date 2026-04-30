@@ -154,11 +154,14 @@ class _StubStrat(Strategy):
 def stub_strategy(monkeypatch):
     # Register stub + ensure the engine's _STATE swap finds it on the
     # current test module (which is what `__module__` resolves to).
+    from app.backtest.engine import clear_backtest_cache
     sys.modules[_StubStrat.__module__]._STATE = _STATE
     _registry[_StubStrat.name] = _StubStrat
+    clear_backtest_cache()
     yield _StubStrat
     _registry.pop(_StubStrat.name, None)
     _STATE.clear()
+    clear_backtest_cache()
 
 
 def _fake_bars(n: int) -> pd.DataFrame:

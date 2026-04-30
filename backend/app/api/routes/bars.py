@@ -13,7 +13,7 @@ from app.ingest.runner import _bucket_start
 
 router = APIRouter(prefix="/bars", tags=["bars"])
 
-VALID_RES = {"1m", "5m", "15m", "30m", "1h", "4h", "12h", "1d", "1w", "1mo"}
+VALID_RES = {"1m", "2m", "5m", "10m", "15m", "30m", "1h", "4h", "12h", "1d", "1w", "1mo"}
 
 
 def _view_for(resolution: str) -> str:

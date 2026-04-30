@@ -14,7 +14,8 @@ import hashlib
 import time
 from collections import OrderedDict
 from datetime import UTC, datetime
-from typing import Literal
+from types import SimpleNamespace
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -34,6 +35,12 @@ class InsightRequest(BaseModel):
     start: str | None = None
     end: str | None = None
     filter: Literal["all", "win", "loss"] = "all"
+    # Optional inline payload — when present, the route skips the `/trades`
+    # DB query entirely and uses these directly. Lets the V4 lens model send
+    # the same trade slice the UI is rendering, so the AI sees exactly what
+    # the user sees. ``trades`` is capped at 200 rows for the prompt budget.
+    trades: list[dict] | None = None
+    stats: dict | None = None
 
 
 class InsightResponse(BaseModel):
@@ -109,6 +116,26 @@ def _check_rate_limit(strategy: str, ip: str) -> float | None:
     return None
 
 
+def _coerce_dt(v: Any) -> datetime | None:
+    """Best-effort coerce a serialized datetime field to ``datetime``.
+
+    Inline trade rows come in as ISO strings from the frontend; ``compute_stats``
+    needs real ``datetime`` objects to compute hold seconds and drawdown
+    ordering. Anything unparseable becomes ``None`` (the function tolerates
+    that — those rows just don't contribute to ``avg_hold_seconds``).
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Route
 # ---------------------------------------------------------------------------
@@ -138,16 +165,40 @@ async def post_strategy_insight(body: InsightRequest, request: Request) -> Insig
     start_dt = _parse_dt(body.start, "start")
     end_dt = _parse_dt(body.end, "end", end_of_day=True)
 
-    # Pull trades + stats. Cap trade rows at 50 for the prompt budget.
-    rows = await _query_trades(
-        strategy=body.strategy,
-        start=start_dt,
-        end=end_dt,
-        result=body.filter,
-        limit=50,
-    )
-    serialized_trades = [_serialize(r) for r in rows]
-    stats = compute_stats(rows)
+    # Inline payload path (V4 lens) — skip the DB query and use the rows the
+    # caller passed in directly. Cap at 200 to bound the prompt size.
+    if body.trades is not None:
+        serialized_trades = body.trades[:200]
+        if body.stats is not None:
+            stats = body.stats
+        else:
+            # Re-derive stats from the trades via SimpleNamespace adapters so
+            # ``compute_stats`` (which reads attribute-style) works without
+            # round-tripping through the DB.
+            ns_rows: list[Any] = []
+            for i, t in enumerate(serialized_trades):
+                entry_ts = _coerce_dt(t.get("entry_ts"))
+                exit_ts = _coerce_dt(t.get("exit_ts"))
+                ns_rows.append(
+                    SimpleNamespace(
+                        id=t.get("id", i),
+                        entry_ts=entry_ts,
+                        exit_ts=exit_ts,
+                        pnl_points=t.get("pnl_points"),
+                    )
+                )
+            stats = compute_stats(ns_rows)
+    else:
+        # Pull trades + stats. Cap trade rows at 50 for the prompt budget.
+        rows = await _query_trades(
+            strategy=body.strategy,
+            start=start_dt,
+            end=end_dt,
+            result=body.filter,
+            limit=50,
+        )
+        serialized_trades = [_serialize(r) for r in rows]
+        stats = compute_stats(rows)
 
     # Cache key: hash a per-trade fingerprint so two distinct distributions
     # with the same trade_count/pnl_total still get distinct cache slots.
