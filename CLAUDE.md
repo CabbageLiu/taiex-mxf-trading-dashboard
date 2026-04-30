@@ -357,3 +357,108 @@ V4 added tests for: lens URL/localStorage round-trip, `GET /backtest/run` shape 
 #### Backlog still deferred
 
 V4 did not address: CORS still wide open, mutating endpoints unauthenticated (`/strategies/*`, `/insights/strategy`, `/admin/backfill`, `/admin/test-webhook`, `/backtest/run`), no global Anthropic spend cap, reverse-proxy IP gap on the rate limiter, no TW holiday calendar, `/admin/backfill` synchronous, no per-trade fees / slippage / position sizing in the backtest engine, no auth / multi-user, backtest engine still fills at signal-bar close (no `next_bar_open` mode), `_STATE` swap convention is module-introspection-based and brittle to non-`_STATE` naming, `wipe_and_rebackfill.py` still has no env guard.
+
+### V5 — strategy spec compliance + chart marker hardening + trades-log indicator columns
+
+V5 was driven by five intertwined user asks: live exits violated spec (TP fires above 220), exit dots missing on chart, trades log needed sequential id + strategy column + open/close indicator deltas, strategy display labels needed Traditional Chinese rename without breaking the DB key, and the v1/v2 spec doc had drifted from the example strategies.
+
+#### Backend
+
+- alembic `0004_bars_3m.py` added the `bars_3m` continuous aggregate (mirrors `0003_bars_2m_10m.py`). `RESOLUTIONS`, `RESOLUTION_DELTAS`, `VALID_RES` extended.
+- `Strategy` ABC gained `display_name: ClassVar[str | None] = None`. Surfaced via `StrategyOut.display_name`. The DB-bound `name` ClassVar stays the canonical key for `trades.strategy`, `signals.strategy`, `strategy_config.name`. UI renders `display_name ?? name`. Backend never accepts `display_name` as input on `/strategies/{name}/*` routes.
+- `trade_strat_v1` rewrite to match `v1_trade.md`: 30m entry, 3m exit-assist (-DI > 23), MACD rising-edge gate (`macd[-3] <= 0 AND macd[-2] > 0 AND macd[-1] > macd[-2]`), `+DI > 21 AND +DI > -DI` for LONG, TP=220 / SL=60, `display_name = "30分鐘線策略"`.
+- `trade_strat_v2` rewrite to match `v2_trade.md`: 5m entry (was 10m), 3m exit-assist with `-DI ≥ 23` (note `>=` not `>` — distinct from v1), 1m TP/SL eval as a separate `_check_tp_sl_minute` code path with no entry logic, TP=70 / SL=50, symmetric SHORT MACD falling-edge via `_macd_rising_edge(-macd)`, display_name = "5分鐘策略". `_snapshot_ind` uses fixed 8-key `dict.fromkeys(...)` shape so the frontend `TradeIndicators` type contract is stable.
+- `Signal.payload` gains `entry_ind` (open) and `exit_ind` (close) as 8-key snapshots `{k, d, macd, signal, hist, plus_di, minus_di, adx}` rounded to 2 decimals, NaN → None. `PositionTracker._open_trade` writes `entry_ind` into `Trade.payload`; `_close` does an `UPDATE … SET payload = COALESCE(payload, '{}'::jsonb) || jsonb_build_object('exit_ind', :exit_ind)` second statement so the existing `entry_ind` is preserved.
+
+#### Frontend
+
+- `Chart.tsx` exit-dot fix: pane-relative y-clamp via `chart.paneSize(0).height` (defensive try/catch fallback to canvas height with a one-shot warning); when clamped, `paintMarker` paints a directional `▲` / `▼` chevron beside the disc so the user sees off-screen exits. Hover hit-test uses a `paintedCoordsRef: Map<TradeEvent, {x, y, outOfRange}>` populated during `drawOverlay`, so clamped markers are now hoverable. `window.__taiexMarkerStats` exposes `{events, drewOpen, drewClose, skipped, clamped, retryScheduled, hitTestable}` for browser-console debugging. The 250ms retry from commit `9da8078` is retained.
+- New `MarkerFilterPills.tsx` in TopBar — 全部 / per-strategy display name. Local component state in `app/trading/page.tsx`; `<Chart>` accepts a new `markerStrategies?: Set<string> | null` prop (null = show all). Filters in a `filteredTradeEvents` memo downstream so paint + hover both inherit.
+- `TradeMarkerTooltip` adds a `#${tradeId}` chip in the head row (sumi-gold `.trade-marker-id` class).
+- `TradesTable.tsx` adds 4 columns — 編號 (`tr.id`), 策略 (display_name fallback to canonical), 開倉指標, 出場指標 — rendered via `formatIndicators` as `K54 D51 / MACD+9 / +DI33 -DI19`. Older trades pre-V5 with empty payload render `—`. Header copy is TC; indicator names (K, D, MACD, +DI, -DI) stay English. Strategy cell carries `title={tr.strategy}` so canonical name is on hover.
+- `StrategySelector` and `AlertLog` render `display_name ?? name` with `title={canonical_name}` on hover. Search/filter still keys on `name` for cache stability.
+- `lib/api.ts` adds `TradeIndicators` + `TradePayload` types; `Trade.payload` narrows from `Record<string, unknown>` to `TradePayload`.
+- `lib/queries.ts` exposes a `useStrategies` hook (was inline in `StrategySelector`); cache key shared.
+
+#### Tests
+
+178 tests as of V5 baseline (was 145).
+
+### V5.1 — pane-height persistence + trade_strat_v1 exit re-spec
+
+User adjusted the v1 exit spec mid-cycle (220 → 199 → 150) and asked for pane heights to survive indicator toggles + interval changes + page reloads.
+
+`Chart.tsx` adds a `paneHeightsRef = useRef<Partial<Record<PaneKey, number>>>({})` Map and a `taiex.pane.heights.v1` localStorage mirror. Hydrated on mount (defensive try/catch JSON parse, ignores non-finite/zero/negative values, defaults applied per missing key). Each indicator effect's pane-create branch reads `paneHeightsRef.current[<key>] ?? DEFAULT_PANE_HEIGHTS[<key>]` instead of a hardcoded literal. Each indicator effect's cleanup branch snapshots `pane.getHeight()` BEFORE `chart.removePane(...)` and persists. A single `setInterval(2000)` polls all 5 panes (candle + 4 indicator) so user drag-resizes are captured even without a toggle event. Cleared on unmount. Lightweight-charts v5 API used: `chart.panes()`, `pane.getHeight()`, `pane.setHeight()` — there's no `setStretchFactor` in v5.
+
+`trade_strat_v1` exit rules rewritten (per user clarification, NOT `v1_trade.md` verbatim):
+
+| condition | rule | reason code |
+|---|---|---|
+| TP | profit ≥ 150 (was 220) | `TP` |
+| SL | loss ≥ 60 | `SL` |
+| 10m DMI flip | `-DI > +DI` closes LONG; `+DI > -DI` closes SHORT | `DI_FLIP_10M` |
+| 30m MACD-falling | `macd[-2] > macd[-1]` closes LONG; mirror for SHORT | `MACD_DOWN_30M` |
+
+The 3m exit-assist rule from V5 is REMOVED. `resolutions` becomes `["10m", "30m", "1d"]`. `Params.exit_di_threshold` deleted. Priority inside `_on_30m`: TP/SL → MACD-falling → entry eval (a TP-hit bar with falling MACD emits TP only).
+
+188 tests as of V5.1.
+
+### V5.2 / V5.3 — Discord rich embed (Traditional Chinese)
+
+User wanted Discord notifications to carry the trade conditions inline so they don't have to check `/analysis`. Decision: enrich the existing `DiscordNotifier` rather than route through an external Hermes / Anthropic AI agent (zero AI cost, deterministic, ~50ms latency, no new infra). The `/insights/strategy` button on `/analysis` already covers AI-driven analysis on demand.
+
+V5.2 (commit `24ef862`) added: display_name lookup via `@lru_cache(maxsize=64)` over `app.strategies.registry.get`, `_fmt_ind` 8-key snapshot renderer (`K54 D51  MACD+9 sig+7 hist+2  +DI33 -DI19 ADX27`), Asia/Taipei timestamp, signed pnl, exit_reason field, signal_id footer.
+
+V5.3 (commit `76fd1c2`) made the embed Traditional Chinese throughout while keeping indicator names English per CLAUDE.md convention:
+
+- Side translation: LONG→多單, SHORT→空單, EXIT→平倉, FLAT→空手.
+- Field names: Symbol→商品, Resolution→週期, Price→價格, Time→時間, Strategy→策略.
+- Description block synthesized in TC by the notifier:
+  - OPEN: `進場訊號 — KD > 20 / MACD 翻正 / +DI > 21 且 +DI > -DI` (entry-gate summary; hardcoded for v1/v2; unknown strategies fall back to `進場條件達標`).
+  - CLOSE: `出場訊號 — {translated reason}（損益 {±value} 點）`.
+- Exit reason translation: TP→達到停利目標, SL→觸及停損, DI_FLIP_10M→`10 分鐘 DMI 翻轉 (-DI > +DI)`, MACD_DOWN_30M→`30 分鐘 MACD 下彎`, DI_FLIP→`3 分鐘 DMI 翻轉`. Unknown codes pass through verbatim.
+- Footer: `signal #N` → `訊號 #N`.
+
+The hub threads `signal_id` into DiscordNotifier the same way it already does for `InAppNotifier`.
+
+`POST /admin/test-webhook` (V4) hooks the right-rail 通知遞送 panel's 測試發送 button. Synthetic signal payload omits `entry_ind` so test sends are visually distinct from real signals (no indicator block).
+
+205 tests as of V5.3.
+
+#### Operational gotcha — adding env keys to `.env`
+
+`docker compose restart backend` does NOT re-read `env_file`. Container keeps the env vars baked in at creation. To pick up a newly-added env key (e.g. `DISCORD_WEBHOOK_URL`):
+
+```sh
+docker compose up -d --force-recreate backend
+```
+
+Verify the env var landed in the container:
+
+```sh
+docker compose exec backend env | grep DISCORD_WEBHOOK_URL
+curl -s http://127.0.0.1:8000/status | python3 -m json.tool | grep discord
+# notifiers.discord should be true after the recreate
+```
+
+The `_notifier_presence` helper in `app/api/routes/status.py:57-69` reads `settings.discord_webhook_url` via `get_settings()` (which is `@lru_cache`-cached). The frontend's `AlertLog.tsx` only renders the `測試發送` button when `/status` reports the channel as configured. So a missing env var after a restart shows up as a missing test button.
+
+#### Verification quick-reference
+
+Backend health (during dev / live):
+
+```sh
+curl -s http://127.0.0.1:8000/status | python3 -m json.tool
+# all of: ingest_running, strategy_loop_running, position_tracker_running, db_ok, ok → true
+# notifiers.discord → true once .env's DISCORD_WEBHOOK_URL is loaded into the container
+```
+
+Confirm paper trading is live:
+
+```sh
+curl -s 'http://127.0.0.1:8000/strategies' | python3 -c "import json,sys; [print(f\"{s['name']:20s} enabled={s['enabled']}\") for s in json.load(sys.stdin)]"
+curl -s 'http://127.0.0.1:8000/trades?limit=5' | python3 -m json.tool | head -50
+curl -s 'http://127.0.0.1:8000/trades/stats?strategy=trade_strat_v1' | python3 -m json.tool
+```
+
+Old trades pre-V5 carry empty `payload: {}` — they predate the indicator-snapshot threading and won't be backfilled. New trades from V5 onward carry full `entry_ind` / `exit_ind` payloads.

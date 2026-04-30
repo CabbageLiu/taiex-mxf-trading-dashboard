@@ -110,6 +110,24 @@ heartbeat.
 > you start during market hours, the chart is empty until the first bar
 > closes; subsequent days resume from whatever ticks were captured.
 
+### Adding or changing keys in `.env`
+
+`docker compose restart backend` does NOT re-read `env_file`. The container keeps the env vars that were baked in at creation. Any new key (e.g. `DISCORD_WEBHOOK_URL`) added to `.env` requires a recreate:
+
+```sh
+docker compose up -d --force-recreate backend
+```
+
+Verify the var actually landed inside the container before chasing other bugs:
+
+```sh
+docker compose exec backend env | grep DISCORD_WEBHOOK_URL
+curl -s http://127.0.0.1:8000/status | python3 -m json.tool | grep discord
+# both should show the configured URL / true
+```
+
+A missing env var after a `restart` shows up as a missing 測試發送 button on the right rail — the frontend reads `/status notifiers.discord` and only renders the button when the channel is configured. The `_notifier_presence` helper in `backend/app/api/routes/status.py` reads `settings.discord_webhook_url` via `get_settings()` (which is `@lru_cache`-cached at module level, so the same caveat applies to non-Docker host workflows: kill + relaunch uvicorn after editing `.env`).
+
 ### When to use `--build`
 
 | Change | Command |
@@ -829,3 +847,117 @@ Migration `0004_bars_3m.py` (mirrors `0003_bars_2m_10m.py`) adds a
    `payload.entry_ind` / `payload.exit_ind` matching the old shape. The
    frontend renders missing fields as `—`, so historical rows don't
    crash; manual cleanup is optional.
+
+---
+
+## 12. V5.1 — `trade_strat_v1` exit re-spec (current live rules)
+
+The 30 分鐘線策略 (`trade_strat_v1`) exit logic was rewritten on
+2026-04-30. Live rules:
+
+| condition | rule | reason code |
+|---|---|---|
+| TP | profit ≥ 150 點 (was 220) | `TP` |
+| SL | loss ≥ 60 點 | `SL` |
+| 10m DMI flip | `-DI > +DI` closes LONG; `+DI > -DI` closes SHORT | `DI_FLIP_10M` |
+| 30m MACD-falling | `macd[-2] > macd[-1]` closes LONG; mirror for SHORT | `MACD_DOWN_30M` |
+
+The previous 3m `-DI > 23` rule is gone. `resolutions` is
+`["10m", "30m", "1d"]`. `Params.exit_di_threshold` was deleted.
+
+Priority inside `_on_30m`: TP/SL → MACD-falling → entry eval. A 30m bar
+that simultaneously hits TP and has falling MACD emits TP only.
+
+The `Params.tp_points` code default is **150**. If you previously saved
+220 (or 199) via the dashboard params popover, that DB override is still
+the live value — use the popover to update or `DELETE FROM
+strategy_config WHERE name='trade_strat_v1'` to fall back to the code
+default. Confirm the live value via:
+
+```sh
+curl -s http://127.0.0.1:8000/strategies | python3 -c \
+  "import json,sys; [print(s['params'].get('tp_points')) for s in json.load(sys.stdin) if s['name']=='trade_strat_v1']"
+```
+
+`trade_strat_v2` (5 分鐘策略) was NOT touched in V5.1 — still the V5
+spec.
+
+---
+
+## 13. Pane height persistence (V5.1, frontend)
+
+Chart pane heights survive indicator toggles, resolution changes, and
+page reloads. Backed by a `paneHeightsRef` Map mirrored to localStorage
+key `taiex.pane.heights.v1`. Snapshot points: (a) before each
+`chart.removePane()` in the indicator-effect cleanup, (b) every 2
+seconds via `setInterval` so user drag-resizes are captured even without
+a toggle.
+
+To reset to defaults from the browser console:
+
+```js
+localStorage.removeItem('taiex.pane.heights.v1'); location.reload();
+```
+
+Defaults: candle 320, MACD 120, RSI 100, KD 100, DMI 100 (px).
+
+---
+
+## 14. Discord rich embed (V5.2 / V5.3)
+
+`backend/app/notify/discord.py` posts a Traditional-Chinese embed for
+every signal. Indicator names (KD / MACD / +DI / -DI / ADX) stay
+English per CLAUDE.md.
+
+Embed shape:
+
+- **Title**: `{display_name} → {side_TC}` — e.g. `30分鐘線策略 → 多單`.
+  Side codes translated: LONG→多單, SHORT→空單, EXIT→平倉, FLAT→空手.
+- **Description (OPEN)**: `進場訊號 — KD > 20 / MACD 翻正 / +DI > 21 且
+  +DI > -DI` (entry-gate summary; hardcoded for v1/v2 because they
+  share the spec; unknown strategies fall back to `進場條件達標`).
+- **Description (CLOSE)**: `出場訊號 — {translated reason}（損益 {±value}
+  點）`.
+- **Fields**: 商品 / 週期 / 價格 / 時間 (Asia/Taipei `CST` suffix) /
+  策略 / 開倉指標 / 出場指標 / 出場原因 / 損益 — fields are emitted
+  only when relevant (no empty/null fields).
+- **Footer**: `訊號 #{signal_id}` for cross-ref to `/analysis` rows.
+
+Exit reason TC translation table (in `_EXIT_REASON_TC`):
+
+| code | 中文 |
+|---|---|
+| `TP` | 達到停利目標 |
+| `SL` | 觸及停損 |
+| `DI_FLIP_10M` | 10 分鐘 DMI 翻轉 (-DI > +DI) |
+| `MACD_DOWN_30M` | 30 分鐘 MACD 下彎 |
+| `DI_FLIP` | 3 分鐘 DMI 翻轉 (legacy v1 / current v2) |
+
+Unknown reason codes pass through verbatim — add to the table when a
+new strategy emits one.
+
+Test sends fire from the right-rail `通知遞送` panel's `測試發送`
+button (V4 plumbing, gated by `notifiers.discord: true` from `/status`).
+The synthetic signal omits `entry_ind` so test sends are visually
+distinct from real ones (no indicator block in the embed).
+
+---
+
+## 15. Where to look first next session
+
+1. **Dashboard health** — `curl -s http://127.0.0.1:8000/status | python3 -m json.tool`. All five booleans (ingest, strategy_loop, position_tracker, db_ok, ok) should be true. `notifiers.discord` should be true after the user has added `DISCORD_WEBHOOK_URL` to `.env` AND recreated the backend container (`docker compose up -d --force-recreate backend`).
+2. **Live paper trading** — `curl -s 'http://127.0.0.1:8000/trades?limit=5'` shows recent rows. `curl -s 'http://127.0.0.1:8000/trades/stats?strategy=trade_strat_v1'` shows aggregate.
+3. **Enabled strategies** — `curl -s 'http://127.0.0.1:8000/strategies'`. `trade_strat_v1` and `trade_strat_v2` should be `enabled: true`. `always_long` should be `enabled: false` (watchdog only, never closes).
+4. **Latest commits** — `git log --oneline -8`. Recent V5 series:
+   - `76fd1c2` V5.3 Discord TC translation
+   - `abad642` V5.2 codex-rescue nit
+   - `24ef862` V5.2 rich Discord embed
+   - `7e12433` V5.1 pane height + v1 exit rewrite
+   - `93b48a2` V5 docs
+   - `7169fe1` V5 codex-rescue blockers
+   - `deedfbb` V5-C trades-table columns
+   - `f5edf6f` V5-B chart marker fixes + filter pills
+5. **Backlog** — see CLAUDE.md "Backlog still deferred" section at the V4 boundary; V5/V5.1/V5.2/V5.3 did not address auth, CORS, mutating-endpoint protection, Anthropic spend cap, TW holiday calendar, or backtest engine fees/slippage. The user has not asked for any of those yet.
+
+If the user asks about a feature without context, search this NOTES.md
+section index (line ~21) and CLAUDE.md before exploring code.
