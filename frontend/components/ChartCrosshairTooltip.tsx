@@ -19,7 +19,7 @@ export type CrosshairIndicators = {
 };
 
 export type CrosshairData = {
-  ohlc: CrosshairOhlc;
+  ohlc: CrosshairOhlc | null;
   indicators: CrosshairIndicators;
   cursorPrice?: number | null;
 };
@@ -59,8 +59,9 @@ function fmtTime(epoch: number): string {
  */
 export function ChartCrosshairTooltip({ data }: Props) {
   if (!data) return null;
+  if (data.cursorPrice == null && !data.ohlc) return null;
   const { ohlc, indicators } = data;
-  const dir = ohlc.close >= ohlc.open ? "up" : "down";
+  const dir = ohlc ? (ohlc.close >= ohlc.open ? "up" : "down") : "";
   return (
     <div className="crosshair-tooltip" role="status" aria-live="off">
       <dl>
@@ -70,12 +71,16 @@ export function ChartCrosshairTooltip({ data }: Props) {
             <dd className="v">{fmtPrice(data.cursorPrice)}</dd>
           </>
         )}
-        <dt>{t("crosshair.time")}</dt>
-        <dd className="v">{fmtTime(ohlc.time)}</dd>
-        <dt>{t("crosshair.ohlc")}</dt>
-        <dd className={`v ${dir}`}>
-          {fmtPrice(ohlc.open)} / {fmtPrice(ohlc.high)} / {fmtPrice(ohlc.low)} / {fmtPrice(ohlc.close)}
-        </dd>
+        {ohlc && (
+          <>
+            <dt>{t("crosshair.time")}</dt>
+            <dd className="v">{fmtTime(ohlc.time)}</dd>
+            <dt>{t("crosshair.ohlc")}</dt>
+            <dd className={`v ${dir}`}>
+              {fmtPrice(ohlc.open)} / {fmtPrice(ohlc.high)} / {fmtPrice(ohlc.low)} / {fmtPrice(ohlc.close)}
+            </dd>
+          </>
+        )}
         {indicators.ma && (
           <>
             <dt>MA{indicators.ma.period}</dt>

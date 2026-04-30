@@ -1,7 +1,7 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
-import type { UseQueryResult } from "@tanstack/react-query";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 
 import { KpiCard, type KpiTone } from "@/components/KpiCard";
 import { TradesTable } from "@/components/TradesTable";
@@ -13,12 +13,13 @@ import { TradeInsightPanel } from "@/components/TradeInsightPanel";
 import { useBacktest, useTrades, useTradeStats } from "@/lib/queries";
 import { useLens, type UseLensReturn } from "@/lib/lens";
 import { t } from "@/lib/i18n";
-import type {
-  BacktestResponse,
-  BacktestStats,
-  BacktestTrade,
-  Trade,
-  TradeStats,
+import {
+  api,
+  type BacktestResponse,
+  type BacktestStats,
+  type BacktestTrade,
+  type Trade,
+  type TradeStats,
 } from "@/lib/api";
 
 function isoDateUTC(d: Date): string {
@@ -114,6 +115,130 @@ export default function AnalysisPage() {
   );
 }
 
+function LensBar({ lens }: { lens: UseLensReturn }) {
+  const stratsQ = useQuery({
+    queryKey: ["strategies"],
+    queryFn: api.strategies,
+    refetchInterval: 30_000,
+  });
+  const stratNames = useMemo(
+    () => (stratsQ.data ?? []).map((r) => r.name),
+    [stratsQ.data],
+  );
+
+  // Sensible default range when the lens has none yet.
+  const today = new Date();
+  const past30 = new Date(today);
+  past30.setUTCDate(past30.getUTCDate() - 30);
+  const fmtDate = (d: Date) => d.toISOString().slice(0, 10);
+  const start = lens.start ?? "";
+  const end = lens.end ?? "";
+
+  const onStrategy = (v: string) => {
+    lens.setStrategy(v || null);
+    if (lens.start == null || lens.end == null) {
+      lens.setRange(fmtDate(past30), fmtDate(today));
+    }
+  };
+  const onSecondary = (v: string) => {
+    lens.setSecondaryStrategy(v || null);
+  };
+  const toggleCompare = () => {
+    const next = !lens.compare;
+    if (next && !lens.secondaryStrategy) {
+      // Pick the first registered strategy that isn't the primary as a default.
+      const fallback = stratNames.find((n) => n !== lens.strategy) ?? null;
+      if (fallback) lens.setSecondaryStrategy(fallback);
+    }
+    lens.setCompare(next);
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexWrap: "wrap",
+        alignItems: "center",
+        gap: 12,
+        padding: "12px 24px",
+        borderBottom: "1px solid var(--rule)",
+        background: "var(--panel)",
+        fontSize: "var(--fs-meta)",
+      }}
+    >
+      <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <span style={{ color: "var(--ink-muted)" }}>{t("panel_strategies")}</span>
+        <select
+          value={lens.strategy ?? ""}
+          onChange={(e) => onStrategy(e.target.value)}
+          style={{ minHeight: 32, padding: "2px 8px" }}
+        >
+          <option value="">—</option>
+          {stratNames.map((n) => (
+            <option key={n} value={n}>
+              {n}
+            </option>
+          ))}
+        </select>
+      </label>
+      {lens.compare && (
+        <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <span style={{ color: "var(--ink-muted)" }}>vs</span>
+          <select
+            value={lens.secondaryStrategy ?? ""}
+            onChange={(e) => onSecondary(e.target.value)}
+            style={{ minHeight: 32, padding: "2px 8px" }}
+          >
+            <option value="">—</option>
+            {stratNames.map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <span style={{ color: "var(--ink-muted)" }}>{t("filter.dateRange")}</span>
+        <input
+          type="date"
+          value={start}
+          onChange={(e) => lens.setRange(e.target.value || null, lens.end)}
+          aria-label="lens start"
+        />
+        <span style={{ color: "var(--ink-muted)" }}>–</span>
+        <input
+          type="date"
+          value={end}
+          onChange={(e) => lens.setRange(lens.start, e.target.value || null)}
+          aria-label="lens end"
+        />
+      </label>
+      <button
+        type="button"
+        className="btn"
+        aria-pressed={lens.compare}
+        onClick={toggleCompare}
+        disabled={!lens.strategy}
+        style={{ minHeight: 32, padding: "4px 12px" }}
+        title={!lens.strategy ? "先選擇主策略" : ""}
+      >
+        {t("compare.toggle")}
+      </button>
+      {lens.isActive && (
+        <button
+          type="button"
+          className="btn"
+          onClick={() => lens.reset()}
+          style={{ minHeight: 32, padding: "4px 12px", marginLeft: "auto" }}
+        >
+          重置
+        </button>
+      )}
+    </div>
+  );
+}
+
 function AnalysisContent() {
   const lens = useLens();
   const compare = lens.compare && !!lens.secondaryStrategy;
@@ -155,8 +280,9 @@ function AnalysisContent() {
     end: filter.end ?? undefined,
   });
 
+  let body: React.ReactNode;
   if (!lens.isActive) {
-    return (
+    body = (
       <LiveView
         filter={filter}
         setFilter={setFilter}
@@ -164,11 +290,24 @@ function AnalysisContent() {
         liveStatsQ={liveStatsQ}
       />
     );
+  } else if (compare) {
+    body = <CompareView lens={lens} btQA={btQA} btQB={btQB} />;
+  } else {
+    body = <SingleLensView lens={lens} btQ={btQA} filter={filter} />;
   }
-  if (compare) {
-    return <CompareView lens={lens} btQA={btQA} btQB={btQB} />;
-  }
-  return <SingleLensView lens={lens} btQ={btQA} filter={filter} />;
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        flex: 1,
+        minHeight: 0,
+      }}
+    >
+      <LensBar lens={lens} />
+      {body}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------

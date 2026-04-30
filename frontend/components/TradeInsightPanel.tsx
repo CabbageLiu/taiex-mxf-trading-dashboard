@@ -166,7 +166,7 @@ export function TradeInsightPanel(props: Props) {
   const errorMsg = insight.isError
     ? isMissingApiKeyError(insight.error as Error)
       ? "伺服器尚未設定 ANTHROPIC_API_KEY"
-      : t("insight.error")
+      : `${t("insight.error")} ${(insight.error as Error)?.message ?? ""}`.trim()
     : null;
 
   const handleGenerate = () => {
