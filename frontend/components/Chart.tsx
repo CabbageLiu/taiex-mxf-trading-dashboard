@@ -237,12 +237,10 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       layout: {
         background: { color: "#fbf7ee" },
         textColor: INK,
-        // Make the pane separator visible + draggable. lightweight-charts'
-        // default 1 px separator is near-invisible on the paper background.
-        // Static color = sumi gold (high contrast against panel), hover =
-        // ink (clear "grabbable" cue). Thickness is bumped to 6 px via a
-        // CSS attribute-selector override in globals.css since the library
-        // hard-codes the row height with no API.
+        // Make the pane separator visible + draggable. lightweight-charts v5
+        // exposes color/hover styling but no separator thickness option.
+        // Keep the row height at the library's measured 1px so autoSize and
+        // pane layout calculations stay in sync.
         panes: {
           separatorColor: "#a8773d",
           separatorHoverColor: "#1f1d1a",
@@ -766,6 +764,7 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   useEffect(() => {
     hoveredEventRef.current = hoveredEvent;
   }, [hoveredEvent]);
+  const overlayFrameRef = useRef<number | null>(null);
 
   const drawOverlay = useCallback(() => {
     const canvas = overlayRef.current;
@@ -779,8 +778,6 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
       canvas.width = Math.round(w * dpr);
       canvas.height = Math.round(h * dpr);
-      canvas.style.width = `${w}px`;
-      canvas.style.height = `${h}px`;
     }
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -799,16 +796,25 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     }
   }, []);
 
+  const scheduleOverlayDraw = useCallback(() => {
+    if (typeof window === "undefined") return;
+    if (overlayFrameRef.current != null) return;
+    overlayFrameRef.current = window.requestAnimationFrame(() => {
+      overlayFrameRef.current = null;
+      drawOverlay();
+    });
+  }, [drawOverlay]);
+
   // Init canvas overlay + listeners once the chart is up.
   useEffect(() => {
     const chart = chartRef.current;
     const container = containerRef.current;
     if (!chart || !container) return;
 
-    const onRange = () => drawOverlay();
+    const onRange = () => scheduleOverlayDraw();
     chart.timeScale().subscribeVisibleTimeRangeChange(onRange);
 
-    const ro = new ResizeObserver(() => drawOverlay());
+    const ro = new ResizeObserver(() => scheduleOverlayDraw());
     ro.observe(container);
 
     const onMouseMove = (e: MouseEvent) => {
@@ -825,9 +831,10 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       }
       let best: { ev: TradeEvent; d: number; x: number; y: number } | null = null;
       for (const ev of tradeEventsRef.current) {
-        const x = ts.timeToCoordinate(ev.time as Time);
+        const xRaw = ts.timeToCoordinate(ev.time as Time);
         const y = series.priceToCoordinate(ev.price);
-        if (x == null || y == null) continue;
+        if (xRaw == null || y == null) continue;
+        const x = xRaw + MARKER_X_OFFSET;
         const d = Math.hypot(px - x, py - y);
         if (d <= 16 && (!best || d < best.d)) {
           best = { ev, d, x, y };
@@ -851,20 +858,24 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     container.addEventListener("mousemove", onMouseMove);
     container.addEventListener("mouseleave", onMouseLeave);
 
-    drawOverlay();
+    scheduleOverlayDraw();
 
     return () => {
       chart.timeScale().unsubscribeVisibleTimeRangeChange(onRange);
       ro.disconnect();
       container.removeEventListener("mousemove", onMouseMove);
       container.removeEventListener("mouseleave", onMouseLeave);
+      if (overlayFrameRef.current != null) {
+        window.cancelAnimationFrame(overlayFrameRef.current);
+        overlayFrameRef.current = null;
+      }
     };
-  }, [drawOverlay]);
+  }, [scheduleOverlayDraw]);
 
   // Redraw when the events list or hovered state changes.
   useEffect(() => {
-    drawOverlay();
-  }, [tradeEvents, hoveredEvent, bars, drawOverlay]);
+    scheduleOverlayDraw();
+  }, [tradeEvents, hoveredEvent, bars, scheduleOverlayDraw]);
 
   // ─── Live updates from WS ─────────────────────────────────────────────
   const lastBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);

@@ -210,26 +210,6 @@ h1, h2, h3, h4, .brand {
 
 .chart { flex: 1; min-height: 300px; background: var(--panel); }
 
-/* ─── Pane separator thickness override ────────────────────────────────────
- * lightweight-charts v5 hard-codes the pane-separator <tr> height to 1px
- * (SeparatorConstants.SeparatorHeight) — no API exposes width / thickness.
- * The separator row is uniquely identified by inline style="height: 1px";
- * no other <tr> in the chart's internal table has that height. Bump it to
- * 6 px so the divider between MACD/RSI/KD/DMI panes reads at a glance and
- * the drag handle is easy to grab.
- *
- * Color is left to the JS-driven LayoutPanesOptions.separatorColor /
- * separatorHoverColor (set in Chart.tsx) so the hover transition still
- * works — overriding background-color here with !important would shadow
- * the hover style.
- */
-.chart tr[style*="height: 1px"] {
-  height: 6px !important;
-}
-.chart tr[style*="height: 1px"] td > div {
-  height: 100% !important;
-}
-
 /* ─── Buttons / pills ──────────────────────────────────────────────────────── */
 
 .btn {
