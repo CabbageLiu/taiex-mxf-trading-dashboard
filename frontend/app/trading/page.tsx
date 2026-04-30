@@ -9,6 +9,7 @@ import { TopBar } from "@/components/TopBar";
 import { AlertLog, type SignalRow } from "@/components/AlertLog";
 import { api } from "@/lib/api";
 import { useLens } from "@/lib/lens";
+import { useStrategies } from "@/lib/queries";
 
 function TradingPageInner() {
   const lens = useLens();
@@ -19,6 +20,10 @@ function TradingPageInner() {
   const strategy = lens.strategy;
 
   const [signals, setSignals] = useState<SignalRow[]>([]);
+  // V5 Phase B Slice B3 — local chart-marker filter. `null` = show all.
+  // Not URL-persisted; fresh tabs land in "show everything" by design.
+  const [markerFilter, setMarkerFilter] = useState<Set<string> | null>(null);
+  const strategiesQ = useStrategies();
   const qc = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
   const handleRefresh = async () => {
@@ -75,6 +80,9 @@ function TradingPageInner() {
           onIndicatorsChange={setInd}
           onRefresh={handleRefresh}
           isRefreshing={refreshing}
+          markerFilter={markerFilter}
+          onMarkerFilterChange={setMarkerFilter}
+          strategies={strategiesQ.data}
         />
         <div style={{ flex: 1, minHeight: 0 }}>
           <Chart
@@ -83,6 +91,7 @@ function TradingPageInner() {
             indicators={indQ.data?.series ?? {}}
             state={ind}
             strategy={strategy}
+            markerStrategies={markerFilter}
             onSignal={(m) => {
               if (m.type !== "signal") return;
               setSignals((prev) => [...prev, {

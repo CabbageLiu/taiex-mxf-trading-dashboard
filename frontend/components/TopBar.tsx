@@ -5,6 +5,10 @@ import { Suspense, useEffect, useRef, useState } from "react";
 
 import type { IndicatorState } from "./Chart";
 import { IndicatorToggleBar } from "./IndicatorToggleBar";
+import {
+  MarkerFilterPills,
+  type MarkerFilterStrategy,
+} from "./MarkerFilterPills";
 import { ResolutionSelector, type Resolution } from "./ResolutionSelector";
 import { StrategySelector } from "./StrategySelector";
 
@@ -15,13 +19,27 @@ type Props = {
   onIndicatorsChange: (next: IndicatorState) => void;
   onRefresh: () => void;
   isRefreshing: boolean;
+  // V5 Phase B Slice B3 — chart marker filter. `null` means show all.
+  markerFilter: Set<string> | null;
+  onMarkerFilterChange: (next: Set<string> | null) => void;
+  strategies: Array<MarkerFilterStrategy> | undefined;
 };
 
 /**
  * Horizontal panel-styled toolbar shared by the trading view.
  * Composes resolution selector + strategy combobox + indicator toggle pills.
  */
-export function TopBar({ resolution, onResolutionChange, indicators, onIndicatorsChange, onRefresh, isRefreshing }: Props) {
+export function TopBar({
+  resolution,
+  onResolutionChange,
+  indicators,
+  onIndicatorsChange,
+  onRefresh,
+  isRefreshing,
+  markerFilter,
+  onMarkerFilterChange,
+  strategies,
+}: Props) {
   // Pulse the refresh button briefly when an in-flight refresh resolves.
   // Hits the keyframe `pulseAccent` once via the `pulse-success` class.
   const [pulse, setPulse] = useState(false);
@@ -57,6 +75,13 @@ export function TopBar({ resolution, onResolutionChange, indicators, onIndicator
       </div>
       <div className="group">
         <IndicatorToggleBar state={indicators} onChange={onIndicatorsChange} />
+      </div>
+      <div className="group">
+        <MarkerFilterPills
+          value={markerFilter}
+          onChange={onMarkerFilterChange}
+          strategies={strategies}
+        />
       </div>
       <div className="group">
         <button

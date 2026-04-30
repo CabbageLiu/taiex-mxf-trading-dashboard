@@ -14,6 +14,7 @@ import {
   type SignalsQuery,
   type StatsQuery,
   type StatusResponse,
+  type StrategyOut,
   type StrategyState,
   type TestWebhookChannel,
   type TestWebhookResponse,
@@ -47,6 +48,20 @@ export function useTradeStats(filter: StatsQuery = {}) {
     queryKey: ["trade-stats", filter],
     queryFn: () => api.getTradeStats(filter),
     staleTime: STALE_TRADES,
+  });
+}
+
+// V5 Phase B — registered-strategy list. Mirrors the StrategySelector's
+// internal query so consumers (e.g. the marker-filter pills) can read the
+// same cache without forcing a second network round-trip. The 10 s
+// `refetchInterval` matches the selector so an enable-toggle from the combo
+// reflects in the toolbar within one tick.
+export function useStrategies() {
+  return useQuery<StrategyOut[]>({
+    queryKey: ["strategies"],
+    queryFn: api.strategies,
+    refetchInterval: 10_000,
+    staleTime: 5_000,
   });
 }
 

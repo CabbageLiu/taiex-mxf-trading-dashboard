@@ -16,6 +16,10 @@ export type StrategyOut = {
   enabled: boolean;
   params: Record<string, unknown>;
   channels: string[];
+  // V5 Phase B — backend slice A4 surfaces the strategy's human-readable
+  // label (e.g. "30分鐘線策略"). Optional + nullable for backward compat
+  // with deployments that haven't been redeployed yet.
+  display_name?: string | null;
 };
 
 export type AlertOut = {

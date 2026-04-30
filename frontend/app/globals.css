@@ -671,6 +671,16 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   padding: 2px 6px;
   border-radius: 4px;
 }
+.trade-marker-id {
+  color: var(--accent);
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.04em;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0 5px;
+  font-variant-numeric: tabular-nums;
+}
 .trade-marker-strategy {
   color: var(--ink);
   font-size: var(--fs-caption);

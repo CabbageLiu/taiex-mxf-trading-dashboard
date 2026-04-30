@@ -68,6 +68,7 @@ export function TradeMarkerTooltip({ event, x, y }: Props) {
   return (
     <div className="trade-marker-card" style={style} role="tooltip" aria-live="polite">
       <div className="trade-marker-head">
+        <span className="trade-marker-id">#{event.tradeId}</span>
         <span
           className="trade-marker-kind"
           style={{

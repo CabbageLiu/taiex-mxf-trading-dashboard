@@ -82,6 +82,9 @@ export const dict = {
   "filter.loss": "虧損",
   "filter.dateRange": "日期區間",
 
+  // V5 Phase B — marker filter toolbar
+  "filter.markers.label": "策略過濾",
+
   // V2 — trades table
   "trades.col.date": "日期",
   "trades.col.side": "方向",

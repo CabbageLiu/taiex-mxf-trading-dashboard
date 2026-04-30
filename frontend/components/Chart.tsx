@@ -47,6 +47,11 @@ type Props = {
   state: IndicatorState;
   onSignal?: (m: WsMessage) => void;
   strategy?: string | null;
+  // V5 Phase B Slice B3 — strategy-name allow-list for marker rendering.
+  // `null` / `undefined` means "render all events" (backward-compatible
+  // default). When a `Set` is supplied, only events whose `strategy` is in
+  // the set are painted on the overlay or surfaced to the hover hit-test.
+  markerStrategies?: Set<string> | null;
 };
 
 export type TradeEvent = {
@@ -98,12 +103,20 @@ function strategyHex(name: string | null | undefined): string {
 // Hover state: scale up + soft strategy-tinted halo + outline ring. The dot
 // sits MARKER_X_OFFSET pixels to the right of the candle so it doesn't
 // overlap candle bodies.
+//
+// V5 Phase B Slice B1: when the trade's price falls outside the visible
+// candle pane (wick beyond the auto-fit range, or extreme TP/SL pierce),
+// `priceToCoordinate` returns null. We clamp y into the pane height and
+// pass `outOfRange: 'above' | 'below'` so this paint draws an extra
+// chevron glyph next to the disc — visual cue "this exit happened off-screen
+// in this direction." `null` means y was inside the pane, no chevron.
 function paintMarker(
   ctx: CanvasRenderingContext2D,
   ev: TradeEvent,
   x: number,
   y: number,
   hovered: boolean,
+  outOfRange: "above" | "below" | null = null,
 ): void {
   const stratColor = strategyHex(ev.strategy);
   const isClose = ev.kind === "CLOSE";
@@ -156,6 +169,33 @@ function paintMarker(
   ctx.textBaseline = "middle";
   ctx.fillText(glyph, x, y + 1);
 
+  // Out-of-range chevron — thin outlined arrow stacked beside the disc to
+  // signal "actual price was above/below the visible pane and the marker
+  // has been clamped to the edge."
+  if (outOfRange) {
+    const chevSize = Math.round(r * 0.85);
+    const chevX = x + r + chevSize + 2;
+    const chevY = y;
+    ctx.beginPath();
+    if (outOfRange === "above") {
+      // ▲ pointing up
+      ctx.moveTo(chevX, chevY - chevSize);
+      ctx.lineTo(chevX + chevSize, chevY + chevSize * 0.6);
+      ctx.lineTo(chevX - chevSize, chevY + chevSize * 0.6);
+    } else {
+      // ▼ pointing down
+      ctx.moveTo(chevX, chevY + chevSize);
+      ctx.lineTo(chevX + chevSize, chevY - chevSize * 0.6);
+      ctx.lineTo(chevX - chevSize, chevY - chevSize * 0.6);
+    }
+    ctx.closePath();
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.strokeStyle = stratColor;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
   ctx.restore();
 }
 
@@ -170,7 +210,7 @@ type PaneRefs = {
 // `trading/page.tsx` keep passing it), but the chart itself no longer
 // reads it directly — live trades render for ALL strategies (color-coded)
 // and the backtest layer is driven by the URL lens. Destructure-ignored.
-export function Chart({ res, bars, indicators, state, onSignal }: Props) {
+export function Chart({ res, bars, indicators, state, onSignal, markerStrategies }: Props) {
   const qc = useQueryClient();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -737,6 +777,18 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     return out;
   }, [trades, btTrades, lens.strategy]);
 
+  // V5 Phase B Slice B3: gate the marker stream by the local strategy
+  // allow-list before it reaches the overlay paint + hover hit-test. A
+  // null/undefined `markerStrategies` is the cold-start "show all" default;
+  // any concrete Set keeps only events whose `.strategy` is in the set.
+  // Both `drawOverlay` and the mousemove handler read from `tradeEventsRef`
+  // (single ref, downstream of this filter), so no other surface needs to
+  // change to honor the gate.
+  const filteredTradeEvents = useMemo<TradeEvent[]>(() => {
+    if (!markerStrategies) return tradeEvents;
+    return tradeEvents.filter((ev) => markerStrategies.has(ev.strategy));
+  }, [tradeEvents, markerStrategies]);
+
   // ─── Custom marker overlay (canvas) ────────────────────────────────────
   // Lightweight-charts' built-in createSeriesMarkers paints into the same
   // canvas the chart owns and exposes no hover events, so a user pointing at
@@ -758,8 +810,11 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   // time-range change, container resize, and bar updates.
   const tradeEventsRef = useRef<TradeEvent[]>([]);
   useEffect(() => {
-    tradeEventsRef.current = tradeEvents;
-  }, [tradeEvents]);
+    // Stash the post-filter list so paint + hover hit-test see the same
+    // gated stream. Toggling pills triggers this effect, which then
+    // schedules a redraw via the dependency below.
+    tradeEventsRef.current = filteredTradeEvents;
+  }, [filteredTradeEvents]);
   const hoveredEventRef = useRef<TradeEvent | null>(null);
   useEffect(() => {
     hoveredEventRef.current = hoveredEvent;
@@ -769,6 +824,9 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   // Retry handle for paint deferred when priceToCoordinate returns null
   // before the chart's first layout pass finishes.
   const retryRef = useRef<number | null>(null);
+  // One-shot warning latches so a recurring fallback path doesn't spam the
+  // console — fired the first time `paneSize` fails or coordinate hits clamp.
+  const paneSizeWarnedRef = useRef(false);
 
   const drawOverlay = useCallback(() => {
     const canvas = overlayRef.current;
@@ -789,6 +847,32 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
+    // Resolve the candle pane (pane index 0) height once per draw so we can
+    // clamp out-of-range markers to the pane edge instead of dropping them.
+    // Defensive: paneSize is documented but if the chart is mid-init it can
+    // throw or return zeroes — fall back to the canvas's CSS height.
+    let paneHeight = 0;
+    try {
+      const ps = chart.paneSize(0);
+      if (ps && Number.isFinite(ps.height) && ps.height > 0) {
+        paneHeight = ps.height;
+      }
+    } catch {
+      // swallow — handled by the fallback below
+    }
+    if (paneHeight <= 0) {
+      paneHeight = h;
+      if (!paneSizeWarnedRef.current && typeof console !== "undefined") {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[Chart] chart.paneSize(0) unavailable; falling back to container height for marker clamp.",
+        );
+        paneSizeWarnedRef.current = true;
+      }
+    }
+    const yMin = 8;
+    const yMax = Math.max(yMin + 1, paneHeight - 8);
+
     const ts = chart.timeScale();
     const hovered = hoveredEventRef.current;
     // Two passes so a CLOSE marker is never painted under its own OPEN marker
@@ -801,27 +885,69 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     let drewOpen = 0;
     let drewClose = 0;
     let skipped = 0;
+    let clamped = 0;
+    let retryScheduled = 0;
     for (const ev of [...opens, ...closes]) {
       const xRaw = ts.timeToCoordinate(ev.time as Time);
-      const y = series.priceToCoordinate(ev.price);
-      if (xRaw == null || y == null) {
-        // Common during the chart's initial layout pass: priceToCoordinate
-        // returns null until the price scale auto-fits the visible bars.
-        // We mark for retry below.
+      if (xRaw == null) {
+        // Time hasn't materialized on the scale yet (probably outside the
+        // current data window or pre-layout). Retry covers the layout case.
         skipped += 1;
         continue;
       }
+      const yRaw = series.priceToCoordinate(ev.price);
+      let y: number;
+      let outOfRange: "above" | "below" | null = null;
+      if (yRaw == null) {
+        // priceToCoordinate returns null in two situations:
+        //   (1) price scale not initialized yet (pre-auto-fit) — retry handles
+        //   (2) price falls outside the auto-fit visible range — clamp & flag
+        // We can't distinguish (1) vs (2) from the API, so we always clamp
+        // AND schedule a retry so case (1) re-paints with a real coordinate
+        // once the layout settles. Direction inference: compare the trade
+        // price against the y=0 (top) and y=paneHeight (bottom) reverse-mapped
+        // prices via coordinateToPrice; if higher than top → above.
+        const topPrice = series.coordinateToPrice(yMin);
+        const botPrice = series.coordinateToPrice(yMax);
+        if (topPrice != null && Number(ev.price) > Number(topPrice)) {
+          y = yMin;
+          outOfRange = "above";
+        } else if (botPrice != null && Number(ev.price) < Number(botPrice)) {
+          y = yMax;
+          outOfRange = "below";
+        } else {
+          // Direction unknown (probably pre-layout) — park at the vertical
+          // mid-line so the dot is at least visible while the retry runs.
+          y = paneHeight / 2;
+        }
+        clamped += 1;
+      } else if (yRaw < yMin) {
+        y = yMin;
+        outOfRange = "above";
+        clamped += 1;
+      } else if (yRaw > yMax) {
+        y = yMax;
+        outOfRange = "below";
+        clamped += 1;
+      } else {
+        y = yRaw;
+      }
       const x = xRaw + MARKER_X_OFFSET;
       const isHovered = hovered === ev;
-      paintMarker(ctx, ev, x, y, isHovered);
+      paintMarker(ctx, ev, x, y, isHovered, outOfRange);
       if (ev.kind === "OPEN") drewOpen += 1;
       else drewClose += 1;
     }
-    if (skipped > 0 && typeof window !== "undefined" && retryRef.current == null) {
+    if ((skipped > 0 || clamped > 0) && typeof window !== "undefined" && retryRef.current == null) {
+      // Retry covers the pre-auto-fit case where priceToCoordinate returns
+      // null transiently. After the price scale settles, the redraw will
+      // produce real coordinates and the clamp branch above stops firing for
+      // genuinely-in-range trades.
       retryRef.current = window.setTimeout(() => {
         retryRef.current = null;
         drawOverlay();
       }, 250);
+      retryScheduled = 1;
     }
     if (typeof window !== "undefined") {
       // dev visibility — `window.__taiexMarkerStats` from devtools console
@@ -830,6 +956,8 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
         drewOpen,
         drewClose,
         skipped,
+        clamped,
+        retryScheduled,
       };
     }
   }, []);
@@ -917,7 +1045,7 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   // Redraw when the events list or hovered state changes.
   useEffect(() => {
     scheduleOverlayDraw();
-  }, [tradeEvents, hoveredEvent, bars, scheduleOverlayDraw]);
+  }, [filteredTradeEvents, hoveredEvent, bars, scheduleOverlayDraw]);
 
   // ─── Live updates from WS ─────────────────────────────────────────────
   const lastBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);
