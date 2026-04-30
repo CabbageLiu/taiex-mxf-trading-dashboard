@@ -1,11 +1,16 @@
 """TAIEX Multi-Timeframe Strategy v2 (5-minute strategy).
 
 Per spec, the timeframes are strictly partitioned:
-  * 5m bar close = entry decision only (KD>20, MACD rising-edge above 0,
-    +DI>21 AND +DI > -DI). NO TP/SL evaluation on the 5m path.
+  * 5m bar close = entry decision only (KD>20, MACD-histogram rising-edge
+    above 0, +DI>21 AND +DI > -DI). NO TP/SL evaluation on the 5m path.
   * 1m bar close = TP/SL evaluation only (pure price math against the
     open position). NO entry logic on the 1m series.
   * 3m bar close = exit assist via -DI >= 23 momentum flip.
+
+All MACD-based gates evaluate on the **histogram** (`hist` column,
+= macd_line - signal_line), NOT the MACD line itself. The histogram
+cross-up matches what shows visually as "MACD bars turning green" on
+the chart, which is what users read as the entry trigger.
 
 Trend layer  : Daily — display-only "Daily Confidence" badge (0/3..3/3),
                does not block entry.
@@ -244,23 +249,23 @@ class TradeStratV2(Strategy):
             return
         k = _scalar(kd["k"])
         d = _scalar(kd["d"])
-        macd_val = _scalar(macd["macd"])
+        hist_val = _scalar(macd["hist"])
         plus_di = _scalar(dmi["plus_di"])
         minus_di = _scalar(dmi["minus_di"])
-        if None in (k, d, macd_val, plus_di, minus_di):
+        if None in (k, d, hist_val, plus_di, minus_di):
             return
 
         long_score = sum(
             (
                 k > p.kd_long_floor and d > p.kd_long_floor,
-                macd_val > 0,
+                hist_val > 0,
                 plus_di > p.di_long_threshold and plus_di > minus_di,
             )
         )
         short_score = sum(
             (
                 k < p.kd_short_ceiling and d < p.kd_short_ceiling,
-                macd_val < 0,
+                hist_val < 0,
                 minus_di > p.di_short_threshold and minus_di > plus_di,
             )
         )
@@ -284,23 +289,23 @@ class TradeStratV2(Strategy):
 
         k_curr = _scalar(kd["k"])
         d_curr = _scalar(kd["d"])
-        macd_curr = _scalar(macd["macd"])
+        hist_curr = _scalar(macd["hist"])
         plus_curr = _scalar(dmi["plus_di"])
         minus_curr = _scalar(dmi["minus_di"])
         close_curr = _scalar(ev.bars["close"])
-        if None in (k_curr, d_curr, macd_curr, plus_curr, minus_curr, close_curr):
+        if None in (k_curr, d_curr, hist_curr, plus_curr, minus_curr, close_curr):
             return None
 
-        macd_rising = _macd_rising_edge(macd["macd"])
+        macd_rising = _macd_rising_edge(macd["hist"])
         # Mirror v1: symmetric falling-edge gate for SHORT (negate the
-        # series so the same "just turned positive" helper detects the
+        # histogram so the same "just turned positive" helper detects the
         # downside cross).
-        macd_falling = _macd_rising_edge(-macd["macd"])
+        macd_falling = _macd_rising_edge(-macd["hist"])
 
         long_now = (
             k_curr > p.kd_long_floor
             and d_curr > p.kd_long_floor
-            and macd_curr > 0
+            and hist_curr > 0
             and macd_rising
             and plus_curr > p.di_long_threshold
             and plus_curr > minus_curr
@@ -309,7 +314,7 @@ class TradeStratV2(Strategy):
             p.enable_short
             and k_curr < p.kd_short_ceiling
             and d_curr < p.kd_short_ceiling
-            and macd_curr < 0
+            and hist_curr < 0
             and macd_falling
             and minus_curr > p.di_short_threshold
             and minus_curr > plus_curr

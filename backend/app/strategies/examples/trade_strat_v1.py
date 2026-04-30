@@ -8,10 +8,13 @@ Trend layer  : Daily — display-only "Daily Confidence" badge (0/3..3/3),
 MACD rising-edge gate
 ---------------------
 Per spec: "MACD above 0 (initial 3 figures of MACD trend becoming positive)".
-Interpreted as a 3-bar pattern on the entry timeframe (30m):
-    macd[-3] <= 0 AND macd[-2] > 0 AND macd[-1] > macd[-2]
-i.e. was non-positive 3 bars ago, became positive on the middle bar, and
-kept rising on the latest bar. NaN values are treated as 0 / non-positive.
+Evaluated on the **MACD histogram** (`hist` column, = macd_line - signal_line),
+not the MACD line itself. 3-bar pattern on the entry timeframe (30m):
+    hist[-3] <= 0 AND hist[-2] > 0 AND hist[-1] > hist[-2]
+i.e. histogram was non-positive 3 bars ago, became positive on the middle
+bar, and kept rising on the latest bar. NaN values are treated as 0 /
+non-positive. The histogram cross-up is what shows visually as "MACD bars
+turning green" on the chart.
 
 Daily confidence rule (display only)
 ------------------------------------
@@ -35,8 +38,9 @@ Exits (any one fires → close):
   * -60 pt stop-loss (30m bar close).
   * 10m DMI flip: -DI > +DI closes LONG, +DI > -DI closes SHORT
     (reason `DI_FLIP_10M`).
-  * 30m MACD-falling: macd[-2] > macd[-1] closes LONG, macd[-2] < macd[-1]
-    closes SHORT (reason `MACD_DOWN_30M`).
+  * 30m MACD-falling: hist[-2] > hist[-1] closes LONG, hist[-2] < hist[-1]
+    closes SHORT (reason `MACD_DOWN_30M`). Evaluated on histogram, same
+    semantics as the entry rising-edge.
 
 Priority on a single 30m bar close: TP/SL > MACD-falling > entry eval. If
 TP and falling-MACD both fire on the same bar, only TP is emitted.
@@ -259,23 +263,23 @@ class TradeStratV1(Strategy):
             return
         k = _scalar(kd["k"])
         d = _scalar(kd["d"])
-        macd_val = _scalar(macd["macd"])
+        hist_val = _scalar(macd["hist"])
         plus_di = _scalar(dmi["plus_di"])
         minus_di = _scalar(dmi["minus_di"])
-        if None in (k, d, macd_val, plus_di, minus_di):
+        if None in (k, d, hist_val, plus_di, minus_di):
             return
 
         long_score = sum(
             (
                 k > p.kd_long_floor and d > p.kd_long_floor,
-                macd_val > 0,
+                hist_val > 0,
                 plus_di > p.di_long_threshold and plus_di > minus_di,
             )
         )
         short_score = sum(
             (
                 k < p.kd_short_ceiling and d < p.kd_short_ceiling,
-                macd_val < 0,
+                hist_val < 0,
                 minus_di > p.di_short_threshold and minus_di > plus_di,
             )
         )
@@ -299,15 +303,15 @@ class TradeStratV1(Strategy):
 
         k_curr = _scalar(kd["k"])
         d_curr = _scalar(kd["d"])
-        macd_curr = _scalar(macd["macd"])
+        hist_curr = _scalar(macd["hist"])
         plus_curr = _scalar(dmi["plus_di"])
         minus_curr = _scalar(dmi["minus_di"])
         close_curr = _scalar(ev.bars["close"])
-        if None in (k_curr, d_curr, macd_curr, plus_curr, minus_curr, close_curr):
+        if None in (k_curr, d_curr, hist_curr, plus_curr, minus_curr, close_curr):
             return None
 
-        macd_rising = _macd_just_turned_positive(macd["macd"])
-        macd_falling = _macd_just_turned_positive(-macd["macd"])  # mirror for SHORT
+        macd_rising = _macd_just_turned_positive(macd["hist"])
+        macd_falling = _macd_just_turned_positive(-macd["hist"])  # mirror for SHORT
 
         long_now = (
             k_curr > p.kd_long_floor
@@ -352,12 +356,12 @@ class TradeStratV1(Strategy):
         if long_rising:
             return self._open_position(
                 ev, st, side="LONG", price=close_curr, p=p,
-                k=k_curr, d=d_curr, macd_v=macd_curr, di=plus_curr,
+                k=k_curr, d=d_curr, macd_v=hist_curr, di=plus_curr,
             )
         if short_rising:
             return self._open_position(
                 ev, st, side="SHORT", price=close_curr, p=p,
-                k=k_curr, d=d_curr, macd_v=macd_curr, di=minus_curr,
+                k=k_curr, d=d_curr, macd_v=hist_curr, di=minus_curr,
             )
         return None
 
@@ -415,18 +419,18 @@ class TradeStratV1(Strategy):
         close = _scalar(ev.bars["close"])
         if macd is None or close is None or len(macd) < 2:
             return None
-        prev_macd = (
-            float(macd["macd"].iloc[-2]) if pd.notna(macd["macd"].iloc[-2]) else None
+        prev_hist = (
+            float(macd["hist"].iloc[-2]) if pd.notna(macd["hist"].iloc[-2]) else None
         )
-        curr_macd = (
-            float(macd["macd"].iloc[-1]) if pd.notna(macd["macd"].iloc[-1]) else None
+        curr_hist = (
+            float(macd["hist"].iloc[-1]) if pd.notna(macd["hist"].iloc[-1]) else None
         )
-        if prev_macd is None or curr_macd is None:
+        if prev_hist is None or curr_hist is None:
             return None
-        if st.position.side == "LONG" and prev_macd > curr_macd:
+        if st.position.side == "LONG" and prev_hist > curr_hist:
             pnl = close - st.position.entry_price
             return self._close_position(ev, st, close, "MACD_DOWN_30M", pnl)
-        if st.position.side == "SHORT" and prev_macd < curr_macd:
+        if st.position.side == "SHORT" and prev_hist < curr_hist:
             pnl = st.position.entry_price - close
             return self._close_position(ev, st, close, "MACD_DOWN_30M", pnl)
         return None
