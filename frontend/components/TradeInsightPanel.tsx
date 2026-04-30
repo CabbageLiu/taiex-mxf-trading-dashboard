@@ -170,6 +170,10 @@ export function TradeInsightPanel(props: Props) {
     : null;
 
   const handleGenerate = () => {
+    // Mirror the backend 200-trades-per-side cap on the client so we never
+    // post a body larger than the server will keep.
+    const cap = (rows: typeof props.inlineTrades) =>
+      rows ? rows.slice(0, 200) : rows;
     if (props.compareMode && props.compareA && props.compareB) {
       insight.mutate({
         strategy: `${props.compareA.strategy ?? "A"}__vs__${props.compareB.strategy ?? "B"}`,
@@ -177,12 +181,12 @@ export function TradeInsightPanel(props: Props) {
         compare_a: {
           strategy: props.compareA.strategy ?? "A",
           stats: props.compareA.stats,
-          trades: props.compareA.trades,
+          trades: cap(props.compareA.trades),
         },
         compare_b: {
           strategy: props.compareB.strategy ?? "B",
           stats: props.compareB.stats,
-          trades: props.compareB.trades,
+          trades: cap(props.compareB.trades),
         },
       });
       return;
@@ -193,7 +197,7 @@ export function TradeInsightPanel(props: Props) {
         start: filter.start ?? undefined,
         end: filter.end ?? undefined,
         filter: filter.result,
-        trades: props.inlineTrades,
+        trades: cap(props.inlineTrades),
         stats: props.inlineStats,
       });
       return;

@@ -70,35 +70,50 @@ export type UseLensReturn = LensState & {
 
 /**
  * Encode an `IndicatorState` into a compact comma-separated form suitable for
- * a URL query value. Only enabled indicators contribute tokens.
+ * a URL query value. Each indicator emits a token iff its current state
+ * differs from the default. Tokens carry a `+` (enabled) or `-` (disabled)
+ * marker so a serialize-then-parse roundtrip is lossless even for disabled
+ * indicators with custom periods/kinds.
  *
  * @example
- * encodeIndicators({
- *   ma:   { enabled: true,  period: 20, kind: "sma" },
- *   macd: { enabled: true },
- *   rsi:  { enabled: false, period: 14 },
- *   kd:   { enabled: false },
- *   dmi:  { enabled: false },
- * });
- * // => "ma:sma:20,macd"
+ * encodeIndicators(DEFAULT_INDICATORS);
+ * // => ""  (empty — defaults need no token)
  *
  * @example
  * encodeIndicators({
  *   ma:   { enabled: true,  period: 50, kind: "ema" },
- *   macd: { enabled: false },
- *   rsi:  { enabled: true,  period: 14 },
+ *   macd: { enabled: false },                          // MACD default is on; flip to off
+ *   rsi:  { enabled: false, period: 42 },              // disabled but custom period
  *   kd:   { enabled: true },
  *   dmi:  { enabled: true },
  * });
- * // => "ma:ema:50,rsi:14,kd,dmi"
+ * // => "ma+:ema:50,macd-,rsi-:42,kd+,dmi+"
  */
 export function encodeIndicators(state: IndicatorState): string {
   const tokens: string[] = [];
-  if (state.ma.enabled) tokens.push(`ma:${state.ma.kind}:${state.ma.period}`);
-  if (state.macd.enabled) tokens.push("macd");
-  if (state.rsi.enabled) tokens.push(`rsi:${state.rsi.period}`);
-  if (state.kd.enabled) tokens.push("kd");
-  if (state.dmi.enabled) tokens.push("dmi");
+  const def = DEFAULT_INDICATORS;
+  if (
+    state.ma.enabled !== def.ma.enabled ||
+    state.ma.period !== def.ma.period ||
+    state.ma.kind !== def.ma.kind
+  ) {
+    tokens.push(`ma${state.ma.enabled ? "+" : "-"}:${state.ma.kind}:${state.ma.period}`);
+  }
+  if (state.macd.enabled !== def.macd.enabled) {
+    tokens.push(`macd${state.macd.enabled ? "+" : "-"}`);
+  }
+  if (
+    state.rsi.enabled !== def.rsi.enabled ||
+    state.rsi.period !== def.rsi.period
+  ) {
+    tokens.push(`rsi${state.rsi.enabled ? "+" : "-"}:${state.rsi.period}`);
+  }
+  if (state.kd.enabled !== def.kd.enabled) {
+    tokens.push(`kd${state.kd.enabled ? "+" : "-"}`);
+  }
+  if (state.dmi.enabled !== def.dmi.enabled) {
+    tokens.push(`dmi${state.dmi.enabled ? "+" : "-"}`);
+  }
   return tokens.join(",");
 }
 
@@ -120,7 +135,8 @@ export function encodeIndicators(state: IndicatorState): string {
  * // }
  */
 export function decodeIndicators(s: string | null): IndicatorState {
-  // Deep clone of defaults — keeps the original constant immutable.
+  // Deep clone of defaults — keeps the original constant immutable. Any
+  // indicator NOT mentioned in the codec stays at its default.
   const out: IndicatorState = {
     ma: { ...DEFAULT_INDICATORS.ma },
     macd: { ...DEFAULT_INDICATORS.macd },
@@ -130,38 +146,41 @@ export function decodeIndicators(s: string | null): IndicatorState {
   };
   if (!s) return out;
 
-  // When a codec is supplied, it is authoritative — start every flag off and
-  // turn back on only the tokens explicitly present.
-  out.ma.enabled = false;
-  out.macd.enabled = false;
-  out.rsi.enabled = false;
-  out.kd.enabled = false;
-  out.dmi.enabled = false;
-
   for (const raw of s.split(",")) {
     const token = raw.trim();
     if (!token) continue;
     const parts = token.split(":");
     const head = parts[0];
-    if (head === "ma") {
+    // Strip trailing +/- marker; legacy tokens without a marker are treated
+    // as enabled (matches V4 phase 2's original lossy codec for back-compat).
+    let key = head;
+    let enabled = true;
+    if (head.endsWith("+")) {
+      key = head.slice(0, -1);
+      enabled = true;
+    } else if (head.endsWith("-")) {
+      key = head.slice(0, -1);
+      enabled = false;
+    }
+    if (key === "ma") {
       const kind = parts[1];
       const period = Number(parts[2]);
       if ((kind === "sma" || kind === "ema") && Number.isFinite(period) && period > 0) {
-        out.ma = { enabled: true, period, kind };
+        out.ma = { enabled, period, kind };
       }
-    } else if (head === "macd") {
-      out.macd = { enabled: true };
-    } else if (head === "rsi") {
+    } else if (key === "macd") {
+      out.macd = { enabled };
+    } else if (key === "rsi") {
       const period = Number(parts[1]);
       if (Number.isFinite(period) && period > 0) {
-        out.rsi = { enabled: true, period };
+        out.rsi = { enabled, period };
       }
-    } else if (head === "kd") {
-      out.kd = { enabled: true };
-    } else if (head === "dmi") {
-      out.dmi = { enabled: true };
+    } else if (key === "kd") {
+      out.kd = { enabled };
+    } else if (key === "dmi") {
+      out.dmi = { enabled };
     }
-    // unknown token → ignored, indicator stays off
+    // unknown token → ignored, indicator stays at default
   }
 
   return out;
