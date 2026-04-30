@@ -16,8 +16,8 @@
      overlapping plot layers (live vs backtest, v1 vs v2). The hex literals
      are mirrored in `Chart.tsx::STRATEGY_COLORS` because lightweight-charts
      does not resolve `var(--…)` for canvas-painted markers. */
-  --strategy-1: #4a7ba6;     /* indigo blue */
-  --strategy-2: #b87333;     /* copper orange */
+  --strategy-1: #1e88e5;     /* vivid blue */
+  --strategy-2: #fb8c00;     /* vivid orange */
 
   /* V2 design tokens — additive, do not remove existing vars */
   --ink: #1f1d1a;

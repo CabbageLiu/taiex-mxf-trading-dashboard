@@ -73,19 +73,31 @@ const TZ = "Asia/Taipei";
 // time, so the SeriesMarker `color` field needs an explicit hex literal.
 // CSS tokens still drive any DOM-visible chrome that wants to match.
 const STRATEGY_COLORS: Record<string, { token: string; hex: string }> = {
-  trade_strat_v1: { token: "var(--strategy-1)", hex: "#4a7ba6" },
-  trade_strat_v2: { token: "var(--strategy-2)", hex: "#b87333" },
+  trade_strat_v1: { token: "var(--strategy-1)", hex: "#1e88e5" },
+  trade_strat_v2: { token: "var(--strategy-2)", hex: "#fb8c00" },
 };
+
+// Pixel offset applied to every marker so the dot sits to the right of the
+// candle wick instead of overlapping the candle body. Keeps the chart
+// readable even with several markers stacked on adjacent bars.
+const MARKER_X_OFFSET = 14;
 
 function strategyHex(name: string | null | undefined): string {
   if (!name) return "#8a8175";
   return STRATEGY_COLORS[name]?.hex ?? "#8a8175";
 }
 
-// Paint one trade marker on the overlay canvas. OPEN = filled triangle that
-// points toward the entry (▲ LONG below the bar / ▼ SHORT above), strategy
-// color fill, white halo. CLOSE = filled circle, win-red / loss-green fill
-// with a 2px ring in the strategy color.
+// Paint one trade marker on the overlay canvas. Both OPEN and CLOSE render
+// as a labelled disc — the Traditional Chinese glyph (進 / 出) inside the
+// dot identifies the event without requiring hover.
+//
+//   OPEN  → filled disc, fill = strategy color, white halo, "進" glyph
+//   CLOSE → filled disc, fill = win-red / loss-green (TW palette), 2 px
+//           ring in strategy color, white halo, "出" glyph
+//
+// Hover state: scale up + soft strategy-tinted halo + outline ring. The dot
+// sits MARKER_X_OFFSET pixels to the right of the candle so it doesn't
+// overlap candle bodies.
 function paintMarker(
   ctx: CanvasRenderingContext2D,
   ev: TradeEvent,
@@ -97,68 +109,52 @@ function paintMarker(
   const isClose = ev.kind === "CLOSE";
   const isWin = isClose && (ev.pnl ?? 0) >= 0;
   const fill = isClose ? (isWin ? UP : DOWN) : stratColor;
+  const glyph = isClose ? "出" : "進";
+  const r = hovered ? 13 : 11;
 
   ctx.save();
 
-  // Hover halo — subtle ring + soft glow under the marker.
+  // Hover halo — soft fill + outline ring around the marker.
   if (hovered) {
     ctx.beginPath();
-    ctx.arc(x, y, 14, 0, Math.PI * 2);
-    ctx.fillStyle = stratColor + "22";
+    ctx.arc(x, y, r + 6, 0, Math.PI * 2);
+    ctx.fillStyle = stratColor + "26";
     ctx.fill();
     ctx.beginPath();
-    ctx.arc(x, y, 12, 0, Math.PI * 2);
+    ctx.arc(x, y, r + 4, 0, Math.PI * 2);
     ctx.strokeStyle = stratColor;
     ctx.lineWidth = 1.5;
     ctx.stroke();
   }
 
+  // White halo behind the disc so the dot reads against any candle color.
+  ctx.beginPath();
+  ctx.arc(x, y, r + 1.5, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
+
+  // Filled disc.
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+
+  // Strategy ring on CLOSE so the win/loss fill doesn't lose the strategy
+  // attribution. OPEN already uses the strategy color as its fill.
   if (isClose) {
-    const r = hovered ? 8 : 6;
-    // White halo for legibility on any candle color.
-    ctx.beginPath();
-    ctx.arc(x, y, r + 2, 0, Math.PI * 2);
-    ctx.fillStyle = "#ffffff";
-    ctx.fill();
-    // Filled core (win/loss tint).
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fillStyle = fill;
-    ctx.fill();
-    // Strategy ring.
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.strokeStyle = stratColor;
     ctx.lineWidth = 2;
     ctx.stroke();
-  } else {
-    const size = hovered ? 9 : 7;
-    const isLong = ev.side === "LONG";
-    // White halo as a slightly larger triangle painted underneath.
-    const haloPath = (s: number) => {
-      ctx.beginPath();
-      if (isLong) {
-        // Pointing up — apex above the y center; LONG entry sits below candle.
-        ctx.moveTo(x, y - s);
-        ctx.lineTo(x - s * 0.9, y + s * 0.7);
-        ctx.lineTo(x + s * 0.9, y + s * 0.7);
-      } else {
-        ctx.moveTo(x, y + s);
-        ctx.lineTo(x - s * 0.9, y - s * 0.7);
-        ctx.lineTo(x + s * 0.9, y - s * 0.7);
-      }
-      ctx.closePath();
-    };
-    haloPath(size + 1.5);
-    ctx.fillStyle = "#ffffff";
-    ctx.fill();
-    haloPath(size);
-    ctx.fillStyle = fill;
-    ctx.fill();
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 1.2;
-    ctx.stroke();
   }
+
+  // TC glyph in white — bold for legibility at small sizes.
+  ctx.fillStyle = "#ffffff";
+  ctx.font = `bold ${Math.round(r * 1.05)}px "Noto Sans TC", "PingFang TC", system-ui, sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(glyph, x, y + 1);
 
   ctx.restore();
 }
@@ -686,7 +682,7 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
           reason: entryReason,
           source: "LIVE",
         });
-        if (tr.exit_ts && tr.exit_price != null && tr.pnl_points != null) {
+        if (tr.exit_ts && tr.exit_price != null) {
           out.push({
             tradeId: tr.id,
             time: Math.floor(new Date(tr.exit_ts).getTime() / 1000),
@@ -695,7 +691,7 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
             side: tr.side,
             strategy: tr.strategy,
             reason: exitReason,
-            pnl: tr.pnl_points,
+            pnl: tr.pnl_points ?? undefined,
             source: "LIVE",
           });
         }
@@ -780,9 +776,10 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     const ts = chart.timeScale();
     const hovered = hoveredEventRef.current;
     for (const ev of tradeEventsRef.current) {
-      const x = ts.timeToCoordinate(ev.time as Time);
+      const xRaw = ts.timeToCoordinate(ev.time as Time);
       const y = series.priceToCoordinate(ev.price);
-      if (x == null || y == null) continue;
+      if (xRaw == null || y == null) continue;
+      const x = xRaw + MARKER_X_OFFSET;
       const isHovered = hovered === ev;
       paintMarker(ctx, ev, x, y, isHovered);
     }
@@ -818,7 +815,7 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
         const y = series.priceToCoordinate(ev.price);
         if (x == null || y == null) continue;
         const d = Math.hypot(px - x, py - y);
-        if (d <= 14 && (!best || d < best.d)) {
+        if (d <= 16 && (!best || d < best.d)) {
           best = { ev, d, x, y };
         }
       }
