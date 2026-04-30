@@ -45,4 +45,4 @@ def test_resolution_rank_ordering():
 
 def test_strategy_loop_subscribes_to_all_resolutions():
     assert isinstance(RESOLUTIONS, list)
-    assert len(RESOLUTIONS) == 12
+    assert len(RESOLUTIONS) == 13

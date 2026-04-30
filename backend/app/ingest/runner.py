@@ -17,10 +17,11 @@ from app.db.models import Tick as TickRow
 
 log = logging.getLogger("taiex.ingest")
 
-RESOLUTIONS = ["1m", "2m", "5m", "10m", "15m", "30m", "1h", "4h", "12h", "1d", "1w", "1mo"]
+RESOLUTIONS = ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "1h", "4h", "12h", "1d", "1w", "1mo"]
 RESOLUTION_DELTAS = {
     "1m": timedelta(minutes=1),
     "2m": timedelta(minutes=2),
+    "3m": timedelta(minutes=3),
     "5m": timedelta(minutes=5),
     "10m": timedelta(minutes=10),
     "15m": timedelta(minutes=15),

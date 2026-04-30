@@ -38,6 +38,7 @@ class EmptyParams(BaseModel):
 
 class Strategy(ABC):
     name: ClassVar[str]
+    display_name: ClassVar[str | None] = None
     resolutions: ClassVar[list[str]] = ["1m"]
     params_schema: ClassVar[type[BaseModel]] = EmptyParams
     indicator_specs: ClassVar[dict[str, dict]] = {}

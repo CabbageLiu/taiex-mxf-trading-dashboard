@@ -16,11 +16,12 @@ Idempotency: each incoming message carries the signal row id; we keep a
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from app.db.engine import session_scope
 from app.db.models import Trade
@@ -36,6 +37,15 @@ def _parse_ts(raw: Any) -> datetime:
     if isinstance(raw, datetime):
         return raw
     return datetime.fromisoformat(str(raw))
+
+
+def _json_dumps(obj: Any) -> str:
+    """JSON-serialize for the JSONB merge UPDATE.
+
+    Uses ``default=str`` so any datetime / Decimal that sneaks into a
+    snapshot indicator dict can't blow up the close path.
+    """
+    return json.dumps(obj, default=str, ensure_ascii=False)
 
 
 def _pnl_points(side: str, entry_price: float, exit_price: float, qty: float) -> float:
@@ -119,10 +129,13 @@ class PositionTracker:
 
         ts = _parse_ts(signal.get("ts"))
         open_id = self._open.get(key)
+        sig_payload = signal.get("payload") or {}
+        entry_ind = sig_payload.get("entry_ind") if isinstance(sig_payload, dict) else None
+        exit_ind = sig_payload.get("exit_ind") if isinstance(sig_payload, dict) else None
 
         if side in ("EXIT", "FLAT"):
             if open_id is not None and price is not None:
-                await self._close(open_id, ts, float(price), signal_id)
+                await self._close(open_id, ts, float(price), signal_id, exit_ind=exit_ind)
                 self._open.pop(key, None)
             return
 
@@ -139,6 +152,7 @@ class PositionTracker:
                 ts=ts,
                 price=float(price),
                 signal_id=signal_id,
+                entry_ind=entry_ind,
             )
             self._open[key] = new_id
             return
@@ -152,7 +166,7 @@ class PositionTracker:
         # Opposite side: close the existing trade then open a fresh one.
         if price is None:
             return
-        await self._close(open_id, ts, float(price), signal_id)
+        await self._close(open_id, ts, float(price), signal_id, exit_ind=exit_ind)
         new_id = await self._open_trade(
             strategy=strategy,
             symbol=symbol,
@@ -160,6 +174,7 @@ class PositionTracker:
             ts=ts,
             price=float(price),
             signal_id=signal_id,
+            entry_ind=entry_ind,
         )
         self._open[key] = new_id
 
@@ -210,7 +225,9 @@ class PositionTracker:
         price: float,
         signal_id: int | None,
         qty: float = 1.0,
+        entry_ind: dict | None = None,
     ) -> int:
+        payload: dict = {"entry_ind": entry_ind} if entry_ind else {}
         async with session_scope() as s:
             row = Trade(
                 strategy=strategy,
@@ -220,7 +237,7 @@ class PositionTracker:
                 entry_price=price,
                 entry_signal_id=signal_id,
                 qty=qty,
-                payload={},
+                payload=payload,
             )
             s.add(row)
             await s.commit()
@@ -233,6 +250,7 @@ class PositionTracker:
         ts: datetime,
         price: float,
         signal_id: int | None,
+        exit_ind: dict | None = None,
     ) -> None:
         async with session_scope() as s:
             row = (
@@ -251,6 +269,21 @@ class PositionTracker:
                     pnl_points=pnl,
                 )
             )
+            if exit_ind is not None:
+                # Merge {"exit_ind": ...} into the existing JSONB payload so
+                # the entry_ind block written at open time survives.
+                await s.execute(
+                    text(
+                        "UPDATE trades "
+                        "SET payload = COALESCE(payload, '{}'::jsonb) "
+                        "    || jsonb_build_object('exit_ind', CAST(:exit_ind AS jsonb)) "
+                        "WHERE id = :trade_id"
+                    ),
+                    {
+                        "trade_id": trade_id,
+                        "exit_ind": _json_dumps(exit_ind),
+                    },
+                )
             await s.commit()
 
     async def _side_of(self, trade_id: int) -> str | None:

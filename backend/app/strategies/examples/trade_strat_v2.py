@@ -1,32 +1,43 @@
-"""TAIEX Multi-Timeframe Strategy v2.
+"""TAIEX Multi-Timeframe Strategy v2 (5-minute strategy).
 
-Entry layer  : 10m K (KD>20, MACD>0, +DI>21).
-Exit assist  : 2m -DI>23 (short-term momentum flip).
+Entry layer  : 5m K (KD>20, MACD rising-edge above 0, +DI>21 AND +DI > -DI).
+Exit assist  : 3m -DI >= 23 (short-term momentum flip, note >= per spec).
+TP / SL eval : 1m bar close — pure price-based check against the open
+               position. NO entry logic on the 1m series.
 Trend layer  : Daily — display-only "Daily Confidence" badge (0/3..3/3),
                does not block entry.
 
 Discipline:
   * No pyramiding (1 contract).
-  * Cooldown 5 x 10m bars after exit before re-entry.
+  * Cooldown 5 x 5m bars after exit before re-entry (cooldown_bars).
   * Freshness — only enter on rising edge (conditions just turned true).
   * Fill at signal bar close (framework cannot delay to next-bar open;
     documented deviation from spec).
 
-Exits:
-  * +220 pt take-profit
-  * -60 pt stop-loss
-  * 2m -DI > 23 (short-term momentum flip)
+Exits (any one):
+  * +70 pt take-profit  (1m close vs entry_price)
+  * -50 pt stop-loss    (1m close vs entry_price)
+  * 3m -DI >= 23 (short-term momentum flip)
 
-R:R = 220 : 60 = 3.67:1 (unchanged from v1).
+R:R = 70 : 50 = 1.4:1 (tighter than v1).
 
 Strategy instance is rebuilt per bar_close, so position / cooldown state
 lives in the module-level _STATE dict keyed by (strategy_name, symbol).
+
+Indicator availability per resolution:
+  * 5m: KD / MACD / DMI precomputed (entry layer + exit_ind snapshot
+    fallback for 1m TP/SL exits).
+  * 3m: DMI precomputed (exit assist).
+  * 1m: no indicator_specs declared — TP/SL is pure price math, and the
+    `_check_tp_sl_minute` exit_ind snapshot falls back to the most
+    recent 5m indicator snapshot cached in module state at entry time.
+  * 1d: KD / MACD / DMI precomputed (daily confidence).
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import ClassVar
 
@@ -53,8 +64,8 @@ class TradeStratV2Params(BaseModel):
     di_short_threshold: float = 21.0
     exit_di_threshold: float = 23.0
 
-    tp_points: float = 220.0
-    sl_points: float = 60.0
+    tp_points: float = 70.0
+    sl_points: float = 50.0
 
     cooldown_bars: int = Field(default=5, ge=0)
 
@@ -64,6 +75,10 @@ class _PositionState:
     side: str  # "LONG" | "SHORT"
     entry_price: float
     entry_ts: datetime
+    # Snapshot of the 5m indicator values at entry — reused as the
+    # `exit_ind` payload when the 1m TP/SL path fires (1m has no
+    # precomputed indicators).
+    entry_ind: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,10 +117,60 @@ def _scalar(series: pd.Series, idx: int = -1) -> float | None:
     return f if not math.isnan(f) else None
 
 
+def _macd_rising_edge(macd_series: pd.Series) -> bool:
+    """Return True iff MACD just turned positive on the latest bar.
+
+    Spec: `macd[-3] <= 0 and macd[-2] > 0 and macd[-1] > macd[-2]`.
+    Pure helper — copied (not imported) so each strategy module is
+    self-contained.
+    """
+    if macd_series is None or len(macd_series) < 3:
+        return False
+    m_3 = _scalar(macd_series, idx=-3)
+    m_2 = _scalar(macd_series, idx=-2)
+    m_1 = _scalar(macd_series, idx=-1)
+    if None in (m_3, m_2, m_1):
+        return False
+    return m_3 <= 0 and m_2 > 0 and m_1 > m_2
+
+
+def _snapshot_ind(
+    kd: pd.DataFrame | None,
+    macd: pd.DataFrame | None,
+    dmi: pd.DataFrame | None,
+) -> dict[str, float]:
+    """Pluck the latest scalar values from KD / MACD / DMI frames.
+
+    Returns a dict with k, d, macd, signal, hist, plus_di, minus_di,
+    adx — each rounded to 2dp. Missing indicators silently skipped.
+    """
+    snap: dict[str, float] = {}
+    if kd is not None:
+        for col in ("k", "d"):
+            if col in kd.columns:
+                v = _scalar(kd[col])
+                if v is not None:
+                    snap[col] = round(v, 2)
+    if macd is not None:
+        for col in ("macd", "signal", "hist"):
+            if col in macd.columns:
+                v = _scalar(macd[col])
+                if v is not None:
+                    snap[col] = round(v, 2)
+    if dmi is not None:
+        for col in ("plus_di", "minus_di", "adx"):
+            if col in dmi.columns:
+                v = _scalar(dmi[col])
+                if v is not None:
+                    snap[col] = round(v, 2)
+    return snap
+
+
 @register_strategy
 class TradeStratV2(Strategy):
     name: ClassVar[str] = "trade_strat_v2"
-    resolutions: ClassVar[list[str]] = ["2m", "10m", "1d"]
+    display_name: ClassVar[str] = "5分鐘策略"
+    resolutions: ClassVar[list[str]] = ["1m", "3m", "5m", "1d"]
     params_schema: ClassVar[type[BaseModel]] = TradeStratV2Params
     indicator_specs: ClassVar[dict[str, dict]] = {
         "kd": {"kind": "kd", "params": {"period": 9, "k_smooth": 3, "d_smooth": 3}},
@@ -144,10 +209,12 @@ class TradeStratV2(Strategy):
         if ev.resolution == "1d":
             self._update_daily_confidence(ev, st, params)
             return None
-        if ev.resolution == "2m":
+        if ev.resolution == "1m":
+            return self._check_tp_sl_minute(ev, st, params)
+        if ev.resolution == "3m":
             return self._exit_assist(ev, st, params)
-        if ev.resolution == "10m":
-            return self._on_10m(ev, st, params)
+        if ev.resolution == "5m":
+            return self._on_entry(ev, st, params)
         return None
 
     # ─── Daily confidence (display only) ─────────────────────────────────
@@ -172,23 +239,23 @@ class TradeStratV2(Strategy):
             (
                 k > p.kd_long_floor and d > p.kd_long_floor,
                 macd_val > 0,
-                plus_di > p.di_long_threshold,
+                plus_di > p.di_long_threshold and plus_di > minus_di,
             )
         )
         short_score = sum(
             (
                 k < p.kd_short_ceiling and d < p.kd_short_ceiling,
                 macd_val < 0,
-                minus_di > p.di_short_threshold,
+                minus_di > p.di_short_threshold and minus_di > plus_di,
             )
         )
         st.daily_confidence_long = long_score
         st.daily_confidence_short = short_score
         st.daily_last_bucket = ev.bucket
 
-    # ─── 10m entry / SL / TP ─────────────────────────────────────────────
+    # ─── 5m entry (rising-edge gated) ────────────────────────────────────
 
-    def _on_10m(
+    def _on_entry(
         self, ev: BarEvent, st: _StratState, p: TradeStratV2Params
     ) -> Signal | None:
         if st.cooldown_left > 0:
@@ -209,11 +276,15 @@ class TradeStratV2(Strategy):
         if None in (k_curr, d_curr, macd_curr, plus_curr, minus_curr, close_curr):
             return None
 
+        macd_rising = _macd_rising_edge(macd["macd"])
+
         long_now = (
             k_curr > p.kd_long_floor
             and d_curr > p.kd_long_floor
             and macd_curr > 0
+            and macd_rising
             and plus_curr > p.di_long_threshold
+            and plus_curr > minus_curr
         )
         short_now = (
             p.enable_short
@@ -221,11 +292,12 @@ class TradeStratV2(Strategy):
             and d_curr < p.kd_short_ceiling
             and macd_curr < 0
             and minus_curr > p.di_short_threshold
+            and minus_curr > plus_curr
         )
 
         # Evaluate exit on existing position before any new entry.
         if st.position is not None:
-            sig = self._check_tp_sl(ev, st, p, close_curr)
+            sig = self._check_tp_sl(ev, st, p, close_curr, kd, macd, dmi)
             if sig is not None:
                 st.last_long_ready = long_now
                 st.last_short_ready = short_now
@@ -243,12 +315,12 @@ class TradeStratV2(Strategy):
         if long_rising:
             return self._open_position(
                 ev, st, side="LONG", price=close_curr, p=p,
-                k=k_curr, d=d_curr, macd_v=macd_curr, di=plus_curr,
+                kd=kd, macd=macd, dmi=dmi,
             )
         if short_rising:
             return self._open_position(
                 ev, st, side="SHORT", price=close_curr, p=p,
-                k=k_curr, d=d_curr, macd_v=macd_curr, di=minus_curr,
+                kd=kd, macd=macd, dmi=dmi,
             )
         return None
 
@@ -258,6 +330,9 @@ class TradeStratV2(Strategy):
         st: _StratState,
         p: TradeStratV2Params,
         close: float,
+        kd: pd.DataFrame | None,
+        macd: pd.DataFrame | None,
+        dmi: pd.DataFrame | None,
     ) -> Signal | None:
         pos = st.position
         if pos is None:
@@ -267,12 +342,54 @@ class TradeStratV2(Strategy):
         else:
             pnl = pos.entry_price - close
         if pnl >= p.tp_points:
-            return self._close_position(ev, st, close, "TP", pnl)
+            return self._close_position(
+                ev, st, close, "TP", pnl, exit_ind=_snapshot_ind(kd, macd, dmi)
+            )
         if pnl <= -p.sl_points:
-            return self._close_position(ev, st, close, "SL", pnl)
+            return self._close_position(
+                ev, st, close, "SL", pnl, exit_ind=_snapshot_ind(kd, macd, dmi)
+            )
         return None
 
-    # ─── 2m exit assist (short-term -DI flip) ────────────────────────────
+    # ─── 1m TP / SL eval (pure price; no entry logic) ────────────────────
+
+    def _check_tp_sl_minute(
+        self, ev: BarEvent, st: _StratState, p: TradeStratV2Params
+    ) -> Signal | None:
+        pos = st.position
+        if pos is None:
+            return None
+        close = _scalar(ev.bars["close"])
+        if close is None:
+            return None
+
+        if pos.side == "LONG":
+            pnl = close - pos.entry_price
+        else:
+            pnl = pos.entry_price - close
+
+        # 1m has no indicator_specs by design — TP/SL is pure price.
+        # Use whatever indicators the framework happened to attach; if
+        # absent, fall back to the entry-time 5m snapshot stored on the
+        # position.
+        kd = ev.indicators.get("kd")
+        macd = ev.indicators.get("macd")
+        dmi = ev.indicators.get("dmi")
+        snapshot = _snapshot_ind(kd, macd, dmi)
+        if not snapshot:
+            snapshot = dict(pos.entry_ind)
+
+        if pnl >= p.tp_points:
+            return self._close_position(
+                ev, st, close, "TP", pnl, exit_ind=snapshot
+            )
+        if pnl <= -p.sl_points:
+            return self._close_position(
+                ev, st, close, "SL", pnl, exit_ind=snapshot
+            )
+        return None
+
+    # ─── 3m exit assist (-DI >= exit_di_threshold) ───────────────────────
 
     def _exit_assist(
         self, ev: BarEvent, st: _StratState, p: TradeStratV2Params
@@ -290,14 +407,20 @@ class TradeStratV2(Strategy):
 
         # LONG → exit when -DI flips strong (downside momentum).
         # SHORT → exit when +DI flips strong (upside momentum).
+        # NOTE: v2 spec uses `>=` (v1 uses `>`).
         flip_ind = minus if st.position.side == "LONG" else plus
-        if flip_ind > p.exit_di_threshold:
+        if flip_ind >= p.exit_di_threshold:
             pnl = (
                 close - st.position.entry_price
                 if st.position.side == "LONG"
                 else st.position.entry_price - close
             )
-            return self._close_position(ev, st, close, "DI_FLIP", pnl)
+            kd = ev.indicators.get("kd")
+            macd = ev.indicators.get("macd")
+            return self._close_position(
+                ev, st, close, "DI_FLIP", pnl,
+                exit_ind=_snapshot_ind(kd, macd, dmi),
+            )
         return None
 
     # ─── helpers ─────────────────────────────────────────────────────────
@@ -310,12 +433,21 @@ class TradeStratV2(Strategy):
         side: str,
         price: float,
         p: TradeStratV2Params,
-        k: float,
-        d: float,
-        macd_v: float,
-        di: float,
+        kd: pd.DataFrame,
+        macd: pd.DataFrame,
+        dmi: pd.DataFrame,
     ) -> Signal:
-        st.position = _PositionState(side=side, entry_price=price, entry_ts=ev.bucket)
+        snap = _snapshot_ind(kd, macd, dmi)
+        st.position = _PositionState(
+            side=side, entry_price=price, entry_ts=ev.bucket, entry_ind=dict(snap)
+        )
+        # Legacy `entry` payload key (back-compat for fixtures / V1 UI).
+        legacy_entry = {
+            "k": snap.get("k"),
+            "d": snap.get("d"),
+            "macd": snap.get("macd"),
+            "di": snap.get("plus_di") if side == "LONG" else snap.get("minus_di"),
+        }
         return Signal(
             ts=ev.bucket,
             symbol=ev.symbol,
@@ -324,15 +456,14 @@ class TradeStratV2(Strategy):
             side=side,
             price=price,
             reason=(
-                f"entry {side}: K={k:.1f} D={d:.1f} MACD={macd_v:.2f} DI={di:.1f}"
+                f"entry {side}: K={snap.get('k', float('nan')):.1f} "
+                f"D={snap.get('d', float('nan')):.1f} "
+                f"MACD={snap.get('macd', float('nan')):.2f} "
+                f"DI={legacy_entry['di'] if legacy_entry['di'] is not None else float('nan'):.1f}"
             ),
             payload={
-                "entry": {
-                    "k": round(k, 2),
-                    "d": round(d, 2),
-                    "macd": round(macd_v, 2),
-                    "di": round(di, 2),
-                },
+                "entry": legacy_entry,
+                "entry_ind": snap,
                 "tp_points": p.tp_points,
                 "sl_points": p.sl_points,
                 "daily_confidence_long": st.daily_confidence_long,
@@ -348,6 +479,8 @@ class TradeStratV2(Strategy):
         price: float,
         reason: str,
         pnl: float,
+        *,
+        exit_ind: dict[str, float] | None = None,
     ) -> Signal:
         pos = st.position
         st.position = None
@@ -367,6 +500,7 @@ class TradeStratV2(Strategy):
                 "pnl_points": round(pnl, 2),
                 "entry_price": pos.entry_price if pos else None,
                 "entry_side": pos.side if pos else None,
+                "exit_ind": exit_ind or {},
                 "fill_hint": "bar_close",
             },
         )

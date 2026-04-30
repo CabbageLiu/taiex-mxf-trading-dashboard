@@ -1,9 +1,27 @@
-"""TAIEX Multi-Timeframe Strategy v1.
+"""TAIEX Multi-Timeframe Strategy v1 (30分鐘線策略).
 
-Entry layer  : 30m K (KD>20, MACD>0, +DI>21).
-Exit assist  : 3m -DI>23 — substituted with 5m here (3m not in RESOLUTIONS).
+Entry layer  : 30m (KD>20, MACD rising-edge positive, +DI>21 AND +DI>-DI).
+Exit assist  : 3m -DI > 23 (short-term momentum flip).
 Trend layer  : Daily — display-only "Daily Confidence" badge (0/3..3/3),
                does not block entry.
+
+MACD rising-edge gate
+---------------------
+Per spec: "MACD above 0 (initial 3 figures of MACD trend becoming positive)".
+Interpreted as a 3-bar pattern on the entry timeframe (30m):
+    macd[-3] <= 0 AND macd[-2] > 0 AND macd[-1] > macd[-2]
+i.e. was non-positive 3 bars ago, became positive on the middle bar, and
+kept rising on the latest bar. NaN values are treated as 0 / non-positive.
+
+Daily confidence rule (display only)
+------------------------------------
+Each of the 4 conditions, evaluated on the 1d bar, contributes 1 point per
+side:
+    1. KD > 20 (long) / KD < 80 (short)
+    2. MACD > 0 (long) / MACD < 0 (short)
+    3. +DI > 21 AND +DI > -DI  (long) / -DI > 21 AND -DI > +DI  (short)
+The +DI condition mirrors the live entry gate so the badge stays
+consistent with what 30m would actually fire on.
 
 Discipline:
   * No pyramiding (1 contract).
@@ -15,12 +33,16 @@ Discipline:
 Exits:
   * +220 pt take-profit
   * -60 pt stop-loss
-  * 5m -DI > 23 (short-term momentum flip)
+  * 3m -DI > 23 (short-term momentum flip)
 
 R:R = 220 : 60 = 3.67:1.
 
 Strategy instance is rebuilt per bar_close, so position / cooldown state
 lives in the module-level _STATE dict keyed by (strategy_name, symbol).
+
+Indicator snapshots are persisted into Signal.payload at entry
+(`entry_ind`) and exit (`exit_ind`) — full {k, d, macd, signal, hist,
+plus_di, minus_di, adx} dict, rounded to 2 decimals, NaN → None.
 """
 
 from __future__ import annotations
@@ -102,10 +124,80 @@ def _scalar(series: pd.Series, idx: int = -1) -> float | None:
     return f if not math.isnan(f) else None
 
 
+def _macd_just_turned_positive(macd_series: pd.Series) -> bool:
+    """Rising-edge gate: macd was non-positive 3 bars ago, turned positive
+    2 bars ago, and kept rising on the latest bar.
+
+    NaN-safe: NaN values are treated as 0 (non-positive); a NaN at index -2
+    or -1 cannot satisfy the "> 0" / strictly-rising checks.
+    """
+    if macd_series is None or len(macd_series) < 3:
+        return False
+
+    def _safe(idx: int) -> float | None:
+        try:
+            v = float(macd_series.iloc[idx])
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(v):
+            return 0.0  # treat NaN as non-positive
+        return v
+
+    m3 = _safe(-3)
+    m2 = _safe(-2)
+    m1 = _safe(-1)
+    if m3 is None or m2 is None or m1 is None:
+        return False
+    return m3 <= 0 and m2 > 0 and m1 > m2
+
+
+def _ind_snapshot(
+    indicators: dict[str, pd.DataFrame], idx: int
+) -> dict[str, float | None]:
+    """Snapshot KD/MACD/DMI values at integer position ``idx``. NaN → None.
+
+    Keys: k, d, macd, signal, hist, plus_di, minus_di, adx.
+    Numeric values are rounded to 2 decimals.
+    """
+    keys = ("k", "d", "macd", "signal", "hist", "plus_di", "minus_di", "adx")
+    snap: dict[str, float | None] = dict.fromkeys(keys)
+
+    def _read(df: pd.DataFrame | None, col: str) -> float | None:
+        if df is None or col not in df.columns:
+            return None
+        try:
+            val = df[col].iloc[idx]
+        except (IndexError, KeyError):
+            return None
+        if val is None:
+            return None
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(f):
+            return None
+        return round(f, 2)
+
+    kd = indicators.get("kd")
+    macd = indicators.get("macd")
+    dmi = indicators.get("dmi")
+    snap["k"] = _read(kd, "k")
+    snap["d"] = _read(kd, "d")
+    snap["macd"] = _read(macd, "macd")
+    snap["signal"] = _read(macd, "signal")
+    snap["hist"] = _read(macd, "hist")
+    snap["plus_di"] = _read(dmi, "plus_di")
+    snap["minus_di"] = _read(dmi, "minus_di")
+    snap["adx"] = _read(dmi, "adx")
+    return snap
+
+
 @register_strategy
 class TradeStratV1(Strategy):
     name: ClassVar[str] = "trade_strat_v1"
-    resolutions: ClassVar[list[str]] = ["5m", "30m", "1d"]
+    display_name: ClassVar[str] = "30分鐘線策略"
+    resolutions: ClassVar[list[str]] = ["3m", "30m", "1d"]
     params_schema: ClassVar[type[BaseModel]] = TradeStratV1Params
     indicator_specs: ClassVar[dict[str, dict]] = {
         "kd": {"kind": "kd", "params": {"period": 9, "k_smooth": 3, "d_smooth": 3}},
@@ -144,7 +236,7 @@ class TradeStratV1(Strategy):
         if ev.resolution == "1d":
             self._update_daily_confidence(ev, st, params)
             return None
-        if ev.resolution == "5m":
+        if ev.resolution == "3m":
             return self._exit_assist(ev, st, params)
         if ev.resolution == "30m":
             return self._on_30m(ev, st, params)
@@ -172,14 +264,14 @@ class TradeStratV1(Strategy):
             (
                 k > p.kd_long_floor and d > p.kd_long_floor,
                 macd_val > 0,
-                plus_di > p.di_long_threshold,
+                plus_di > p.di_long_threshold and plus_di > minus_di,
             )
         )
         short_score = sum(
             (
                 k < p.kd_short_ceiling and d < p.kd_short_ceiling,
                 macd_val < 0,
-                minus_di > p.di_short_threshold,
+                minus_di > p.di_short_threshold and minus_di > plus_di,
             )
         )
         st.daily_confidence_long = long_score
@@ -209,18 +301,23 @@ class TradeStratV1(Strategy):
         if None in (k_curr, d_curr, macd_curr, plus_curr, minus_curr, close_curr):
             return None
 
+        macd_rising = _macd_just_turned_positive(macd["macd"])
+        macd_falling = _macd_just_turned_positive(-macd["macd"])  # mirror for SHORT
+
         long_now = (
             k_curr > p.kd_long_floor
             and d_curr > p.kd_long_floor
-            and macd_curr > 0
+            and macd_rising
             and plus_curr > p.di_long_threshold
+            and plus_curr > minus_curr
         )
         short_now = (
             p.enable_short
             and k_curr < p.kd_short_ceiling
             and d_curr < p.kd_short_ceiling
-            and macd_curr < 0
+            and macd_falling
             and minus_curr > p.di_short_threshold
+            and minus_curr > plus_curr
         )
 
         # Evaluate exit on existing position before any new entry.
@@ -272,7 +369,7 @@ class TradeStratV1(Strategy):
             return self._close_position(ev, st, close, "SL", pnl)
         return None
 
-    # ─── 5m exit assist (substituting for 3m -DI flip) ───────────────────
+    # ─── 3m exit assist (-DI flip) ───────────────────────────────────────
 
     def _exit_assist(
         self, ev: BarEvent, st: _StratState, p: TradeStratV1Params
@@ -316,6 +413,7 @@ class TradeStratV1(Strategy):
         di: float,
     ) -> Signal:
         st.position = _PositionState(side=side, entry_price=price, entry_ts=ev.bucket)
+        entry_ind = _ind_snapshot(ev.indicators, -1)
         return Signal(
             ts=ev.bucket,
             symbol=ev.symbol,
@@ -327,12 +425,14 @@ class TradeStratV1(Strategy):
                 f"entry {side}: K={k:.1f} D={d:.1f} MACD={macd_v:.2f} DI={di:.1f}"
             ),
             payload={
+                # Legacy back-compat: tests / fixtures still read `entry`.
                 "entry": {
                     "k": round(k, 2),
                     "d": round(d, 2),
                     "macd": round(macd_v, 2),
                     "di": round(di, 2),
                 },
+                "entry_ind": entry_ind,
                 "tp_points": p.tp_points,
                 "sl_points": p.sl_points,
                 "daily_confidence_long": st.daily_confidence_long,
@@ -354,6 +454,7 @@ class TradeStratV1(Strategy):
         st.cooldown_left = self.params.cooldown_bars  # type: ignore[attr-defined]
         st.last_long_ready = False
         st.last_short_ready = False
+        exit_ind = _ind_snapshot(ev.indicators, -1)
         return Signal(
             ts=ev.bucket,
             symbol=ev.symbol,
@@ -367,6 +468,7 @@ class TradeStratV1(Strategy):
                 "pnl_points": round(pnl, 2),
                 "entry_price": pos.entry_price if pos else None,
                 "entry_side": pos.side if pos else None,
+                "exit_ind": exit_ind,
                 "fill_hint": "bar_close",
             },
         )
