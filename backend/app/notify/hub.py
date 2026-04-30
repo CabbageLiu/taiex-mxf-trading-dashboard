@@ -59,6 +59,8 @@ class NotifierHub:
         try:
             if isinstance(notifier, InAppNotifier):
                 return await notifier.send(signal, signal_id=signal_id)
+            if isinstance(notifier, DiscordNotifier):
+                return await notifier.send(signal, signal_id=signal_id)
             return await notifier.send(signal)
         except Exception as e:
             log.exception("notifier %s raised", notifier.name)
