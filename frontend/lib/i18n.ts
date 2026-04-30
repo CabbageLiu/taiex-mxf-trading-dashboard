@@ -92,6 +92,10 @@ export const dict = {
   "trades.col.exit": "出場",
   "trades.col.hold": "持倉時長",
   "trades.col.pnl": "損益",
+  "trades.col.id": "編號",
+  "trades.col.strategy": "策略",
+  "trades.col.entry_ind": "開倉指標",
+  "trades.col.exit_ind": "出場指標",
   "trades.empty": "此區間無交易紀錄",
   "trades.loading": "讀取中…",
 

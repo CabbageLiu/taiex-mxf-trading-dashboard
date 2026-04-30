@@ -47,6 +47,30 @@ export type StatusResponse = {
 // V2 — trades
 export type TradeSide = "LONG" | "SHORT";
 
+// V5 Phase A — backend writes indicator snapshots into Trade.payload at the
+// moment of entry / exit. Each field is `number | null` because indicators
+// can legitimately be unavailable (warm-up window, cross-resolution gaps).
+export type TradeIndicators = {
+  k: number | null;
+  d: number | null;
+  macd: number | null;
+  signal: number | null;
+  hist: number | null;
+  plus_di: number | null;
+  minus_di: number | null;
+  adx: number | null;
+};
+
+// V5 Phase A — Trade.payload shape. Documents the known keys without locking
+// down the rest (strategies are free to stash extra context like
+// `entry_reason`, `exit_reason`, etc., which downstream consumers read via
+// the index signature).
+export type TradePayload = {
+  entry_ind?: TradeIndicators | null;
+  exit_ind?: TradeIndicators | null;
+  [key: string]: unknown;
+};
+
 export type Trade = {
   id: number;
   strategy: string;
@@ -61,7 +85,7 @@ export type Trade = {
   qty: number;
   pnl_points: number | null;
   hold_seconds: number | null;
-  payload: Record<string, unknown>;
+  payload: TradePayload;
 };
 
 export type TradesQuery = {

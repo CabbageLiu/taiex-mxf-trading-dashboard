@@ -104,8 +104,13 @@ export function StrategySelector() {
     }
   };
 
-  // Display value: active strategy name, or current query while typing
-  const displayValue = open ? query : (activeName ?? "");
+  // Display value: active strategy's display name (fallback to canonical
+  // name) when closed, or the current query string while the user is typing.
+  // Search/filter logic still keys on `s.name` above so power users typing
+  // the canonical key keep getting matches.
+  const activeStrategy = activeName ? (data ?? []).find((s) => s.name === activeName) ?? null : null;
+  const activeLabel = activeStrategy ? (activeStrategy.display_name ?? activeStrategy.name) : (activeName ?? "");
+  const displayValue = open ? query : activeLabel;
 
   const editingStrategy = editing ? (data ?? []).find((s) => s.name === editing) ?? null : null;
 
@@ -117,6 +122,7 @@ export function StrategySelector() {
         className="combo-input"
         placeholder={t("panel_strategies")}
         value={displayValue}
+        title={activeStrategy?.name ?? activeName ?? undefined}
         onFocus={() => setOpen(true)}
         onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
         onKeyDown={onKeyDown}
@@ -137,11 +143,12 @@ export function StrategySelector() {
               className={`combo-row${activeName === s.name ? " is-active" : ""}`}
               role="option"
               aria-selected={highlight === idx}
+              title={s.name}
               onMouseEnter={() => setHighlight(idx)}
               onClick={() => { setActive(s.name); setOpen(false); setQuery(""); }}
             >
               <div>
-                <div>{s.name}</div>
+                <div>{s.display_name ?? s.name}</div>
                 <div className="meta">{s.resolutions.join(", ")}</div>
               </div>
               <div className="controls" onClick={(e) => e.stopPropagation()}>

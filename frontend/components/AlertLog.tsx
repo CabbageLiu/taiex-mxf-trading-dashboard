@@ -9,6 +9,7 @@ import {
   useAlertStats,
   useSignals,
   useStatus,
+  useStrategies,
   useTestWebhook,
 } from "@/lib/queries";
 import { t, tSide } from "@/lib/i18n";
@@ -87,6 +88,18 @@ export function AlertLog({ liveSignals }: { liveSignals: SignalRow[] }) {
   // precedence (they carry the most recent state), then we backfill from
   // the seed query up to a 50-row cap.
   const seedQ = useSignals({ limit: 50 });
+
+  // V5 Phase C — map canonical strategy `name` → `display_name` for label
+  // rendering on signal rows. The `useStrategies` cache is shared with the
+  // selector / marker pills, so this is a free read in practice.
+  const strategiesQ = useStrategies();
+  const displayNameOf = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const s of strategiesQ.data ?? []) {
+      if (s.display_name) map.set(s.name, s.display_name);
+    }
+    return (name: string) => map.get(name) ?? name;
+  }, [strategiesQ.data]);
 
   const merged = useMemo<SignalRow[]>(() => {
     const out: SignalRow[] = [];
@@ -171,7 +184,7 @@ export function AlertLog({ liveSignals }: { liveSignals: SignalRow[] }) {
               <span className={`tag ${s.side.toLowerCase()}`}>
                 {tSide(s.side)}
               </span>{" "}
-              <strong>{s.strategy}</strong>{" "}
+              <strong title={s.strategy}>{displayNameOf(s.strategy)}</strong>{" "}
               <span style={{ color: "var(--muted)" }}>{s.resolution}</span>
             </div>
             <div style={{ fontVariantNumeric: "tabular-nums" }}>

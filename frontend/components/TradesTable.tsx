@@ -2,8 +2,9 @@
 
 import { useMemo } from "react";
 
-import type { Trade } from "@/lib/api";
+import type { Trade, TradeIndicators, TradePayload } from "@/lib/api";
 import { t } from "@/lib/i18n";
+import { useStrategies } from "@/lib/queries";
 
 type Props = {
   trades: Trade[] | undefined;
@@ -62,8 +63,48 @@ function fmtPnl(pnl: number | null): {
   };
 }
 
+// V5 Phase C2 — compact indicator snapshot renderer.
+// Format: `K54 D51 / MACD+9 / +DI33 -DI19`. Indicator names stay English
+// per CLAUDE.md. Returns "—" when the snapshot is missing entirely OR when
+// every numeric field is null; partial snapshots fall through and render
+// "—" per missing field within their section.
+export function formatIndicators(
+  snap: TradeIndicators | null | undefined,
+): string {
+  if (!snap) return "—";
+  const fields = [snap.k, snap.d, snap.macd, snap.plus_di, snap.minus_di];
+  if (fields.every((v) => v == null)) return "—";
+
+  const r = (v: number | null | undefined): string =>
+    v == null ? "—" : String(Math.round(v));
+  const signed = (v: number | null | undefined): string => {
+    if (v == null) return "—";
+    const n = Math.round(v);
+    return n >= 0 ? `+${n}` : `${n}`;
+  };
+
+  const kd = `K${r(snap.k)} D${r(snap.d)}`;
+  const macd = `MACD${signed(snap.macd)}`;
+  const dmi = `+DI${r(snap.plus_di)} -DI${r(snap.minus_di)}`;
+  return `${kd} / ${macd} / ${dmi}`;
+}
+
+// Inline self-checks (no test runner present). Cheap; no DB / network.
+// `K54 D51 / MACD+9 / +DI33 -DI19` for full snapshot.
+const _SELFCHECK_FULL: TradeIndicators = {
+  k: 54.2, d: 50.7, macd: 8.6, signal: 0, hist: 0, plus_di: 33.1, minus_di: 18.9, adx: 0,
+};
+if (formatIndicators(_SELFCHECK_FULL) !== "K54 D51 / MACD+9 / +DI33 -DI19") {
+  // eslint-disable-next-line no-console
+  console.warn("[formatIndicators] full-snap check failed:", formatIndicators(_SELFCHECK_FULL));
+}
+if (formatIndicators(null) !== "—") {
+  // eslint-disable-next-line no-console
+  console.warn("[formatIndicators] null check failed");
+}
+
 const SKELETON_ROWS = 8;
-const COLS = 6;
+const COLS = 10;
 
 export function TradesTable({ trades, isLoading }: Props) {
   const sorted = useMemo(() => {
@@ -74,6 +115,15 @@ export function TradesTable({ trades, isLoading }: Props) {
       return tb - ta;
     });
   }, [trades]);
+
+  const { data: strategies } = useStrategies();
+  const displayNameOf = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const s of strategies ?? []) {
+      map.set(s.name, s.display_name ?? s.name);
+    }
+    return (name: string): string => map.get(name) ?? name;
+  }, [strategies]);
 
   return (
     <table className="trades-table" aria-busy={isLoading} aria-live="polite">
@@ -91,10 +141,16 @@ export function TradesTable({ trades, isLoading }: Props) {
       </caption>
       <thead>
         <tr>
+          <th style={{ textAlign: "left" }} className="tnum">
+            {t("trades.col.id")}
+          </th>
           <th>{t("trades.col.date")}</th>
           <th>{t("trades.col.side")}</th>
+          <th>{t("trades.col.strategy")}</th>
           <th style={{ textAlign: "right" }}>{t("trades.col.entry")}</th>
+          <th>{t("trades.col.entry_ind")}</th>
           <th style={{ textAlign: "right" }}>{t("trades.col.exit")}</th>
+          <th>{t("trades.col.exit_ind")}</th>
           <th style={{ textAlign: "right" }}>{t("trades.col.hold")}</th>
           <th style={{ textAlign: "right" }}>
             {t("trades.col.pnl")} ({t("kpi.unit.points")})
@@ -128,9 +184,16 @@ export function TradesTable({ trades, isLoading }: Props) {
             const sideColor = isLong ? "var(--up)" : "var(--down)";
             const sideLabel = isLong ? t("side.long") : t("side.short");
             const pnl = fmtPnl(tr.pnl_points);
+            // Defensive cast — older trades pre-Phase-A have empty payload `{}`.
+            const payload = (tr.payload ?? {}) as TradePayload;
+            const entryInd = formatIndicators(payload.entry_ind);
+            const exitInd = formatIndicators(payload.exit_ind);
 
             return (
               <tr key={tr.id}>
+                <td className="tnum" style={{ textAlign: "left" }}>
+                  {tr.id}
+                </td>
                 <td className="tnum">{fmtDate(tr.entry_ts)}</td>
                 <td>
                   <span
@@ -144,8 +207,11 @@ export function TradesTable({ trades, isLoading }: Props) {
                     <span aria-hidden="true">{sideGlyph}</span> {sideLabel}
                   </span>
                 </td>
+                <td>{displayNameOf(tr.strategy)}</td>
                 <td className="num">{fmtPrice(tr.entry_price)}</td>
+                <td className="tnum">{entryInd}</td>
                 <td className="num">{fmtPrice(tr.exit_price)}</td>
+                <td className="tnum">{exitInd}</td>
                 <td className="num">{fmtHold(tr.entry_ts, tr.exit_ts)}</td>
                 <td
                   className={`num${pnl.tone === "win" ? " win" : pnl.tone === "loss" ? " loss" : ""}`}
