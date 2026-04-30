@@ -2,7 +2,7 @@
 
 import { useMemo } from "react";
 
-import type { Trade, TradeStats } from "@/lib/api";
+import type { BacktestStats, BacktestTrade, Trade, TradeStats } from "@/lib/api";
 import { t } from "@/lib/i18n";
 import { useInsight } from "@/lib/queries";
 import { Skeleton } from "./Skeleton";
@@ -13,6 +13,17 @@ type Props = {
   stats: TradeStats | undefined;
   trades: Trade[] | undefined;
   isLoading?: boolean;
+  // Lens-on inline payload (single-strategy backtest) — when supplied, the
+  // generate button posts these rows inline instead of forcing the server to
+  // re-query the live `trades` table.
+  inlineTrades?: BacktestTrade[];
+  inlineStats?: BacktestStats;
+  // Comparison mode — when true, the button posts both compareA/compareB
+  // payloads. The backend slice 4B accepts the new shape; until landed,
+  // the wrapper response error surfaces in the panel as `t("insight.error")`.
+  compareMode?: boolean;
+  compareA?: { strategy: string | null; stats?: BacktestStats; trades?: BacktestTrade[] };
+  compareB?: { strategy: string | null; stats?: BacktestStats; trades?: BacktestTrade[] };
 };
 
 function fmtPoints(n: number | null | undefined, opts?: { signed?: boolean }): string | null {
@@ -131,7 +142,8 @@ function isMissingApiKeyError(err: Error | null): boolean {
   return /^503\b/.test(msg) || /ANTHROPIC_API_KEY/.test(msg);
 }
 
-export function TradeInsightPanel({ filter, stats, trades, isLoading = false }: Props) {
+export function TradeInsightPanel(props: Props) {
+  const { filter, stats, trades, isLoading = false } = props;
   const insight = useInsight();
 
   const patternLines = useMemo(
@@ -146,7 +158,9 @@ export function TradeInsightPanel({ filter, stats, trades, isLoading = false }: 
     return parseBullets(insight.data.content);
   }, [insight.data?.content]);
 
-  const canGenerate = filter.strategy != null;
+  const canGenerate = props.compareMode
+    ? !!(props.compareA?.strategy && props.compareB?.strategy)
+    : filter.strategy != null;
   const showLoading = insight.isPending;
   const showResult = !showLoading && insight.isSuccess && bullets.length > 0;
   const errorMsg = insight.isError
@@ -156,6 +170,34 @@ export function TradeInsightPanel({ filter, stats, trades, isLoading = false }: 
     : null;
 
   const handleGenerate = () => {
+    if (props.compareMode && props.compareA && props.compareB) {
+      insight.mutate({
+        strategy: `${props.compareA.strategy ?? "A"}__vs__${props.compareB.strategy ?? "B"}`,
+        compare: true,
+        compare_a: {
+          strategy: props.compareA.strategy ?? "A",
+          stats: props.compareA.stats,
+          trades: props.compareA.trades,
+        },
+        compare_b: {
+          strategy: props.compareB.strategy ?? "B",
+          stats: props.compareB.stats,
+          trades: props.compareB.trades,
+        },
+      });
+      return;
+    }
+    if (props.inlineTrades) {
+      insight.mutate({
+        strategy: filter.strategy as string,
+        start: filter.start ?? undefined,
+        end: filter.end ?? undefined,
+        filter: filter.result,
+        trades: props.inlineTrades,
+        stats: props.inlineStats,
+      });
+      return;
+    }
     if (!canGenerate) return;
     insight.mutate({
       strategy: filter.strategy as string,
@@ -283,7 +325,7 @@ export function TradeInsightPanel({ filter, stats, trades, isLoading = false }: 
                 className="empty"
                 style={{ marginTop: 8, fontSize: "var(--fs-caption)" }}
               >
-                先在頂部選擇策略
+                {props.compareMode ? "請於 URL 設定 s 與 s2" : "先在頂部選擇策略"}
               </div>
             )}
           </div>

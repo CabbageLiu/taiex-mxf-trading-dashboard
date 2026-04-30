@@ -28,6 +28,12 @@ from app.services.insights_cache import InsightsCache, make_cache_key
 router = APIRouter()
 
 
+class CompareSide(BaseModel):
+    strategy: str
+    trades: list[dict] | None = None
+    stats: dict | None = None
+
+
 class InsightRequest(BaseModel):
     strategy: str
     # Accept ISO date or datetime strings; parsed via shared `_parse_dt` so the
@@ -41,6 +47,13 @@ class InsightRequest(BaseModel):
     # the user sees. ``trades`` is capped at 200 rows for the prompt budget.
     trades: list[dict] | None = None
     stats: dict | None = None
+    # V4 phase 4 slice B — comparison mode. When ``compare=true``, both
+    # ``compare_a`` and ``compare_b`` must be present; the route bypasses the
+    # DB query path and the inline single-side path entirely and threads a
+    # compound JSON payload of both sides into the model.
+    compare: bool = False
+    compare_a: CompareSide | None = None
+    compare_b: CompareSide | None = None
 
 
 class InsightResponse(BaseModel):
@@ -116,6 +129,28 @@ def _check_rate_limit(strategy: str, ip: str) -> float | None:
     return None
 
 
+def _stats_from_trades(trades: list[dict]) -> dict:
+    """Build a ``compute_stats``-compatible result from inline trade dicts.
+
+    Mirrors the inline-mode ``SimpleNamespace`` adapter pattern so the math
+    stays consistent across DB / inline / compare paths without duplicating
+    logic.
+    """
+    ns_rows: list[Any] = []
+    for i, t in enumerate(trades):
+        entry_ts = _coerce_dt(t.get("entry_ts"))
+        exit_ts = _coerce_dt(t.get("exit_ts"))
+        ns_rows.append(
+            SimpleNamespace(
+                id=t.get("id", i),
+                entry_ts=entry_ts,
+                exit_ts=exit_ts,
+                pnl_points=t.get("pnl_points"),
+            )
+        )
+    return compute_stats(ns_rows)
+
+
 def _coerce_dt(v: Any) -> datetime | None:
     """Best-effort coerce a serialized datetime field to ``datetime``.
 
@@ -164,6 +199,74 @@ async def post_strategy_insight(body: InsightRequest, request: Request) -> Insig
     # `end` strings get the inclusive-day-boundary semantic.
     start_dt = _parse_dt(body.start, "start")
     end_dt = _parse_dt(body.end, "end", end_of_day=True)
+
+    # Comparison path (V4 phase 4 slice B). Two strategy result sets in,
+    # comparative narrative out. Bypasses the single-side inline + DB paths
+    # entirely so we never round-trip the compare payload through compute_stats
+    # at the route level beyond the per-side ``_stats_from_trades`` helper.
+    if body.compare:
+        if body.compare_a is None or body.compare_b is None:
+            raise HTTPException(400, "compare=true requires both compare_a and compare_b")
+        # Cap each side at 200 trades to match the inline single-side cap so
+        # the prompt budget stays bounded for either mode.
+        a_trades = (body.compare_a.trades or [])[:200]
+        b_trades = (body.compare_b.trades or [])[:200]
+        a_stats = body.compare_a.stats or _stats_from_trades(a_trades)
+        b_stats = body.compare_b.stats or _stats_from_trades(b_trades)
+
+        # Cache key fingerprints both sides separately (and with the strategy
+        # name interleaved) so a flipped pair gets a distinct slot — the AI
+        # narrative reads "A vs B" not "B vs A".
+        payload_fp = hashlib.sha256(
+            (
+                f"{body.compare_a.strategy}|"
+                + "|".join(
+                    f"{t.get('id', '')}:{(t.get('pnl_points') or 0):.4f}" for t in a_trades
+                )
+                + f"||{body.compare_b.strategy}|"
+                + "|".join(
+                    f"{t.get('id', '')}:{(t.get('pnl_points') or 0):.4f}" for t in b_trades
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        compare_key = make_cache_key(
+            strategy=f"compare:{body.compare_a.strategy}::{body.compare_b.strategy}",
+            start_iso=None,
+            end_iso=None,
+            filter_=body.filter,
+            trade_count=len(a_trades) + len(b_trades),
+            stats_signature=payload_fp,
+        )
+        cache = _get_cache()
+        hit = cache.get(compare_key)
+        if hit is not None:
+            content, generated_at = hit
+            return InsightResponse(cached=True, generated_at=generated_at, content=content)
+
+        content = await generate_strategy_insight(
+            strategy=f"compare:{body.compare_a.strategy}::{body.compare_b.strategy}",
+            start=None,
+            end=None,
+            filter=body.filter,
+            trade_rows=[],
+            stats={},
+            compare={
+                "compare_a": {
+                    "strategy": body.compare_a.strategy,
+                    "stats": a_stats,
+                    "trades": a_trades,
+                },
+                "compare_b": {
+                    "strategy": body.compare_b.strategy,
+                    "stats": b_stats,
+                    "trades": b_trades,
+                },
+            },
+        )
+        generated_at = cache.put(compare_key, content)
+        if generated_at.tzinfo is None:
+            generated_at = generated_at.replace(tzinfo=UTC)
+        return InsightResponse(cached=False, generated_at=generated_at, content=content)
 
     # Inline payload path (V4 lens) — skip the DB query and use the rows the
     # caller passed in directly. Cap at 200 to bound the prompt size.

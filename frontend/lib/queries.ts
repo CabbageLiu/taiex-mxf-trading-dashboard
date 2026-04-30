@@ -8,6 +8,7 @@ import {
   type BacktestRequest,
   type BacktestResponse,
   type InsightRequest,
+  type InsightRequestExtended,
   type InsightResponse,
   type SignalRow,
   type SignalsQuery,
@@ -127,7 +128,7 @@ export function useTestWebhook() {
  * never bill Anthropic on accidental refetch.
  */
 export function useInsight() {
-  return useMutation<InsightResponse, Error, InsightRequest>({
+  return useMutation<InsightResponse, Error, InsightRequest | InsightRequestExtended>({
     mutationFn: (body) => api.postInsight(body),
   });
 }

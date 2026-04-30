@@ -115,6 +115,11 @@ export const dict = {
   // V4 — chart hi/lo badge
   "hilo.high": "高",
   "hilo.low": "低",
+
+  // V4 — compare mode
+  "compare.title": "回測比較",
+  "compare.toggle": "比較模式",
+  "compare.lensSubtitle": "回測：",
 } as const;
 
 export type DictKey = keyof typeof dict;

@@ -115,6 +115,20 @@ export type InsightRequestExtended = InsightRequest & {
     pnl_points: number;
   }>;
   stats?: TradeStats;
+  // V4 phase 4A — comparison mode. Backend slice 4B will accept these fields
+  // and produce a comparative narrative; until then the wrapper transmits and
+  // an unrecognized payload returns a non-200 (handled by the panel).
+  compare?: boolean;
+  compare_a?: {
+    strategy: string | null;
+    stats?: BacktestStats;
+    trades?: BacktestTrade[];
+  };
+  compare_b?: {
+    strategy: string | null;
+    stats?: BacktestStats;
+    trades?: BacktestTrade[];
+  };
 };
 
 // V4 — signals (raw signal stream, distinct from `alerts` which is per-channel
