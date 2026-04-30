@@ -18,10 +18,22 @@ export type CrosshairIndicators = {
   dmi?: { plus: number; minus: number; adx: number };
 };
 
+export type CrosshairTradeEvent = {
+  tradeId: number;
+  price: number;
+  kind: "OPEN" | "CLOSE";
+  side: string;
+  strategy: string;
+  reason: string;
+  pnl?: number;
+  source: "LIVE" | "BACKTEST";
+};
+
 export type CrosshairData = {
   ohlc: CrosshairOhlc | null;
   indicators: CrosshairIndicators;
   cursorPrice?: number | null;
+  tradeEvents?: CrosshairTradeEvent[];
 };
 
 type Props = {
@@ -57,9 +69,21 @@ function fmtTime(epoch: number): string {
  * Side-anchored panel rendered above the chart container. Receives
  * already-computed values from the Chart parent — does no fetching.
  */
+function sideLabel(side: string): string {
+  const u = side?.toUpperCase();
+  if (u === "LONG") return "多";
+  if (u === "SHORT") return "空";
+  return side;
+}
+
+function sourceLabel(src: "LIVE" | "BACKTEST"): string {
+  return src === "LIVE" ? "實盤" : "回測";
+}
+
 export function ChartCrosshairTooltip({ data }: Props) {
   if (!data) return null;
-  if (data.cursorPrice == null && !data.ohlc) return null;
+  const hasEvents = (data.tradeEvents?.length ?? 0) > 0;
+  if (data.cursorPrice == null && !data.ohlc && !hasEvents) return null;
   const { ohlc, indicators } = data;
   const dir = ohlc ? (ohlc.close >= ohlc.open ? "up" : "down") : "";
   return (
@@ -118,6 +142,48 @@ export function ChartCrosshairTooltip({ data }: Props) {
           </>
         )}
       </dl>
+      {hasEvents && (
+        <div className="crosshair-trade-events">
+          {data.tradeEvents!.map((ev, i) => {
+            const kindLabel = ev.kind === "OPEN" ? "開倉" : "關倉";
+            const winLoss =
+              ev.kind === "CLOSE" && ev.pnl != null
+                ? ev.pnl >= 0
+                  ? "win"
+                  : "loss"
+                : "";
+            return (
+              <div key={`${ev.tradeId}-${ev.kind}-${i}`} className="trade-event">
+                <div className="trade-event-head">
+                  <span className="trade-event-kind">{kindLabel}</span>
+                  <span className="trade-event-side">{sideLabel(ev.side)}</span>
+                  <span className="trade-event-strategy">{ev.strategy}</span>
+                  <span className="trade-event-source">{sourceLabel(ev.source)}</span>
+                </div>
+                <div className="trade-event-row">
+                  <span className="trade-event-label">價格</span>
+                  <span className="trade-event-num">{fmtPrice(ev.price)}</span>
+                </div>
+                {ev.kind === "CLOSE" && ev.pnl != null && (
+                  <div className="trade-event-row">
+                    <span className="trade-event-label">損益</span>
+                    <span className={`trade-event-num ${winLoss}`}>
+                      {ev.pnl >= 0 ? "+" : ""}
+                      {ev.pnl.toFixed(1)}
+                    </span>
+                  </div>
+                )}
+                {ev.reason && (
+                  <div className="trade-event-row">
+                    <span className="trade-event-label">原因</span>
+                    <span className="trade-event-reason">{ev.reason}</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

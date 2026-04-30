@@ -51,6 +51,18 @@ type Props = {
   strategy?: string | null;
 };
 
+export type TradeEvent = {
+  tradeId: number;
+  time: number;
+  price: number;
+  kind: "OPEN" | "CLOSE";
+  side: string;
+  strategy: string;
+  reason: string;
+  pnl?: number;
+  source: "LIVE" | "BACKTEST";
+};
+
 // TW market convention: red = up 漲, green = down 跌
 const UP = "#c0392b";
 const DOWN = "#3a7d4f";
@@ -120,18 +132,6 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   // `backtest:${strategy}:${tradeId}` for backtest-derived markers. Keeping
   // them in a single set avoids accidental collisions.
   const seenSignalIdsRef = useRef<Set<string>>(new Set());
-  // Per-strategy LineSeries holding entry→exit segments. Each strategy gets
-  // its own series so the canvas paints in the strategy color. Segments are
-  // joined by `whitespace` entries (a LineData point with `value: undefined`)
-  // — the chart breaks the line at those gaps so the segments don't visually
-  // connect across unrelated trades.
-  const connectorRefs = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
-
-  // V4 Phase 3 Slice B — backtest plot overlay. When the lens is active and a
-  // /backtest/run result is in cache, render its trades as a parallel
-  // (hollow / half-opacity) layer alongside the live one.
-  const btMarkersListRef = useRef<SeriesMarker<Time>[]>([]);
-  const btConnectorRefs = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
 
   // Lookup tables — time(epoch s) → indicator values. Updated whenever the
   // upstream `indicators` payload changes; the crosshair handler reads from
@@ -269,10 +269,12 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
           if (v) ind.dmi = v;
         }
       }
+      const events = time != null ? tradeEventsByTimeRef.current.get(time) : undefined;
       setTooltip({
         ohlc: bar && time != null ? { time, ...bar } : null,
         indicators: ind,
         cursorPrice,
+        tradeEvents: events,
       });
     };
     chart.subscribeCrosshairMove(onMove);
@@ -320,11 +322,6 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       tpLineRef.current = null;
       slLineRef.current = null;
       seenSignalIdsRef.current = new Set();
-      // The chart was just removed; the underlying series are gone with it.
-      // Clear our handle map so a fresh mount doesn't reuse dead refs.
-      connectorRefs.current.clear();
-      btMarkersListRef.current = [];
-      btConnectorRefs.current.clear();
     };
   }, []);
 
@@ -581,125 +578,13 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     lookups.current.dmi = m;
   }, [indicators.dmi, wantDMI]);
 
-  // ─── Live entry → exit connectors (per-strategy) ──────────────────────
-  // Pulls ALL closed trades (no strategy filter — let the rail / lens drive
-  // scope) and renders one solid LineSeries per strategy in the strategy
-  // color. Segments inside one series are separated by a whitespace data
-  // point (no `value`) so lightweight-charts breaks the line between
-  // unrelated trades. Out-of-window segments simply hide; LWC requires
-  // monotonic time, so trades are sorted per strategy.
-  const tradesQ = useTrades({
-    result: "all",
-    limit: 200,
-  });
+  // ─── Unified trade events (live + backtest) ───────────────────────────
+  // One marker layer for all open/close events regardless of source. Markers
+  // are small dots — no inline text labels (those collided with candles).
+  // Hover detail comes from the crosshair tooltip via tradeEventsByTime.
+  const tradesQ = useTrades({ result: "all", limit: 200 });
   const trades = tradesQ.data;
-  useEffect(() => {
-    const chart = chartRef.current;
-    if (!chart) return;
-    type ClosedTrade = NonNullable<typeof trades>[number];
-    const byStrat = new Map<string, ClosedTrade[]>();
-    if (trades) {
-      for (const tr of trades) {
-        if (!tr.exit_ts || tr.exit_price == null) continue;
-        const arr = byStrat.get(tr.strategy) ?? [];
-        arr.push(tr);
-        byStrat.set(tr.strategy, arr);
-      }
-    }
-    // Tear down series for strategies that no longer have trades in scope.
-    for (const [name, series] of connectorRefs.current) {
-      if (!byStrat.has(name)) {
-        try { chart.removeSeries(series); } catch {}
-        connectorRefs.current.delete(name);
-      }
-    }
-    // For each strategy with closed trades, ensure a series and update data.
-    for (const [name, list] of byStrat) {
-      let series = connectorRefs.current.get(name);
-      if (!series) {
-        series = chart.addSeries(
-          LineSeries,
-          {
-            color: strategyHex(name),
-            lineWidth: 1,
-            lineStyle: LineStyle.Solid,
-            priceLineVisible: false,
-            lastValueVisible: false,
-          },
-          0,
-        );
-        connectorRefs.current.set(name, series);
-      } else {
-        series.applyOptions({ color: strategyHex(name) });
-      }
-      type Pt = { time: Time; value?: number };
-      const sorted = [...list].sort(
-        (a, b) =>
-          new Date(a.entry_ts).getTime() - new Date(b.entry_ts).getTime(),
-      );
-      const data: Pt[] = [];
-      for (const tr of sorted) {
-        const tEntry = Math.floor(new Date(tr.entry_ts).getTime() / 1000);
-        const tExit = Math.floor(new Date(tr.exit_ts as string).getTime() / 1000);
-        if (tExit <= tEntry) continue;
-        data.push({ time: tEntry as Time, value: tr.entry_price });
-        data.push({ time: tExit as Time, value: tr.exit_price as number });
-        // whitespace separator: time strictly after exit but before any next
-        // entry; +1 second is enough since LWC requires strictly monotonic time.
-        data.push({ time: (tExit + 1) as Time });
-      }
-      series.setData(data);
-    }
-  }, [trades]);
 
-  // ─── Permanent live markers from the trades table ─────────────────────
-  // Each closed trade contributes an entry arrow + exit circle; each open
-  // trade contributes an entry arrow only. Tinted by strategy. Re-runs on
-  // every `trades` change, so newly persisted trades appear without a
-  // page reload. WS signal arrivals invalidate the trades query (see WS
-  // handler below) so the marker layer follows the live position tracker.
-  useEffect(() => {
-    const list: SeriesMarker<Time>[] = [];
-    if (trades) {
-      const sorted = [...trades].sort(
-        (a, b) =>
-          new Date(a.entry_ts).getTime() - new Date(b.entry_ts).getTime(),
-      );
-      for (const tr of sorted) {
-        const stratColor = strategyHex(tr.strategy);
-        const tEntry = Math.floor(new Date(tr.entry_ts).getTime() / 1000) as Time;
-        const isLong = tr.side === "LONG";
-        list.push({
-          time: tEntry,
-          position: isLong ? "belowBar" : "aboveBar",
-          color: stratColor,
-          shape: isLong ? "arrowUp" : "arrowDown",
-          text: tr.side,
-        });
-        if (tr.exit_ts && tr.exit_price != null && tr.pnl_points != null) {
-          const tExit = Math.floor(new Date(tr.exit_ts).getTime() / 1000) as Time;
-          list.push({
-            time: tExit,
-            position: tr.pnl_points >= 0 ? "aboveBar" : "belowBar",
-            color: stratColor,
-            shape: "circle",
-            text: `${tr.pnl_points >= 0 ? "+" : ""}${tr.pnl_points.toFixed(0)}`,
-          });
-        }
-      }
-    }
-    markersListRef.current = list;
-    markersRef.current?.setMarkers([
-      ...markersListRef.current,
-      ...btMarkersListRef.current,
-    ]);
-  }, [trades]);
-
-  // ─── Backtest plot overlay (lens-driven) ──────────────────────────────
-  // When the lens is active (s + start + end), pull the cached
-  // /backtest/run result and render trades as a half-opacity dotted layer
-  // alongside the live one. Markers are merged via btMarkersListRef so a
-  // new live signal arriving via WS doesn't blow them away.
   const lens = useLens();
   const btReq =
     lens.isActive && lens.strategy && lens.start && lens.end
@@ -708,94 +593,104 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   const btQ = useBacktest(btReq);
   const btTrades = btQ.data?.trades;
 
-  useEffect(() => {
-    const chart = chartRef.current;
-    const stratName = lens.strategy;
-    if (!chart || !stratName || !btTrades || btTrades.length === 0) {
-      // Tear down all backtest connectors when the lens goes inactive or the
-      // result is empty.
-      for (const [, s] of btConnectorRefs.current) {
-        try {
-          chart?.removeSeries(s);
-        } catch {}
+  const tradeEvents = useMemo<TradeEvent[]>(() => {
+    const out: TradeEvent[] = [];
+    if (trades) {
+      for (const tr of trades) {
+        const payload = (tr.payload ?? {}) as Record<string, unknown>;
+        const entryReason =
+          (payload.entry_reason as string | undefined) ?? "";
+        const exitReason = (payload.exit_reason as string | undefined) ?? "";
+        out.push({
+          tradeId: tr.id,
+          time: Math.floor(new Date(tr.entry_ts).getTime() / 1000),
+          price: tr.entry_price,
+          kind: "OPEN",
+          side: tr.side,
+          strategy: tr.strategy,
+          reason: entryReason,
+          source: "LIVE",
+        });
+        if (tr.exit_ts && tr.exit_price != null && tr.pnl_points != null) {
+          out.push({
+            tradeId: tr.id,
+            time: Math.floor(new Date(tr.exit_ts).getTime() / 1000),
+            price: tr.exit_price,
+            kind: "CLOSE",
+            side: tr.side,
+            strategy: tr.strategy,
+            reason: exitReason,
+            pnl: tr.pnl_points,
+            source: "LIVE",
+          });
+        }
       }
-      btConnectorRefs.current.clear();
-      return;
     }
-    let series = btConnectorRefs.current.get(stratName);
-    const halfOpacityColor = strategyHex(stratName) + "99"; // ~60%
-    if (!series) {
-      series = chart.addSeries(
-        LineSeries,
-        {
-          color: halfOpacityColor,
-          lineWidth: 1,
-          lineStyle: LineStyle.Dotted,
-          priceLineVisible: false,
-          lastValueVisible: false,
-        },
-        0,
-      );
-      btConnectorRefs.current.set(stratName, series);
-    } else {
-      series.applyOptions({ color: halfOpacityColor });
-    }
-    // Drop any stale series for other strategies (e.g. switched lens target).
-    for (const [name, s] of btConnectorRefs.current) {
-      if (name === stratName) continue;
-      try { chart.removeSeries(s); } catch {}
-      btConnectorRefs.current.delete(name);
-    }
-    type Pt = { time: Time; value?: number };
-    const sorted = [...btTrades].sort(
-      (a, b) => new Date(a.entry_ts).getTime() - new Date(b.entry_ts).getTime(),
-    );
-    const data: Pt[] = [];
-    for (const tr of sorted) {
-      const tEntry = Math.floor(new Date(tr.entry_ts).getTime() / 1000);
-      const tExit = Math.floor(new Date(tr.exit_ts).getTime() / 1000);
-      if (tExit <= tEntry) continue;
-      data.push({ time: tEntry as Time, value: tr.entry_price });
-      data.push({ time: tExit as Time, value: tr.exit_price });
-      data.push({ time: (tExit + 1) as Time });
-    }
-    series.setData(data);
-  }, [btTrades, lens.strategy]);
-
-  useEffect(() => {
-    // Build the backtest marker layer from the cached trades, then re-flush
-    // the merged (live + backtest) marker list so neither layer clobbers
-    // the other on re-render.
-    const stratName = lens.strategy;
-    if (!btTrades || !stratName) {
-      btMarkersListRef.current = [];
-    } else {
-      const baseColor = strategyHex(stratName) + "AA"; // ~67%
-      const list: SeriesMarker<Time>[] = [];
+    if (btTrades && lens.strategy) {
       for (const tr of btTrades) {
-        const tEntry = Math.floor(new Date(tr.entry_ts).getTime() / 1000) as Time;
-        const tExit = Math.floor(new Date(tr.exit_ts).getTime() / 1000) as Time;
-        const isLong = tr.side === "LONG";
-        list.push({
-          time: tEntry,
-          position: isLong ? "belowBar" : "aboveBar",
-          color: baseColor,
-          shape: isLong ? "arrowUp" : "arrowDown",
-          text: tr.side,
+        out.push({
+          tradeId: tr.id,
+          time: Math.floor(new Date(tr.entry_ts).getTime() / 1000),
+          price: tr.entry_price,
+          kind: "OPEN",
+          side: tr.side,
+          strategy: lens.strategy,
+          reason: tr.entry_reason,
+          source: "BACKTEST",
         });
-        list.push({
-          time: tExit,
-          position: tr.pnl_points >= 0 ? "aboveBar" : "belowBar",
-          color: baseColor,
-          shape: "circle",
-          text: `BT ${tr.pnl_points >= 0 ? "+" : ""}${tr.pnl_points.toFixed(0)}`,
+        out.push({
+          tradeId: tr.id,
+          time: Math.floor(new Date(tr.exit_ts).getTime() / 1000),
+          price: tr.exit_price,
+          kind: "CLOSE",
+          side: tr.side,
+          strategy: lens.strategy,
+          reason: tr.exit_reason,
+          pnl: tr.pnl_points,
+          source: "BACKTEST",
         });
       }
-      btMarkersListRef.current = list;
     }
-    const merged = [...markersListRef.current, ...btMarkersListRef.current];
-    markersRef.current?.setMarkers(merged);
-  }, [btTrades, lens.strategy]);
+    return out;
+  }, [trades, btTrades, lens.strategy]);
+
+  // Index by candle time so the crosshair handler can surface hover details
+  // in the tooltip without scanning the full list every move.
+  const tradeEventsByTimeRef = useRef<Map<number, TradeEvent[]>>(new Map());
+  useEffect(() => {
+    const m = new Map<number, TradeEvent[]>();
+    for (const ev of tradeEvents) {
+      const arr = m.get(ev.time) ?? [];
+      arr.push(ev);
+      m.set(ev.time, arr);
+    }
+    tradeEventsByTimeRef.current = m;
+  }, [tradeEvents]);
+
+  // Push markers — small circle, no text. Position aboveBar for SHORT entry
+  // and CLOSE-with-loss; belowBar for LONG entry and CLOSE-with-win, so the
+  // dot reads naturally relative to the candle direction.
+  useEffect(() => {
+    const list: SeriesMarker<Time>[] = [];
+    const sorted = [...tradeEvents].sort((a, b) => a.time - b.time);
+    for (const ev of sorted) {
+      const isLong = ev.side === "LONG";
+      const aboveBar =
+        ev.kind === "OPEN"
+          ? !isLong
+          : (ev.pnl ?? 0) < 0;
+      list.push({
+        time: ev.time as Time,
+        position: aboveBar ? "aboveBar" : "belowBar",
+        color: strategyHex(ev.strategy),
+        shape: "circle",
+        text: "",
+        size: 1,
+      });
+    }
+    markersListRef.current = list;
+    markersRef.current?.setMarkers(list);
+  }, [tradeEvents]);
 
   // ─── Live updates from WS ─────────────────────────────────────────────
   const lastBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);
