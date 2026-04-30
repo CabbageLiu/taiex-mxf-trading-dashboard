@@ -641,37 +641,42 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
 .crosshair-tooltip .v.up   { color: var(--up); }
 .crosshair-tooltip .v.down { color: var(--down); }
 
-.crosshair-trade-events {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--rule);
+/* ─── Trade marker hover card (chart overlay) ────────────────────────────── */
+
+.trade-marker-card {
+  background: rgba(251, 247, 238, 0.98);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 8px 10px;
+  min-width: 160px;
+  max-width: 240px;
+  box-shadow: var(--shadow-pop);
   display: flex;
   flex-direction: column;
-  gap: 8px;
-}
-.trade-event {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  gap: 6px;
   font-size: var(--fs-meta);
+  font-variant-numeric: tabular-nums;
 }
-.trade-event-head {
+.trade-marker-head {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.trade-marker-kind {
+  display: inline-block;
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.trade-marker-strategy {
+  color: var(--ink);
+  font-size: var(--fs-caption);
   font-weight: var(--fw-semi);
 }
-.trade-event-kind {
-  color: var(--ink);
-}
-.trade-event-side {
-  color: var(--ink-muted);
-}
-.trade-event-strategy {
-  color: var(--ink-muted);
-  font-size: var(--fs-caption);
-}
-.trade-event-source {
+.trade-marker-source {
   margin-left: auto;
   color: var(--ink-muted);
   font-size: var(--fs-caption);
@@ -679,25 +684,41 @@ input[type="number"]:focus, input[type="date"]:focus, select:focus, input[type="
   border-radius: 4px;
   padding: 0 4px;
 }
-.trade-event-row {
+.trade-marker-price {
   display: flex;
-  gap: 8px;
+  justify-content: space-between;
   align-items: baseline;
+  gap: 8px;
 }
-.trade-event-label {
+.trade-marker-label {
   color: var(--ink-muted);
   font-size: var(--fs-caption);
-  min-width: 32px;
 }
-.trade-event-num {
-  font-variant-numeric: tabular-nums;
+.trade-marker-num {
+  font-size: var(--fs-subhead);
   font-weight: var(--fw-semi);
-}
-.trade-event-num.win  { color: var(--up); }
-.trade-event-num.loss { color: var(--down); }
-.trade-event-reason {
   color: var(--ink);
+}
+.trade-marker-pnl {
+  font-size: var(--fs-num-lg);
+  font-weight: var(--fw-bold);
+  letter-spacing: -0.01em;
+  line-height: 1;
+}
+.trade-marker-pnl.win  { color: var(--up); }
+.trade-marker-pnl.loss { color: var(--down); }
+.trade-marker-unit {
   font-size: var(--fs-caption);
+  color: var(--ink-muted);
+  font-weight: var(--fw-semi);
+  margin-left: 2px;
+}
+.trade-marker-reason {
+  color: var(--ink-muted);
+  font-size: var(--fs-caption);
+  line-height: 1.35;
+  border-top: 1px solid var(--rule);
+  padding-top: 6px;
 }
 
 /* ─── Insight spinner (analysis page) ─────────────────────────────────────── */

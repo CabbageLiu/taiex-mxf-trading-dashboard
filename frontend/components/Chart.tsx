@@ -1,7 +1,7 @@
 "use client";
 
 import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CandlestickSeries,
   HistogramSeries,
@@ -9,17 +9,14 @@ import {
   LineStyle,
   TickMarkType,
   createChart,
-  createSeriesMarkers,
   type IChartApi,
   type IPaneApi,
   type IPriceLine,
   type ISeriesApi,
-  type ISeriesMarkersPluginApi,
   type CandlestickData,
   type LineData,
   type HistogramData,
   type MouseEventParams,
-  type SeriesMarker,
   type Time,
 } from "lightweight-charts";
 import type { Bar } from "@/lib/api";
@@ -33,6 +30,7 @@ import {
   type CrosshairIndicators,
 } from "./ChartCrosshairTooltip";
 import { HiLoBadge } from "./HiLoBadge";
+import { TradeMarkerTooltip } from "./TradeMarkerTooltip";
 
 export type IndicatorState = {
   ma: { enabled: boolean; period: number; kind: "sma" | "ema" };
@@ -84,6 +82,87 @@ function strategyHex(name: string | null | undefined): string {
   return STRATEGY_COLORS[name]?.hex ?? "#8a8175";
 }
 
+// Paint one trade marker on the overlay canvas. OPEN = filled triangle that
+// points toward the entry (▲ LONG below the bar / ▼ SHORT above), strategy
+// color fill, white halo. CLOSE = filled circle, win-red / loss-green fill
+// with a 2px ring in the strategy color.
+function paintMarker(
+  ctx: CanvasRenderingContext2D,
+  ev: TradeEvent,
+  x: number,
+  y: number,
+  hovered: boolean,
+): void {
+  const stratColor = strategyHex(ev.strategy);
+  const isClose = ev.kind === "CLOSE";
+  const isWin = isClose && (ev.pnl ?? 0) >= 0;
+  const fill = isClose ? (isWin ? UP : DOWN) : stratColor;
+
+  ctx.save();
+
+  // Hover halo — subtle ring + soft glow under the marker.
+  if (hovered) {
+    ctx.beginPath();
+    ctx.arc(x, y, 14, 0, Math.PI * 2);
+    ctx.fillStyle = stratColor + "22";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x, y, 12, 0, Math.PI * 2);
+    ctx.strokeStyle = stratColor;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  if (isClose) {
+    const r = hovered ? 8 : 6;
+    // White halo for legibility on any candle color.
+    ctx.beginPath();
+    ctx.arc(x, y, r + 2, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    // Filled core (win/loss tint).
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    // Strategy ring.
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = stratColor;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  } else {
+    const size = hovered ? 9 : 7;
+    const isLong = ev.side === "LONG";
+    // White halo as a slightly larger triangle painted underneath.
+    const haloPath = (s: number) => {
+      ctx.beginPath();
+      if (isLong) {
+        // Pointing up — apex above the y center; LONG entry sits below candle.
+        ctx.moveTo(x, y - s);
+        ctx.lineTo(x - s * 0.9, y + s * 0.7);
+        ctx.lineTo(x + s * 0.9, y + s * 0.7);
+      } else {
+        ctx.moveTo(x, y + s);
+        ctx.lineTo(x - s * 0.9, y - s * 0.7);
+        ctx.lineTo(x + s * 0.9, y - s * 0.7);
+      }
+      ctx.closePath();
+    };
+    haloPath(size + 1.5);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    haloPath(size);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
 type IndKey = "macd" | "rsi" | "kd" | "dmi";
 
 type PaneRefs = {
@@ -119,18 +198,19 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   } | null>(null);
 
   const [tooltip, setTooltip] = useState<CrosshairData | null>(null);
-
-  // Strategy plot overlays — markers (entry/exit) accumulate in markersListRef
-  // and are flushed via markersRef.setMarkers(). Active SL/TP/entry lines are
-  // recreated per LONG/SHORT signal and torn down on the matching EXIT.
-  const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
-  const markersListRef = useRef<SeriesMarker<Time>[]>([]);
+  // Custom canvas overlay for trade markers — replaces lightweight-charts'
+  // built-in createSeriesMarkers so we can pixel hit-test on the dot itself
+  // and own the visual treatment (shape grammar OPEN vs CLOSE, win/loss tint,
+  // strategy ring, hover affordance). The canvas sits absolutely over the
+  // chart container with pointer-events: none so chart drag/zoom still work.
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const [hoveredEvent, setHoveredEvent] = useState<TradeEvent | null>(null);
+  const [hoveredPos, setHoveredPos] = useState<{ x: number; y: number } | null>(null);
+  // Live SL/TP/entry price lines for the open position.
   const entryLineRef = useRef<IPriceLine | null>(null);
   const tpLineRef = useRef<IPriceLine | null>(null);
   const slLineRef = useRef<IPriceLine | null>(null);
-  // Namespaced dedup keys: `live:${signalId}` for WS-driven entries,
-  // `backtest:${strategy}:${tradeId}` for backtest-derived markers. Keeping
-  // them in a single set avoids accidental collisions.
+  // Live signal dedup so WS replay can't double-paint entry/TP/SL price lines.
   const seenSignalIdsRef = useRef<Set<string>>(new Set());
 
   // Lookup tables — time(epoch s) → indicator values. Updated whenever the
@@ -225,7 +305,6 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     if (reduceMotion) {
       candleRef.current.applyOptions({ priceLineVisible: false });
     }
-    markersRef.current = createSeriesMarkers(candleRef.current, []);
 
     const onMove = (param: MouseEventParams<Time>) => {
       // Cursor price is independent of whether a candle exists at param.time —
@@ -269,12 +348,10 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
           if (v) ind.dmi = v;
         }
       }
-      const events = time != null ? tradeEventsByTimeRef.current.get(time) : undefined;
       setTooltip({
         ohlc: bar && time != null ? { time, ...bar } : null,
         indicators: ind,
         cursorPrice,
-        tradeEvents: events,
       });
     };
     chart.subscribeCrosshairMove(onMove);
@@ -316,8 +393,6 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       rsiRef.current = null;
       kdRef.current = null;
       dmiRef.current = null;
-      markersRef.current = null;
-      markersListRef.current = [];
       entryLineRef.current = null;
       tpLineRef.current = null;
       slLineRef.current = null;
@@ -654,43 +729,131 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
     return out;
   }, [trades, btTrades, lens.strategy]);
 
-  // Index by candle time so the crosshair handler can surface hover details
-  // in the tooltip without scanning the full list every move.
-  const tradeEventsByTimeRef = useRef<Map<number, TradeEvent[]>>(new Map());
+  // ─── Custom marker overlay (canvas) ────────────────────────────────────
+  // Lightweight-charts' built-in createSeriesMarkers paints into the same
+  // canvas the chart owns and exposes no hover events, so a user pointing at
+  // the dot itself never gets a tooltip — only when the cursor happens to
+  // also intersect the underlying candle's logical time. We replace it with
+  // our own canvas overlay where:
+  //   * each event is painted via priceToCoordinate / timeToCoordinate
+  //   * a mousemove listener on the chart container hit-tests against the
+  //     event list (12px radius, nearest wins)
+  //   * the hovered event drives both a highlight ring on the canvas and a
+  //     dedicated <TradeMarkerTooltip> card (separate from the OHLC tooltip).
+  //
+  // OPEN markers: filled triangle pointing toward the entry bar (▲ LONG
+  // below the bar / ▼ SHORT above), fill = strategy color, white halo.
+  // CLOSE markers: filled circle, fill = win/loss (TW palette: red = win,
+  // green = loss), 2px ring in strategy color, white halo.
+  //
+  // Triggers redraw on tradeEvents change, hoveredEvent change, visible
+  // time-range change, container resize, and bar updates.
+  const tradeEventsRef = useRef<TradeEvent[]>([]);
   useEffect(() => {
-    const m = new Map<number, TradeEvent[]>();
-    for (const ev of tradeEvents) {
-      const arr = m.get(ev.time) ?? [];
-      arr.push(ev);
-      m.set(ev.time, arr);
-    }
-    tradeEventsByTimeRef.current = m;
+    tradeEventsRef.current = tradeEvents;
   }, [tradeEvents]);
+  const hoveredEventRef = useRef<TradeEvent | null>(null);
+  useEffect(() => {
+    hoveredEventRef.current = hoveredEvent;
+  }, [hoveredEvent]);
 
-  // Push markers — small circle, no text. Position aboveBar for SHORT entry
-  // and CLOSE-with-loss; belowBar for LONG entry and CLOSE-with-win, so the
-  // dot reads naturally relative to the candle direction.
-  useEffect(() => {
-    const list: SeriesMarker<Time>[] = [];
-    const sorted = [...tradeEvents].sort((a, b) => a.time - b.time);
-    for (const ev of sorted) {
-      const isLong = ev.side === "LONG";
-      const aboveBar =
-        ev.kind === "OPEN"
-          ? !isLong
-          : (ev.pnl ?? 0) < 0;
-      list.push({
-        time: ev.time as Time,
-        position: aboveBar ? "aboveBar" : "belowBar",
-        color: strategyHex(ev.strategy),
-        shape: "circle",
-        text: "",
-        size: 1,
-      });
+  const drawOverlay = useCallback(() => {
+    const canvas = overlayRef.current;
+    const container = containerRef.current;
+    const chart = chartRef.current;
+    const series = candleRef.current;
+    if (!canvas || !container || !chart || !series) return;
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      canvas.style.width = `${w}px`;
+      canvas.style.height = `${h}px`;
     }
-    markersListRef.current = list;
-    markersRef.current?.setMarkers(list);
-  }, [tradeEvents]);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const ts = chart.timeScale();
+    const hovered = hoveredEventRef.current;
+    for (const ev of tradeEventsRef.current) {
+      const x = ts.timeToCoordinate(ev.time as Time);
+      const y = series.priceToCoordinate(ev.price);
+      if (x == null || y == null) continue;
+      const isHovered = hovered === ev;
+      paintMarker(ctx, ev, x, y, isHovered);
+    }
+  }, []);
+
+  // Init canvas overlay + listeners once the chart is up.
+  useEffect(() => {
+    const chart = chartRef.current;
+    const container = containerRef.current;
+    if (!chart || !container) return;
+
+    const onRange = () => drawOverlay();
+    chart.timeScale().subscribeVisibleTimeRangeChange(onRange);
+
+    const ro = new ResizeObserver(() => drawOverlay());
+    ro.observe(container);
+
+    const onMouseMove = (e: MouseEvent) => {
+      const rect = container.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      const series = candleRef.current;
+      const ts = chart.timeScale();
+      if (!series) {
+        setHoveredEvent(null);
+        setHoveredPos(null);
+        container.style.cursor = "";
+        return;
+      }
+      let best: { ev: TradeEvent; d: number; x: number; y: number } | null = null;
+      for (const ev of tradeEventsRef.current) {
+        const x = ts.timeToCoordinate(ev.time as Time);
+        const y = series.priceToCoordinate(ev.price);
+        if (x == null || y == null) continue;
+        const d = Math.hypot(px - x, py - y);
+        if (d <= 14 && (!best || d < best.d)) {
+          best = { ev, d, x, y };
+        }
+      }
+      if (best) {
+        setHoveredEvent(best.ev);
+        setHoveredPos({ x: best.x, y: best.y });
+        container.style.cursor = "pointer";
+      } else {
+        setHoveredEvent(null);
+        setHoveredPos(null);
+        container.style.cursor = "";
+      }
+    };
+    const onMouseLeave = () => {
+      setHoveredEvent(null);
+      setHoveredPos(null);
+      container.style.cursor = "";
+    };
+    container.addEventListener("mousemove", onMouseMove);
+    container.addEventListener("mouseleave", onMouseLeave);
+
+    drawOverlay();
+
+    return () => {
+      chart.timeScale().unsubscribeVisibleTimeRangeChange(onRange);
+      ro.disconnect();
+      container.removeEventListener("mousemove", onMouseMove);
+      container.removeEventListener("mouseleave", onMouseLeave);
+    };
+  }, [drawOverlay]);
+
+  // Redraw when the events list or hovered state changes.
+  useEffect(() => {
+    drawOverlay();
+  }, [tradeEvents, hoveredEvent, bars, drawOverlay]);
 
   // ─── Live updates from WS ─────────────────────────────────────────────
   const lastBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);
@@ -839,6 +1002,17 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
   return (
     <div style={{ position: "relative", height: "100%" }}>
       <div ref={containerRef} className="chart" style={{ height: "100%" }} />
+      <canvas
+        ref={overlayRef}
+        className="chart-marker-overlay"
+        style={{
+          position: "absolute",
+          inset: 0,
+          pointerEvents: "none",
+          zIndex: 5,
+        }}
+        aria-hidden
+      />
       <ChartCrosshairTooltip data={tooltip} />
       <div style={{ position: "absolute", top: 6, right: 10, fontSize: 11, color: connected ? "var(--down)" : "var(--warn)" }}>
         {status}
@@ -846,6 +1020,11 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       {tooltip?.ohlc && (
         <HiLoBadge hi={tooltip.ohlc.high} lo={tooltip.ohlc.low} />
       )}
+      <TradeMarkerTooltip
+        event={hoveredEvent}
+        x={hoveredPos?.x ?? null}
+        y={hoveredPos?.y ?? null}
+      />
     </div>
   );
 }
