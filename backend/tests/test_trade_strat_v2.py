@@ -177,15 +177,21 @@ def test_v2_plus_di_must_exceed_minus_di_for_long():
     assert state.position is None
 
 
-def test_v2_5m_entry_tp_70():
-    """A +75 pt favorable move on 5m closes the position via TP at 70."""
+def test_v2_5m_does_not_fire_tp_sl():
+    """V2 spec: TP/SL is 1m-only. A +75 pt move on the 5m path does NOT close.
+
+    The 5m bar after entry should only refresh the rising-edge latches and
+    return None — exits live on `_check_tp_sl_minute` (1m) and `_exit_assist`
+    (3m). This guards against regressing back to v1's behaviour where the
+    entry timeframe also evaluated TP/SL.
+    """
     strat = TradeStratV2(params=TradeStratV2Params())
     ev = _entry_event(macd_series=[-1.0, 1.0, 2.0])
     first = strat.on_bar(ev)
     assert first is not None and first.side == "LONG"
     entry_price = first.price
 
-    # Now feed a fresh 5m bar +75 pt above the entry — TP triggers.
+    # Same 5m timeframe, +75 pts above entry — must NOT emit a TP exit.
     later_idx = pd.date_range("2026-04-29 00:20", periods=4, freq="5min", tz="UTC")
     closes = [entry_price + 75.0] * 4
     arr = np.asarray(closes, dtype=float)
@@ -210,20 +216,48 @@ def test_v2_5m_entry_tp_70():
 
     sig2 = TradeStratV2(params=TradeStratV2Params()).on_bar(ev2)
 
-    assert sig2 is not None
-    assert sig2.side == "EXIT"
-    assert sig2.payload["exit_reason"] == "TP"
-    assert sig2.payload["pnl_points"] == 75.0
+    assert sig2 is None
+    state = mod._state_for(TradeStratV2.name, "MXF")
+    assert state.position is not None  # position still open
+
+    # And the same +75 pt move, expressed as a 1m bar, DOES trigger TP.
+    bars1m = _bars([entry_price + 75.0] * 3, freq="1min")
+    ev1m = BarEvent(
+        symbol="MXF",
+        resolution="1m",
+        bucket=bars1m.index[-1].to_pydatetime(),
+        bars=bars1m,
+        indicators={},
+    )
+    sig3 = TradeStratV2(params=TradeStratV2Params()).on_bar(ev1m)
+
+    assert sig3 is not None
+    assert sig3.side == "EXIT"
+    assert sig3.payload["exit_reason"] == "TP"
+    assert sig3.payload["pnl_points"] == 75.0
 
 
 def test_v2_1m_tp_sl_eval_separate_from_entry():
     """1m bar with NO indicators still triggers TP via pure pnl math."""
+    # Per v2's fixed-shape contract, _PositionState.entry_ind always carries
+    # all 8 keys (None for missing). Build the seed snapshot accordingly so
+    # the fallback path round-trips through the payload unchanged.
+    seed_entry_ind = {
+        "k": 55.0,
+        "d": 50.0,
+        "macd": 2.0,
+        "signal": None,
+        "hist": None,
+        "plus_di": 25.0,
+        "minus_di": None,
+        "adx": None,
+    }
     st = mod._state_for(TradeStratV2.name, "MXF")
     st.position = _PositionState(
         side="LONG",
         entry_price=39000.0,
         entry_ts=datetime(2026, 4, 29, 5, 0, tzinfo=UTC),
-        entry_ind={"k": 55.0, "d": 50.0, "macd": 2.0, "plus_di": 25.0},
+        entry_ind=seed_entry_ind,
     )
 
     # Pure 1m bars, no indicator dict — close 75 pts above entry.
@@ -242,10 +276,14 @@ def test_v2_1m_tp_sl_eval_separate_from_entry():
     assert sig.side == "EXIT"
     assert sig.payload["exit_reason"] == "TP"
     assert sig.payload["pnl_points"] == 78.0
-    # exit_ind falls back to the entry-time 5m snapshot stored on _PositionState.
-    assert sig.payload["exit_ind"] == {
-        "k": 55.0, "d": 50.0, "macd": 2.0, "plus_di": 25.0
+    # exit_ind falls back to the entry-time 5m snapshot stored on
+    # _PositionState — must contain all 8 keys with the seeded values
+    # (None for missing). Variable-shape would break the frontend type.
+    snap = sig.payload["exit_ind"]
+    assert set(snap.keys()) == {
+        "k", "d", "macd", "signal", "hist", "plus_di", "minus_di", "adx"
     }
+    assert snap == seed_entry_ind
     state = mod._state_for(TradeStratV2.name, "MXF")
     assert state.position is None
 
@@ -323,10 +361,50 @@ def test_v2_close_position_payload_carries_exit_ind():
     assert sig is not None
     assert sig.side == "EXIT"
     snap = sig.payload["exit_ind"]
+    # Fixed 8-key contract — every key is present, missing values are None.
+    assert set(snap.keys()) == {
+        "k", "d", "macd", "signal", "hist", "plus_di", "minus_di", "adx"
+    }
     assert snap["plus_di"] == 10.0
     assert snap["minus_di"] == 30.0
-    assert "macd" in snap
-    assert "k" in snap
+    assert snap["macd"] is not None
+    assert snap["k"] is not None
+
+
+def test_v2_short_macd_requires_falling_edge_gate():
+    """SHORT entry mirrors LONG: MACD must just have crossed *below* 0.
+
+    A stale negative MACD (e.g. macd[-3]=-1, macd[-2]=-2, macd[-1]=-3)
+    means MACD has been negative all along — no fresh cross down — so the
+    rising-edge-mirror (`_macd_rising_edge(-macd)`) returns False and the
+    SHORT entry must NOT fire even though every other condition holds.
+    """
+    params = TradeStratV2Params(enable_short=True)
+    strat = TradeStratV2(params=params)
+    # KD < 80, +DI < -DI, -DI > 21 → DMI + KD short gate satisfied.
+    # MACD strictly negative, monotonically decreasing → no rising-edge
+    # of the negated series, i.e. no fresh downside cross.
+    ev = _entry_event(
+        plus=10.0, minus=25.0, k=40.0, d=40.0,
+        macd_series=[-1.0, -2.0, -3.0],
+    )
+
+    sig = strat.on_bar(ev)
+
+    assert sig is None
+    state = mod._state_for(TradeStratV2.name, "MXF")
+    assert state.position is None
+
+    # Sanity: a true falling-edge pattern (was non-negative 3 bars ago,
+    # turned negative 2 bars ago, kept falling on the latest bar) DOES
+    # fire — the gate is symmetric to LONG.
+    ev_falling = _entry_event(
+        plus=10.0, minus=25.0, k=40.0, d=40.0,
+        macd_series=[1.0, -1.0, -2.0],
+    )
+    sig2 = TradeStratV2(params=params).on_bar(ev_falling)
+    assert sig2 is not None
+    assert sig2.side == "SHORT"
 
 
 def test_v2_on_5m_rising_edge_long_entry():

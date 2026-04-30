@@ -821,6 +821,18 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
   }, [hoveredEvent]);
   const overlayFrameRef = useRef<number | null>(null);
 
+  // V5 Phase B follow-up: paint-time pixel cache so hover hit-test stays
+  // consistent with what's actually drawn on the canvas. `drawOverlay`
+  // populates this every redraw — including for events whose y-coordinate
+  // was clamped to the pane edge (out-of-range markers). The mousemove
+  // handler reads from this cache instead of recomputing
+  // `priceToCoordinate(ev.price)`, which would return null for the same
+  // out-of-range cases and silently drop the marker from hit-testing.
+  // Keys are TradeEvent object identities; entries are mirror-image
+  // {x, y} of what `paintMarker` consumed, with `outOfRange` for any
+  // future hit-test affordances. Cleared at the start of each draw.
+  const paintedCoordsRef = useRef<Map<TradeEvent, { x: number; y: number; outOfRange: "above" | "below" | null }>>(new Map());
+
   // Retry handle for paint deferred when priceToCoordinate returns null
   // before the chart's first layout pass finishes.
   const retryRef = useRef<number | null>(null);
@@ -882,6 +894,10 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     for (const ev of tradeEventsRef.current) {
       (ev.kind === "OPEN" ? opens : closes).push(ev);
     }
+    // Reset the paint-time pixel cache; we re-populate it below for every
+    // marker we actually draw (including clamped ones). The mousemove
+    // handler reads from this map so hit-testing matches what's on screen.
+    paintedCoordsRef.current = new Map();
     let drewOpen = 0;
     let drewClose = 0;
     let skipped = 0;
@@ -935,6 +951,10 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       const x = xRaw + MARKER_X_OFFSET;
       const isHovered = hovered === ev;
       paintMarker(ctx, ev, x, y, isHovered, outOfRange);
+      // Mirror the painted pixel into the cache so hover hit-testing finds
+      // this marker — including clamped exits whose `priceToCoordinate`
+      // would return null at hover time.
+      paintedCoordsRef.current.set(ev, { x, y, outOfRange });
       if (ev.kind === "OPEN") drewOpen += 1;
       else drewClose += 1;
     }
@@ -950,7 +970,10 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       retryScheduled = 1;
     }
     if (typeof window !== "undefined") {
-      // dev visibility — `window.__taiexMarkerStats` from devtools console
+      // dev visibility — `window.__taiexMarkerStats` from devtools console.
+      // `hitTestable` is the size of the paint-time pixel cache that the
+      // mousemove handler reads from — equal to drewOpen + drewClose on
+      // every successful draw (including clamped markers).
       (window as unknown as { __taiexMarkerStats?: unknown }).__taiexMarkerStats = {
         events: tradeEventsRef.current.length,
         drewOpen,
@@ -958,6 +981,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
         skipped,
         clamped,
         retryScheduled,
+        hitTestable: paintedCoordsRef.current.size,
       };
     }
   }, []);
@@ -987,23 +1011,23 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       const rect = container.getBoundingClientRect();
       const px = e.clientX - rect.left;
       const py = e.clientY - rect.top;
-      const series = candleRef.current;
-      const ts = chart.timeScale();
-      if (!series) {
-        setHoveredEvent(null);
-        setHoveredPos(null);
-        container.style.cursor = "";
-        return;
-      }
+      // V5 Phase B follow-up: read from the paint-time pixel cache instead
+      // of recomputing `priceToCoordinate(ev.price)` here. The recompute
+      // returned null for clamped out-of-range markers, which silently
+      // dropped them from hit-testing — the dot painted on screen but
+      // tooltips never fired. The cache is empty before the first paint;
+      // in that case the loop is a no-op and `setHoveredEvent(null)` falls
+      // through naturally.
+      const cache = paintedCoordsRef.current;
       let best: { ev: TradeEvent; d: number; x: number; y: number } | null = null;
-      for (const ev of tradeEventsRef.current) {
-        const xRaw = ts.timeToCoordinate(ev.time as Time);
-        const y = series.priceToCoordinate(ev.price);
-        if (xRaw == null || y == null) continue;
-        const x = xRaw + MARKER_X_OFFSET;
-        const d = Math.hypot(px - x, py - y);
-        if (d <= 16 && (!best || d < best.d)) {
-          best = { ev, d, x, y };
+      // Hit-test radius matches the painted disc — paintMarker uses
+      // r = hovered ? 13 : 11, and we add a few pixels of slop so the
+      // cursor doesn't have to land dead-center.
+      const hitRadius = 16;
+      for (const [ev, coords] of cache) {
+        const d = Math.hypot(px - coords.x, py - coords.y);
+        if (d <= hitRadius && (!best || d < best.d)) {
+          best = { ev, d, x: coords.x, y: coords.y };
         }
       }
       if (best) {

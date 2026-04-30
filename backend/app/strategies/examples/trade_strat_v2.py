@@ -1,9 +1,12 @@
 """TAIEX Multi-Timeframe Strategy v2 (5-minute strategy).
 
-Entry layer  : 5m K (KD>20, MACD rising-edge above 0, +DI>21 AND +DI > -DI).
-Exit assist  : 3m -DI >= 23 (short-term momentum flip, note >= per spec).
-TP / SL eval : 1m bar close — pure price-based check against the open
-               position. NO entry logic on the 1m series.
+Per spec, the timeframes are strictly partitioned:
+  * 5m bar close = entry decision only (KD>20, MACD rising-edge above 0,
+    +DI>21 AND +DI > -DI). NO TP/SL evaluation on the 5m path.
+  * 1m bar close = TP/SL evaluation only (pure price math against the
+    open position). NO entry logic on the 1m series.
+  * 3m bar close = exit assist via -DI >= 23 momentum flip.
+
 Trend layer  : Daily — display-only "Daily Confidence" badge (0/3..3/3),
                does not block entry.
 
@@ -77,8 +80,8 @@ class _PositionState:
     entry_ts: datetime
     # Snapshot of the 5m indicator values at entry — reused as the
     # `exit_ind` payload when the 1m TP/SL path fires (1m has no
-    # precomputed indicators).
-    entry_ind: dict[str, float] = field(default_factory=dict)
+    # precomputed indicators). Fixed 8-key shape per `_snapshot_ind`.
+    entry_ind: dict[str, float | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -138,31 +141,43 @@ def _snapshot_ind(
     kd: pd.DataFrame | None,
     macd: pd.DataFrame | None,
     dmi: pd.DataFrame | None,
-) -> dict[str, float]:
-    """Pluck the latest scalar values from KD / MACD / DMI frames.
+) -> dict[str, float | None]:
+    """Snapshot the latest KD / MACD / DMI scalars into a fixed-shape dict.
 
-    Returns a dict with k, d, macd, signal, hist, plus_di, minus_di,
-    adx — each rounded to 2dp. Missing indicators silently skipped.
+    Returns a dict that *always* contains all 8 keys (k, d, macd, signal,
+    hist, plus_di, minus_di, adx). Missing / NaN values are emitted as
+    ``None`` so the payload shape is stable for the frontend
+    ``TradeIndicators`` type and the AI insight serializer. Numeric
+    values are rounded to 2 decimals.
     """
-    snap: dict[str, float] = {}
-    if kd is not None:
-        for col in ("k", "d"):
-            if col in kd.columns:
-                v = _scalar(kd[col])
-                if v is not None:
-                    snap[col] = round(v, 2)
-    if macd is not None:
-        for col in ("macd", "signal", "hist"):
-            if col in macd.columns:
-                v = _scalar(macd[col])
-                if v is not None:
-                    snap[col] = round(v, 2)
-    if dmi is not None:
-        for col in ("plus_di", "minus_di", "adx"):
-            if col in dmi.columns:
-                v = _scalar(dmi[col])
-                if v is not None:
-                    snap[col] = round(v, 2)
+    keys = ("k", "d", "macd", "signal", "hist", "plus_di", "minus_di", "adx")
+    snap: dict[str, float | None] = dict.fromkeys(keys)
+
+    def _read(df: pd.DataFrame | None, col: str) -> float | None:
+        if df is None or col not in df.columns:
+            return None
+        try:
+            val = df[col].iloc[-1]
+        except (IndexError, KeyError):
+            return None
+        if val is None:
+            return None
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(f):
+            return None
+        return round(f, 2)
+
+    snap["k"] = _read(kd, "k")
+    snap["d"] = _read(kd, "d")
+    snap["macd"] = _read(macd, "macd")
+    snap["signal"] = _read(macd, "signal")
+    snap["hist"] = _read(macd, "hist")
+    snap["plus_di"] = _read(dmi, "plus_di")
+    snap["minus_di"] = _read(dmi, "minus_di")
+    snap["adx"] = _read(dmi, "adx")
     return snap
 
 
@@ -277,6 +292,10 @@ class TradeStratV2(Strategy):
             return None
 
         macd_rising = _macd_rising_edge(macd["macd"])
+        # Mirror v1: symmetric falling-edge gate for SHORT (negate the
+        # series so the same "just turned positive" helper detects the
+        # downside cross).
+        macd_falling = _macd_rising_edge(-macd["macd"])
 
         long_now = (
             k_curr > p.kd_long_floor
@@ -291,17 +310,19 @@ class TradeStratV2(Strategy):
             and k_curr < p.kd_short_ceiling
             and d_curr < p.kd_short_ceiling
             and macd_curr < 0
+            and macd_falling
             and minus_curr > p.di_short_threshold
             and minus_curr > plus_curr
         )
 
-        # Evaluate exit on existing position before any new entry.
+        # Per spec, V2 TP/SL runs on the 1m timeframe (`_check_tp_sl_minute`),
+        # NOT on the 5m entry path. The 5m bar close evaluates entry only;
+        # if a position is already open we just refresh the rising-edge
+        # latches and return without emitting an exit.
         if st.position is not None:
-            sig = self._check_tp_sl(ev, st, p, close_curr, kd, macd, dmi)
-            if sig is not None:
-                st.last_long_ready = long_now
-                st.last_short_ready = short_now
-                return sig
+            st.last_long_ready = long_now
+            st.last_short_ready = short_now
+            return None
 
         # Freshness — rising edge only.
         long_rising = long_now and not st.last_long_ready
@@ -324,33 +345,6 @@ class TradeStratV2(Strategy):
             )
         return None
 
-    def _check_tp_sl(
-        self,
-        ev: BarEvent,
-        st: _StratState,
-        p: TradeStratV2Params,
-        close: float,
-        kd: pd.DataFrame | None,
-        macd: pd.DataFrame | None,
-        dmi: pd.DataFrame | None,
-    ) -> Signal | None:
-        pos = st.position
-        if pos is None:
-            return None
-        if pos.side == "LONG":
-            pnl = close - pos.entry_price
-        else:
-            pnl = pos.entry_price - close
-        if pnl >= p.tp_points:
-            return self._close_position(
-                ev, st, close, "TP", pnl, exit_ind=_snapshot_ind(kd, macd, dmi)
-            )
-        if pnl <= -p.sl_points:
-            return self._close_position(
-                ev, st, close, "SL", pnl, exit_ind=_snapshot_ind(kd, macd, dmi)
-            )
-        return None
-
     # ─── 1m TP / SL eval (pure price; no entry logic) ────────────────────
 
     def _check_tp_sl_minute(
@@ -370,13 +364,13 @@ class TradeStratV2(Strategy):
 
         # 1m has no indicator_specs by design — TP/SL is pure price.
         # Use whatever indicators the framework happened to attach; if
-        # absent, fall back to the entry-time 5m snapshot stored on the
-        # position.
+        # the live snapshot is entirely empty (all 8 keys None), fall
+        # back to the entry-time 5m snapshot stored on the position.
         kd = ev.indicators.get("kd")
         macd = ev.indicators.get("macd")
         dmi = ev.indicators.get("dmi")
         snapshot = _snapshot_ind(kd, macd, dmi)
-        if not snapshot:
+        if all(v is None for v in snapshot.values()) and pos.entry_ind:
             snapshot = dict(pos.entry_ind)
 
         if pnl >= p.tp_points:
@@ -448,6 +442,12 @@ class TradeStratV2(Strategy):
             "macd": snap.get("macd"),
             "di": snap.get("plus_di") if side == "LONG" else snap.get("minus_di"),
         }
+        # Render-time NaN-safe float coercion for the human-readable reason.
+        nan = float("nan")
+        k_disp = snap.get("k") if snap.get("k") is not None else nan
+        d_disp = snap.get("d") if snap.get("d") is not None else nan
+        macd_disp = snap.get("macd") if snap.get("macd") is not None else nan
+        di_disp = legacy_entry["di"] if legacy_entry["di"] is not None else nan
         return Signal(
             ts=ev.bucket,
             symbol=ev.symbol,
@@ -456,10 +456,8 @@ class TradeStratV2(Strategy):
             side=side,
             price=price,
             reason=(
-                f"entry {side}: K={snap.get('k', float('nan')):.1f} "
-                f"D={snap.get('d', float('nan')):.1f} "
-                f"MACD={snap.get('macd', float('nan')):.2f} "
-                f"DI={legacy_entry['di'] if legacy_entry['di'] is not None else float('nan'):.1f}"
+                f"entry {side}: K={k_disp:.1f} D={d_disp:.1f} "
+                f"MACD={macd_disp:.2f} DI={di_disp:.1f}"
             ),
             payload={
                 "entry": legacy_entry,
@@ -480,13 +478,17 @@ class TradeStratV2(Strategy):
         reason: str,
         pnl: float,
         *,
-        exit_ind: dict[str, float] | None = None,
+        exit_ind: dict[str, float | None] | None = None,
     ) -> Signal:
         pos = st.position
         st.position = None
         st.cooldown_left = self.params.cooldown_bars  # type: ignore[attr-defined]
         st.last_long_ready = False
         st.last_short_ready = False
+        # Always emit the fixed 8-key shape so the payload schema is
+        # stable across exit paths (3m DI flip, 1m TP/SL, fallback).
+        if exit_ind is None:
+            exit_ind = _snapshot_ind(None, None, None)
         return Signal(
             ts=ev.bucket,
             symbol=ev.symbol,
@@ -500,7 +502,7 @@ class TradeStratV2(Strategy):
                 "pnl_points": round(pnl, 2),
                 "entry_price": pos.entry_price if pos else None,
                 "entry_side": pos.side if pos else None,
-                "exit_ind": exit_ind or {},
+                "exit_ind": exit_ind,
                 "fill_hint": "bar_close",
             },
         )

@@ -207,7 +207,7 @@ export function TradesTable({ trades, isLoading }: Props) {
                     <span aria-hidden="true">{sideGlyph}</span> {sideLabel}
                   </span>
                 </td>
-                <td>{displayNameOf(tr.strategy)}</td>
+                <td title={tr.strategy}>{displayNameOf(tr.strategy)}</td>
                 <td className="num">{fmtPrice(tr.entry_price)}</td>
                 <td className="tnum">{entryInd}</td>
                 <td className="num">{fmtPrice(tr.exit_price)}</td>
