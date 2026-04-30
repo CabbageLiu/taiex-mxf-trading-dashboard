@@ -234,7 +234,20 @@ export function Chart({ res, bars, indicators, state, onSignal }: Props) {
       window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const chart = createChart(containerRef.current, {
       autoSize: true,
-      layout: { background: { color: "#fbf7ee" }, textColor: INK },
+      layout: {
+        background: { color: "#fbf7ee" },
+        textColor: INK,
+        // Make the pane separator visible + draggable. Default lightweight
+        // separator is barely visible (1 px ~ rule color); user couldn't tell
+        // where one indicator pane ended and the next began. Bump to a strong
+        // ink-muted line with a sumi-gold hover accent so the drag handle
+        // signals affordance.
+        panes: {
+          separatorColor: "#8a8175",
+          separatorHoverColor: "#a8773d",
+          enableResize: true,
+        },
+      },
       grid: { vertLines: { color: "#ece5d6" }, horzLines: { color: "#ece5d6" } },
       timeScale: {
         timeVisible: true,
