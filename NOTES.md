@@ -30,7 +30,7 @@ The dashboard has two pages, both 繁體中文:
 git clone <this repo>
 cd TAIEX
 cp .env.example .env       # fill in FINMIND_TOKEN, DISCORD_WEBHOOK_URL,
-                            # N8N_WEBHOOK_URL, ANTHROPIC_API_KEY (optional)
+                            # N8N_WEBHOOK_URL, TAIEX_ANTHROPIC_API_KEY (optional)
 docker compose up --build  # first build pulls images + installs deps
 ```
 
@@ -64,7 +64,7 @@ V2 additions (all optional):
 
 | Key                              | Default              | What it does                                              |
 |----------------------------------|----------------------|------------------------------------------------------------|
-| `ANTHROPIC_API_KEY`              | unset                | Without this, `/analysis` AI panel returns 503 (UI degrades cleanly) |
+| `TAIEX_ANTHROPIC_API_KEY`        | unset                | Without this, `/analysis` AI panel returns 503 (UI degrades cleanly). Prefixed to avoid colliding with Claude Code's `ANTHROPIC_API_KEY`. |
 | `ANTHROPIC_MODEL`                | `claude-sonnet-4-6`  | Override only when migrating models                       |
 | `INSIGHTS_CACHE_TTL_SECONDS`     | `1800`               | How long an AI insight stays cached before regeneration   |
 | `INSIGHTS_CACHE_MAX_ENTRIES`     | `256`                | Bounded LRU; restart drops the cache (no Redis dep)       |
@@ -264,7 +264,7 @@ tailscale down
 | Price stuck at a specific time during the day | FinMind sponsor endpoint stopped returning new rows for the configured `data_id` | Hit the endpoint manually: `curl -s -H "Authorization: Bearer $FINMIND_TOKEN" "https://api.finmindtrade.com/api/v4/taiwan_futures_snapshot?data_id=TXF" \| jq '.data \| length'`. Zero rows = wrong `data_id` or sponsor tier expired. |
 | Want to fill the gap from when the server was down | Backfill endpoint or wait for next boot | `curl -X POST 'http://127.0.0.1:8000/admin/backfill?start=YYYY-MM-DD&end=YYYY-MM-DD'`. See §7.8. |
 | Status pill stays red | Backend down, DB unreachable, or FinMind throwing | Hover the pill for which subsystem is failing; tail `docker compose logs backend` |
-| `/analysis` AI panel says `伺服器尚未設定 ANTHROPIC_API_KEY` | Key not set in `.env` | Add `ANTHROPIC_API_KEY=sk-ant-…` to `.env`, then `docker compose restart backend` |
+| `/analysis` AI panel says `伺服器尚未設定 TAIEX_ANTHROPIC_API_KEY` | Key not set in `.env` | Add `TAIEX_ANTHROPIC_API_KEY=sk-ant-…` to `.env`, then `docker compose up -d --force-recreate backend` (restart keeps stale env). Var is prefixed so it does not clobber Claude Code's `ANTHROPIC_API_KEY`. |
 | `/analysis` says rate-limited | More than 5 insights/min/(strategy, ip) | Wait the `Retry-After` seconds shown in the toast; cache hits are free, so reusing a recent filter avoids the limit |
 | zh-TW characters render as boxes | Google Fonts blocked | Allow `fonts.googleapis.com` / `fonts.gstatic.com` in any blocker |
 | Tailscale URL fails for invited user | They didn't accept invite, or aren't logged in | Re-send invite from admin console |
@@ -379,7 +379,7 @@ appears in the StrategySelector dropdown.
 5. Open `/analysis` and select `macd_cross` from the same selector
    (the URL `?s=macd_cross` carries the active strategy across pages).
    After a few signals fire, KPI cards + trade rows fill in.
-6. Click `生成洞察` (requires `ANTHROPIC_API_KEY`) for AI coaching against
+6. Click `生成洞察` (requires `TAIEX_ANTHROPIC_API_KEY`) for AI coaching against
    the recent trade window.
 
 ### 7.4 The `Strategy` API in detail
@@ -664,7 +664,7 @@ bullets of 繁體中文 coaching against the current filter (strategy + date
 range + win/loss). It only fires when you click — there is no automatic
 spend.
 
-- Set `ANTHROPIC_API_KEY` in `.env` and `docker compose restart backend`.
+- Set `TAIEX_ANTHROPIC_API_KEY` in `.env` and `docker compose up -d --force-recreate backend` (plain `restart` does not re-read `env_file`).
 - Cache: keyed on `(strategy, start, end, filter, trade_count, per-trade
   fingerprint)`. Same filter, no new closed trades → cache hit (`· 已快取`
   hint shown). New close → cache invalidates automatically.
@@ -768,11 +768,11 @@ succession after a backend restart — the second one is correctly rejected.
 |---|---|
 | resolutions | `["3m", "30m", "1d"]` |
 | entry tf | 30m bar close |
-| entry conditions (LONG) | `KD > 20` AND MACD just-turned-positive (`macd[-3] <= 0 AND macd[-2] > 0 AND macd[-1] > macd[-2]`) AND `+DI > 21` AND `+DI > -DI` |
-| entry conditions (SHORT) | symmetric: KD < 20-ceiling, MACD just-turned-negative (mirrored via `-macd`), `-DI > 21` AND `-DI > +DI` |
+| entry conditions (LONG) | `KD > 20` AND MACD just-turned-positive (`macd[-3] <= 0 AND macd[-2] > 0 AND macd[-1] > macd[-2]`) AND `+DI > 21` |
+| entry conditions (SHORT) | symmetric: KD < 20-ceiling, MACD just-turned-negative (mirrored via `-macd`), `-DI > 21` |
 | exit assist tf | 3m bar close |
 | exit assist | `-DI > 23` (strict `>`) closes LONG; `+DI > 23` closes SHORT |
-| TP / SL | 220 / 60 points, eval on entry-tf bar close |
+| TP / SL | 250 / 75 points, eval on entry-tf bar close |
 | daily 1d display | counts how many of the 3 entry conditions hold long/short side; shown as 0..3 dots in `DailyConfidenceBadge` |
 | cooldown | 5 × 30m bars after exit |
 
@@ -786,7 +786,7 @@ succession after a backend restart — the second one is correctly rejected.
 | entry conditions | identical shape to v1, on 5m |
 | exit assist tf | 3m bar close |
 | exit assist | `-DI ≥ 23` (note: `>=`, not `>` — this is the v2 spec's distinction from v1) |
-| TP / SL | 70 / 50 points, eval on **1m** bar close (separate code path with no entry logic — `_check_tp_sl_minute`); 5m bar close does NOT evaluate TP/SL |
+| TP / SL | 65 / 50 points, eval on **1m** bar close (separate code path with no entry logic — `_check_tp_sl_minute`); 5m bar close does NOT evaluate TP/SL |
 | daily 1d display | same as v1 |
 | cooldown | 5 × 5m bars after exit |
 
@@ -796,7 +796,33 @@ hist, plus_di, minus_di, adx}`, 2-decimal-rounded, NaN → None). The
 position tracker copies these into `Trade.payload` so the analysis log
 renders the conditions side-by-side.
 
-### 11.2 `bars_3m` continuous aggregate
+### 11.2 strat_30k / strat_15k / strat_1k (MA120 trend strategies)
+
+Three single-resolution LONG-only strategies sharing the same 4-condition entry. Differ in timeframe and exit thresholds.
+
+**Entry (all three; emit only on rising-edge transition false→true):**
+1. close > MA120 AND MA120 rising (`ma[-1] > ma[-2]`)
+2. KD: `k[-2] > d[-2]` AND `k[-1] > d[-1]` AND `k[-2] < 80`
+3. MACD histogram: `hist[-2] < 0` AND `hist[-1] > 0`
+4. DMI: `+DI[-2] > -DI[-2]` AND `+DI[-1] > -DI[-1]` AND `-DI[-1] < -DI[-2]`
+
+| canonical | display | resolution | TP | SL | Trail | Extra exit |
+|-----------|---------|-----------|-----|-----|-------|------------|
+| `strat_30k` | 30K策略 | 30m | 180 | 70 | 80 | — |
+| `strat_15k` | 15K策略 | 15m | 130 | 70 | 80 | — |
+| `strat_1k`  | 1K策略  | 1m  | 50  | 40 | 50  | DI_JUMP_1M: `-DI[-1] − -DI[-2] > 5` |
+
+**Trailing stop semantics:** `peak_pnl` tracks from entry, starts at 0. Exit fires when `current_pnl ≤ peak_pnl − trail_points`. SL handles the never-profitable case (SL < trail, so SL fires first). Peak update happens after all priority checks.
+
+**Exit priority:** TP → SL → TRAIL → (strat_1k only) DI_JUMP_1M → hold.
+
+**Cooldown:** 5 bars after EXIT (matches v1 / v2 default).
+
+**Indicator specs:** `ma120 (period=120 SMA)`, `kd (9, 3, 3)`, `macd (12, 26, 9)`, `dmi (14)`. MA120 needs ~2.5 days of 30m bars to fully warm up; default `BACKFILL_ON_STARTUP_DAYS=7` covers it. The `entry_ind` / `exit_ind` payload snapshot keeps the existing 8-key shape (`{k, d, macd, signal, hist, plus_di, minus_di, adx}`) — MA120 is intentionally NOT in the snapshot.
+
+**Operator deploy step:** restart backend; the registry autodiscovers the new modules. Default `enabled=False` in `strategy_config`. Operator enables the three new strategies in the Strategies UI; toggles `trade_strat_v1` / `trade_strat_v2` off if previously enabled.
+
+### 11.3 `bars_3m` continuous aggregate
 
 Migration `0004_bars_3m.py` (mirrors `0003_bars_2m_10m.py`) adds a
 `bars_3m` continuous aggregate with the same 30 s
@@ -806,7 +832,7 @@ Migration `0004_bars_3m.py` (mirrors `0003_bars_2m_10m.py`) adds a
 `docker compose down -v && docker compose up -d --build` (or
 `uv run alembic upgrade head` on the host) to apply.
 
-### 11.3 Chart marker behavior
+### 11.4 Chart marker behavior
 
 - **Pane-relative y clamp** in `frontend/components/Chart.tsx`. When
   `series.priceToCoordinate(price)` returns null OR returns a y outside
@@ -825,7 +851,7 @@ Migration `0004_bars_3m.py` (mirrors `0003_bars_2m_10m.py`) adds a
   persistence. `<Chart>` accepts a new
   `markerStrategies?: Set<string> | null` prop (null = show all).
 
-### 11.4 What to do when a strategy spec changes
+### 11.5 What to do when a strategy spec changes
 
 1. Edit the strategy module under `backend/app/strategies/examples/`.
 2. Update the matching `backend/tests/test_<strategy>.py` cases — lock
@@ -857,8 +883,8 @@ The 30 分鐘線策略 (`trade_strat_v1`) exit logic was rewritten on
 
 | condition | rule | reason code |
 |---|---|---|
-| TP | profit ≥ 150 點 (was 220) | `TP` |
-| SL | loss ≥ 60 點 | `SL` |
+| TP | profit ≥ 250 點 | `TP` |
+| SL | loss ≥ 75 點 | `SL` |
 | 10m DMI flip | `-DI > +DI` closes LONG; `+DI > -DI` closes SHORT | `DI_FLIP_10M` |
 | 30m MACD-falling | `macd[-2] > macd[-1]` closes LONG; mirror for SHORT | `MACD_DOWN_30M` |
 
@@ -868,19 +894,19 @@ The previous 3m `-DI > 23` rule is gone. `resolutions` is
 Priority inside `_on_30m`: TP/SL → MACD-falling → entry eval. A 30m bar
 that simultaneously hits TP and has falling MACD emits TP only.
 
-The `Params.tp_points` code default is **150**. If you previously saved
-220 (or 199) via the dashboard params popover, that DB override is still
-the live value — use the popover to update or `DELETE FROM
-strategy_config WHERE name='trade_strat_v1'` to fall back to the code
-default. Confirm the live value via:
+The `Params.tp_points` code default is **250**, `sl_points` is **75**.
+If you previously saved older values (150 / 220 / 199 / 60) via the
+dashboard params popover, that DB override is still the live value —
+use the popover to update or `DELETE FROM strategy_config WHERE
+name='trade_strat_v1'` to fall back to the code default. Confirm via:
 
 ```sh
 curl -s http://127.0.0.1:8000/strategies | python3 -c \
-  "import json,sys; [print(s['params'].get('tp_points')) for s in json.load(sys.stdin) if s['name']=='trade_strat_v1']"
+  "import json,sys; [print(s['name'], s['params'].get('tp_points'), s['params'].get('sl_points')) for s in json.load(sys.stdin) if s['name'].startswith('trade_strat')]"
 ```
 
-`trade_strat_v2` (5 分鐘策略) was NOT touched in V5.1 — still the V5
-spec.
+The same DB-override gotcha applies to `trade_strat_v2.tp_points`
+(code default **65** as of 2026-05-01; was 70).
 
 ---
 
@@ -932,6 +958,8 @@ Exit reason TC translation table (in `_EXIT_REASON_TC`):
 | `DI_FLIP_10M` | 10 分鐘 DMI 翻轉 (-DI > +DI) |
 | `MACD_DOWN_30M` | 30 分鐘 MACD 下彎 |
 | `DI_FLIP` | 3 分鐘 DMI 翻轉 (legacy v1 / current v2) |
+| `TRAIL` | 移動停損 |
+| `DI_JUMP_1M` | 1 分鐘 -DI 跳升 (>5 點) |
 
 Unknown reason codes pass through verbatim — add to the table when a
 new strategy emits one.
@@ -957,7 +985,45 @@ distinct from real ones (no indicator block in the embed).
    - `7169fe1` V5 codex-rescue blockers
    - `deedfbb` V5-C trades-table columns
    - `f5edf6f` V5-B chart marker fixes + filter pills
-5. **Backlog** — see CLAUDE.md "Backlog still deferred" section at the V4 boundary; V5/V5.1/V5.2/V5.3 did not address auth, CORS, mutating-endpoint protection, Anthropic spend cap, TW holiday calendar, or backtest engine fees/slippage. The user has not asked for any of those yet.
+5. **Backlog** — §16 below. V5/V5.1/V5.2/V5.3 did not address auth, CORS, mutating-endpoint protection, Anthropic spend cap, TW holiday calendar, or backtest engine fees/slippage. The user has not asked for any of those yet.
 
 If the user asks about a feature without context, search this NOTES.md
 section index (line ~21) and CLAUDE.md before exploring code.
+
+## 16. Deferred backlog
+
+Cross-cutting items not yet addressed. None of these block live operation; they are visible gaps the user has not asked to close.
+
+- CORS still wide open.
+- Mutating endpoints unauthenticated: `/strategies/*`, `/insights/strategy`, `/admin/backfill`, `/admin/test-webhook`, `/backtest/run`.
+- No global Anthropic spend cap.
+- Reverse-proxy IP gap on rate limiter (collapses to single bucket if `X-Forwarded-For` stripped).
+- No TW holiday calendar (backfill iterates Mon-Fri incl holidays — wasted API calls).
+- `/admin/backfill` synchronous (multi-month windows block).
+- No per-trade fees / slippage / position sizing in backtest engine.
+- Backtest fills at signal-bar close (no `next_bar_open` mode).
+- No auth / multi-user.
+- `_STATE` swap convention module-introspection-based; brittle to non-`_STATE` naming.
+- `wipe_and_rebackfill.py` has no env guard — destructive, dev container only.
+- Front-month picker assumes FinMind keeps `R1` rolling-alias suffix (logs when fallback triggers).
+- Dominant-contract backfill filter falls through to "keep everything" when all rows have empty `contract_date` (logs warning, does not fail).
+
+## 17. Verification quick-reference
+
+Backend health:
+
+```sh
+curl -s http://127.0.0.1:8000/status | python3 -m json.tool
+# all of: ingest_running, strategy_loop_running, position_tracker_running, db_ok, ok → true
+# notifiers.discord → true once .env's DISCORD_WEBHOOK_URL is loaded into the container
+```
+
+Confirm paper trading live:
+
+```sh
+curl -s 'http://127.0.0.1:8000/strategies' | python3 -c "import json,sys; [print(f\"{s['name']:20s} enabled={s['enabled']}\") for s in json.load(sys.stdin)]"
+curl -s 'http://127.0.0.1:8000/trades?limit=5' | python3 -m json.tool | head -50
+curl -s 'http://127.0.0.1:8000/trades/stats?strategy=trade_strat_v1' | python3 -m json.tool
+```
+
+Pre-V5 trades carry empty `payload: {}` — predate indicator-snapshot threading + are not backfilled. New trades carry full `entry_ind` / `exit_ind`.

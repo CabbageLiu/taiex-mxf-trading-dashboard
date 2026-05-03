@@ -26,6 +26,8 @@ _EXIT_REASON_TC = {
     "DI_FLIP_10M": "10 分鐘 DMI 翻轉 (-DI > +DI)",
     "MACD_DOWN_30M": "30 分鐘 MACD 下彎",
     "DI_FLIP": "3 分鐘 DMI 翻轉",  # legacy v1 / current v2 reason code
+    "TRAIL": "移動停損",
+    "DI_JUMP_1M": "1 分鐘 -DI 跳升 (>5 點)",
 }
 
 
@@ -59,12 +61,16 @@ def _exit_reason_tc(reason: str | None) -> str | None:
 def _entry_condition_summary_tc(strategy_name: str) -> str:
     """Describe the entry gates the strategy fires on.
 
-    Hardcoded for the two example strategies because they share the same
-    spec shape (KD floor + MACD rising-edge + +DI dominance). For unknown
-    strategies returns a generic phrase. Indicator names stay English.
+    Hardcoded per strategy family because each family shares the same
+    spec shape (e.g. v1/v2 share KD floor + MACD rising-edge + +DI
+    dominance; the strat_30k/15k/1k family shares MA120 trend + KD + MACD
+    histogram + DMI flip). For unknown strategies returns a generic
+    phrase. Indicator names stay English.
     """
     if strategy_name in {"trade_strat_v1", "trade_strat_v2"}:
         return "KD > 20 / MACD 翻正 / +DI > 21 且 +DI > -DI"
+    if strategy_name in {"strat_30k", "strat_15k", "strat_1k"}:
+        return "K 棒在 MA120 之上且 MA120 向上 / KD 連兩 KS>DS / MACD 翻正 / +DI>-DI 且 -DI 縮"
     return "進場條件達標"
 
 

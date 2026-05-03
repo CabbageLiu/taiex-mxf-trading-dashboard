@@ -80,6 +80,9 @@ const TZ = "Asia/Taipei";
 const STRATEGY_COLORS: Record<string, { token: string; hex: string }> = {
   trade_strat_v1: { token: "var(--strategy-1)", hex: "#1e88e5" },
   trade_strat_v2: { token: "var(--strategy-2)", hex: "#fb8c00" },
+  strat_30k: { token: "var(--strategy-3)", hex: "#43a047" },
+  strat_15k: { token: "var(--strategy-4)", hex: "#8e24aa" },
+  strat_1k: { token: "var(--strategy-5)", hex: "#d81b60" },
 };
 
 // Pixel offset applied to every marker so the dot sits to the right of the

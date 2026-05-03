@@ -11,6 +11,9 @@ type Props = {
 const STRATEGY_HEX: Record<string, string> = {
   trade_strat_v1: "#1e88e5",
   trade_strat_v2: "#fb8c00",
+  strat_30k: "#43a047",
+  strat_15k: "#8e24aa",
+  strat_1k: "#d81b60",
 };
 
 function strategyHex(name: string): string {

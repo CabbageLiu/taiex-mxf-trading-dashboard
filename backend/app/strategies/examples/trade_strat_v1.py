@@ -205,7 +205,7 @@ def _ind_snapshot(
 @register_strategy
 class TradeStratV1(Strategy):
     name: ClassVar[str] = "trade_strat_v1"
-    display_name: ClassVar[str] = "30分鐘線策略"
+    display_name: ClassVar[str] = "30分鐘線策略 (舊)"
     description: ClassVar[str] = (
         "進場：30 分鐘 KD>20、MACD 直方圖三根上揚翻正、+DI>21；"
         "出場：TP +250 / SL −75 點，輔以 10 分鐘 DMI 翻轉、30 分鐘 MACD 下彎；"
