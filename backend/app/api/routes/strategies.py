@@ -17,6 +17,8 @@ router = APIRouter(prefix="/strategies", tags=["strategies"])
 class StrategyOut(BaseModel):
     name: str
     display_name: str | None = None
+    description: str | None = None
+    spec: dict[str, str] | None = None
     resolutions: list[str]
     params_schema: dict
     enabled: bool
@@ -53,6 +55,8 @@ async def list_strategies() -> list[StrategyOut]:
             StrategyOut(
                 name=name,
                 display_name=getattr(cls, "display_name", None),
+                description=getattr(cls, "description", None),
+                spec=getattr(cls, "spec", None),
                 resolutions=list(cls.resolutions),
                 params_schema=cls.params_schema.model_json_schema(),
                 **cfg,

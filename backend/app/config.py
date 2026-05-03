@@ -44,7 +44,9 @@ class Settings(BaseSettings):
     backfill_min_ticks_per_day: int = Field(default=1000, alias="BACKFILL_MIN_TICKS_PER_DAY")
 
     # AI insights (Anthropic Claude Sonnet) — V2 strategy analysis page
-    anthropic_api_key: SecretStr | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    anthropic_api_key: SecretStr | None = Field(
+        default=None, alias="TAIEX_ANTHROPIC_API_KEY"
+    )
     anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
     insights_cache_ttl_seconds: int = Field(
         default=1800, alias="INSIGHTS_CACHE_TTL_SECONDS"

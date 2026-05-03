@@ -182,7 +182,7 @@ async def post_strategy_insight(body: InsightRequest, request: Request) -> Insig
     if settings.anthropic_api_key is None or not settings.anthropic_api_key.get_secret_value():
         raise HTTPException(
             status_code=503,
-            detail="ANTHROPIC_API_KEY not configured on server",
+            detail="TAIEX_ANTHROPIC_API_KEY not configured on server",
         )
 
     ip = _client_ip(request)

@@ -20,6 +20,8 @@ export type StrategyOut = {
   // label (e.g. "30分鐘線策略"). Optional + nullable for backward compat
   // with deployments that haven't been redeployed yet.
   display_name?: string | null;
+  description?: string | null;
+  spec?: Record<string, string> | null;
 };
 
 export type AlertOut = {

@@ -164,19 +164,6 @@ def test_v2_macd_not_rising_no_entry(macd_series):
     assert state.position is None
 
 
-def test_v2_plus_di_must_exceed_minus_di_for_long():
-    """+DI > 21 alone is not enough — also needs +DI > -DI."""
-    strat = TradeStratV2(params=TradeStratV2Params())
-    # +DI=25 (>21) but -DI=30 (so +DI < -DI) → entry blocked.
-    ev = _entry_event(plus=25.0, minus=30.0, macd_series=[-1.0, 1.0, 2.0])
-
-    sig = strat.on_bar(ev)
-
-    assert sig is None
-    state = mod._state_for(TradeStratV2.name, "MXF")
-    assert state.position is None
-
-
 def test_v2_5m_does_not_fire_tp_sl():
     """V2 spec: TP/SL is 1m-only. A +75 pt move on the 5m path does NOT close.
 

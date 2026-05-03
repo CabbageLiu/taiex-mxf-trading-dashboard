@@ -4,6 +4,7 @@ import { Suspense, useEffect, useMemo, useState } from "react";
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 
 import { KpiCard, type KpiTone } from "@/components/KpiCard";
+import { StrategyDescription } from "@/components/StrategyDescription";
 import { TradesTable } from "@/components/TradesTable";
 import {
   TradeFilterBar,
@@ -400,13 +401,22 @@ function LiveView({ filter, setFilter, liveTradesQ, liveStatsQ }: LiveViewProps)
         </div>
       </div>
 
-      <aside style={{ position: "sticky", top: 24 }}>
+      <aside
+        style={{
+          position: "sticky",
+          top: 24,
+          display: "flex",
+          flexDirection: "column",
+          gap: 16,
+        }}
+      >
         <TradeInsightPanel
           filter={filter}
           stats={stats}
           trades={trades}
           isLoading={statsLoading || liveTradesQ.isLoading || liveTradesQ.isPending}
         />
+        <StrategyDescription withSectionTitle />
       </aside>
     </div>
   );
@@ -500,7 +510,15 @@ function SingleLensView({ lens, btQ, filter }: SingleLensViewProps) {
         </div>
       </div>
 
-      <aside style={{ position: "sticky", top: 24 }}>
+      <aside
+        style={{
+          position: "sticky",
+          top: 24,
+          display: "flex",
+          flexDirection: "column",
+          gap: 16,
+        }}
+      >
         <TradeInsightPanel
           filter={{ ...filter, strategy }}
           stats={tradeStatsCompat}
@@ -509,6 +527,7 @@ function SingleLensView({ lens, btQ, filter }: SingleLensViewProps) {
           inlineTrades={trades}
           inlineStats={stats}
         />
+        <StrategyDescription withSectionTitle />
       </aside>
     </div>
   );
@@ -607,6 +626,8 @@ function CompareView({ lens, btQA, btQB }: CompareViewProps) {
           trades: btQB.data?.trades,
         }}
       />
+
+      <StrategyDescription withSectionTitle />
     </div>
   );
 }

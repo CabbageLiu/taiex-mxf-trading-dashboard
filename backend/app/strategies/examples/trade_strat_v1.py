@@ -1,6 +1,6 @@
 """TAIEX Multi-Timeframe Strategy v1 (30分鐘線策略).
 
-Entry layer  : 30m (KD>20, MACD rising-edge positive, +DI>21 AND +DI>-DI).
+Entry layer  : 30m (KD>20, MACD rising-edge positive, +DI>21).
 Exit assist  : 10m DMI flip (-DI > +DI for LONG; +DI > -DI for SHORT).
 Trend layer  : Daily — display-only "Daily Confidence" badge (0/3..3/3),
                does not block entry.
@@ -22,7 +22,7 @@ Each of the 4 conditions, evaluated on the 1d bar, contributes 1 point per
 side:
     1. KD > 20 (long) / KD < 80 (short)
     2. MACD > 0 (long) / MACD < 0 (short)
-    3. +DI > 21 AND +DI > -DI  (long) / -DI > 21 AND -DI > +DI  (short)
+    3. +DI > 21 (long) / -DI > 21 (short)
 The +DI condition mirrors the live entry gate so the badge stays
 consistent with what 30m would actually fire on.
 
@@ -34,8 +34,8 @@ Discipline:
     documented deviation from spec).
 
 Exits (any one fires → close):
-  * +150 pt take-profit (30m bar close).
-  * -60 pt stop-loss (30m bar close).
+  * +250 pt take-profit (30m bar close).
+  * -75 pt stop-loss (30m bar close).
   * 10m DMI flip: -DI > +DI closes LONG, +DI > -DI closes SHORT
     (reason `DI_FLIP_10M`).
   * 30m MACD-falling: hist[-2] > hist[-1] closes LONG, hist[-2] < hist[-1]
@@ -45,7 +45,7 @@ Exits (any one fires → close):
 Priority on a single 30m bar close: TP/SL > MACD-falling > entry eval. If
 TP and falling-MACD both fire on the same bar, only TP is emitted.
 
-R:R = 150 : 60 = 2.5:1.
+R:R = 250 : 75 ≈ 3.33:1.
 
 Strategy instance is rebuilt per bar_close, so position / cooldown state
 lives in the module-level _STATE dict keyed by (strategy_name, symbol).
@@ -84,8 +84,8 @@ class TradeStratV1Params(BaseModel):
     di_long_threshold: float = 21.0
     di_short_threshold: float = 21.0
 
-    tp_points: float = 150.0
-    sl_points: float = 60.0
+    tp_points: float = 250.0
+    sl_points: float = 75.0
 
     cooldown_bars: int = Field(default=5, ge=0)
 
@@ -206,6 +206,18 @@ def _ind_snapshot(
 class TradeStratV1(Strategy):
     name: ClassVar[str] = "trade_strat_v1"
     display_name: ClassVar[str] = "30分鐘線策略"
+    description: ClassVar[str] = (
+        "進場：30 分鐘 KD>20、MACD 直方圖三根上揚翻正、+DI>21；"
+        "出場：TP +250 / SL −75 點，輔以 10 分鐘 DMI 翻轉、30 分鐘 MACD 下彎；"
+        "冷卻 5 根 30 分鐘 K。"
+    )
+    spec: ClassVar[dict[str, str]] = {
+        "週期": "30 分鐘進場 / 10 分鐘出場輔助 / 1 日趨勢顯示",
+        "進場": "30m KD>20、MACD 直方圖三根上揚翻正 (hist[-3]≤0、[-2]>0、[-1]>[-2])、+DI>21",
+        "出場": "TP +250 / SL −75 點；10m -DI>+DI 翻轉；30m MACD 直方圖下彎",
+        "冷卻": "出場後 5 根 30 分鐘 K 線方可再進場",
+        "備註": "無金字塔 (1 口)；進場限新訊號邊緣；出場優先序 TP/SL → MACD 下彎 → 進場評估",
+    }
     resolutions: ClassVar[list[str]] = ["10m", "30m", "1d"]
     params_schema: ClassVar[type[BaseModel]] = TradeStratV1Params
     indicator_specs: ClassVar[dict[str, dict]] = {
@@ -273,14 +285,14 @@ class TradeStratV1(Strategy):
             (
                 k > p.kd_long_floor and d > p.kd_long_floor,
                 hist_val > 0,
-                plus_di > p.di_long_threshold and plus_di > minus_di,
+                plus_di > p.di_long_threshold,
             )
         )
         short_score = sum(
             (
                 k < p.kd_short_ceiling and d < p.kd_short_ceiling,
                 hist_val < 0,
-                minus_di > p.di_short_threshold and minus_di > plus_di,
+                minus_di > p.di_short_threshold,
             )
         )
         st.daily_confidence_long = long_score
@@ -318,7 +330,6 @@ class TradeStratV1(Strategy):
             and d_curr > p.kd_long_floor
             and macd_rising
             and plus_curr > p.di_long_threshold
-            and plus_curr > minus_curr
         )
         short_now = (
             p.enable_short
@@ -326,7 +337,6 @@ class TradeStratV1(Strategy):
             and d_curr < p.kd_short_ceiling
             and macd_falling
             and minus_curr > p.di_short_threshold
-            and minus_curr > plus_curr
         )
 
         # Evaluate exit on existing position before any new entry. TP/SL

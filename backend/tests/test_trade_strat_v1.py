@@ -265,38 +265,6 @@ def test_macd_not_rising_no_entry(tail):
     assert sig is None
 
 
-def test_plus_di_must_exceed_minus_di_for_long():
-    """+DI=22 > 21 but +DI < -DI → no entry. Flip -DI down → entry."""
-    bars = _bars([39000, 39100, 39200, 39300])
-
-    # Case A: +DI=22, -DI=25 — fails the +DI > -DI gate.
-    indicators_blocked = _ind(period=14, plus=22.0, minus=25.0)
-    ev_blocked = BarEvent(
-        symbol="MXF",
-        resolution="30m",
-        bucket=bars.index[-1].to_pydatetime(),
-        bars=bars,
-        indicators=indicators_blocked,
-    )
-    assert TradeStratV1(params=TradeStratV1Params()).on_bar(ev_blocked) is None
-
-    # Reset module-level state so case B starts fresh.
-    _STATE.clear()
-
-    # Case B: +DI=22, -DI=10 — passes both gates, entry fires.
-    indicators_ok = _ind(period=14, plus=22.0, minus=10.0)
-    ev_ok = BarEvent(
-        symbol="MXF",
-        resolution="30m",
-        bucket=bars.index[-1].to_pydatetime(),
-        bars=bars,
-        indicators=indicators_ok,
-    )
-    sig = TradeStratV1(params=TradeStratV1Params()).on_bar(ev_ok)
-    assert sig is not None
-    assert sig.side == "LONG"
-
-
 def test_open_position_payload_carries_entry_ind():
     strat = TradeStratV1(params=TradeStratV1Params())
     bars = _bars([39000, 39100, 39200, 39300])
@@ -318,7 +286,7 @@ def test_open_position_payload_carries_entry_ind():
 
 
 def test_close_position_payload_carries_exit_ind():
-    """Open a LONG, then push close +151 pts on the next 30m bar to TP."""
+    """Open a LONG, then push close +251 pts on the next 30m bar to TP."""
     strat = TradeStratV1(params=TradeStratV1Params())
 
     entry_bars = _bars([39000, 39100, 39200, 39300])
@@ -334,10 +302,10 @@ def test_close_position_payload_carries_exit_ind():
     assert open_sig is not None and open_sig.side == "LONG"
     entry_price = open_sig.price
 
-    # TP exit: close jumps +151 pts (above the new 150-pt TP threshold).
+    # TP exit: close jumps +251 pts (above the 250-pt TP threshold).
     # Reuse same indicator fixture (still passes the gates, but exit
     # check fires first inside _on_30m).
-    tp_close = entry_price + 151.0
+    tp_close = entry_price + 251.0
     exit_bars = _bars([39000, 39100, 39200, tp_close])
     exit_ev = BarEvent(
         symbol="MXF",
@@ -359,9 +327,9 @@ def test_close_position_payload_carries_exit_ind():
 # ─── V5.1 — new exit-rules suite ───────────────────────────────────────────
 
 
-def test_v1_tp_at_150():
-    """LONG opened at 17000; 30m bar close at 17151 → TP fires (>=150)."""
-    # Seed an explicit entry price of 17000 so the +151 → TP threshold
+def test_v1_tp_at_250():
+    """LONG opened at 17000; 30m bar close at 17251 → TP fires (>=250)."""
+    # Seed an explicit entry price of 17000 so the +251 → TP threshold
     # is unambiguous and independent of `_open_long`'s entry.
     st = mod._state_for(TradeStratV1.name, "MXF")
     st.position = _PositionState(
@@ -373,7 +341,7 @@ def test_v1_tp_at_150():
     # Use indicator fixture that does NOT trigger MACD-falling (rising).
     indicators = _ind(period=14, plus=25.0, minus=10.0,
                       macd_tail=(-0.1, 0.05, 0.12))
-    bars = _bars([17000, 17050, 17100, 17151])
+    bars = _bars([17000, 17050, 17100, 17251])
     ev = BarEvent(
         symbol="MXF",
         resolution="30m",
@@ -387,11 +355,11 @@ def test_v1_tp_at_150():
     assert sig is not None
     assert sig.side == "EXIT"
     assert sig.payload.get("exit_reason") == "TP"
-    assert sig.payload.get("pnl_points") >= 150.0
+    assert sig.payload.get("pnl_points") >= 250.0
 
 
-def test_v1_no_tp_below_150():
-    """LONG opened at 17000; 30m bar close at 17149 → no exit."""
+def test_v1_no_tp_below_250():
+    """LONG opened at 17000; 30m bar close at 17249 → no exit."""
     st = mod._state_for(TradeStratV1.name, "MXF")
     st.position = _PositionState(
         side="LONG",
@@ -402,7 +370,7 @@ def test_v1_no_tp_below_150():
     # MACD rising so the falling-MACD exit is not tripped either.
     indicators = _ind(period=14, plus=25.0, minus=10.0,
                       macd_tail=(-0.1, 0.05, 0.12))
-    bars = _bars([17000, 17050, 17100, 17149])
+    bars = _bars([17000, 17050, 17100, 17249])
     ev = BarEvent(
         symbol="MXF",
         resolution="30m",
@@ -552,7 +520,7 @@ def test_v1_3m_no_longer_dispatches():
 
 
 def test_v1_tp_priority_over_macd_falling():
-    """Bar that simultaneously hits TP (+151) AND falling MACD → TP wins."""
+    """Bar that simultaneously hits TP (+251) AND falling MACD → TP wins."""
     st = mod._state_for(TradeStratV1.name, "MXF")
     st.position = _PositionState(
         side="LONG",
@@ -560,8 +528,8 @@ def test_v1_tp_priority_over_macd_falling():
         entry_ts=datetime(2026, 4, 29, 5, 30, tzinfo=UTC),
     )
 
-    # close 17151 (+151 → TP) AND macd falling (0.6 → 0.4).
-    bars = _bars([17000, 17050, 17100, 17151])
+    # close 17251 (+251 → TP) AND macd falling (0.6 → 0.4).
+    bars = _bars([17000, 17050, 17100, 17251])
     indicators = _ind(
         period=14, plus=25.0, minus=10.0, macd_tail=(0.05, 0.6, 0.4)
     )

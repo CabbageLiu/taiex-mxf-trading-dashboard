@@ -2,7 +2,7 @@
 
 Per spec, the timeframes are strictly partitioned:
   * 5m bar close = entry decision only (KD>20, MACD-histogram rising-edge
-    above 0, +DI>21 AND +DI > -DI). NO TP/SL evaluation on the 5m path.
+    above 0, +DI>21). NO TP/SL evaluation on the 5m path.
   * 1m bar close = TP/SL evaluation only (pure price math against the
     open position). NO entry logic on the 1m series.
   * 3m bar close = exit assist via -DI >= 23 momentum flip.
@@ -23,11 +23,11 @@ Discipline:
     documented deviation from spec).
 
 Exits (any one):
-  * +70 pt take-profit  (1m close vs entry_price)
+  * +65 pt take-profit  (1m close vs entry_price)
   * -50 pt stop-loss    (1m close vs entry_price)
   * 3m -DI >= 23 (short-term momentum flip)
 
-R:R = 70 : 50 = 1.4:1 (tighter than v1).
+R:R = 65 : 50 = 1.3:1 (tighter than v1).
 
 Strategy instance is rebuilt per bar_close, so position / cooldown state
 lives in the module-level _STATE dict keyed by (strategy_name, symbol).
@@ -72,7 +72,7 @@ class TradeStratV2Params(BaseModel):
     di_short_threshold: float = 21.0
     exit_di_threshold: float = 23.0
 
-    tp_points: float = 70.0
+    tp_points: float = 65.0
     sl_points: float = 50.0
 
     cooldown_bars: int = Field(default=5, ge=0)
@@ -190,6 +190,18 @@ def _snapshot_ind(
 class TradeStratV2(Strategy):
     name: ClassVar[str] = "trade_strat_v2"
     display_name: ClassVar[str] = "5分鐘策略"
+    description: ClassVar[str] = (
+        "進場：5 分鐘 KD>20、MACD 直方圖三根上揚翻正、+DI>21；"
+        "出場：1 分鐘判斷 TP +65 / SL −50 點，3 分鐘 -DI≥23 提前平倉；"
+        "冷卻 5 根 5 分鐘 K。"
+    )
+    spec: ClassVar[dict[str, str]] = {
+        "週期": "5 分鐘進場 / 1 分鐘 TP·SL / 3 分鐘出場輔助 / 1 日趨勢顯示",
+        "進場": "5m KD>20、MACD 直方圖三根上揚翻正、+DI>21",
+        "出場": "1m 判斷 TP +65 / SL −50 點；3m -DI≥23 提前平倉",
+        "冷卻": "出場後 5 根 5 分鐘 K 線",
+        "備註": "5m 路徑只決定進場、不評估 TP/SL",
+    }
     resolutions: ClassVar[list[str]] = ["1m", "3m", "5m", "1d"]
     params_schema: ClassVar[type[BaseModel]] = TradeStratV2Params
     indicator_specs: ClassVar[dict[str, dict]] = {
@@ -259,14 +271,14 @@ class TradeStratV2(Strategy):
             (
                 k > p.kd_long_floor and d > p.kd_long_floor,
                 hist_val > 0,
-                plus_di > p.di_long_threshold and plus_di > minus_di,
+                plus_di > p.di_long_threshold,
             )
         )
         short_score = sum(
             (
                 k < p.kd_short_ceiling and d < p.kd_short_ceiling,
                 hist_val < 0,
-                minus_di > p.di_short_threshold and minus_di > plus_di,
+                minus_di > p.di_short_threshold,
             )
         )
         st.daily_confidence_long = long_score
@@ -308,7 +320,6 @@ class TradeStratV2(Strategy):
             and hist_curr > 0
             and macd_rising
             and plus_curr > p.di_long_threshold
-            and plus_curr > minus_curr
         )
         short_now = (
             p.enable_short
@@ -317,7 +328,6 @@ class TradeStratV2(Strategy):
             and hist_curr < 0
             and macd_falling
             and minus_curr > p.di_short_threshold
-            and minus_curr > plus_curr
         )
 
         # Per spec, V2 TP/SL runs on the 1m timeframe (`_check_tp_sl_minute`),

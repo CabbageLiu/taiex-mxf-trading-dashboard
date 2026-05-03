@@ -39,6 +39,11 @@ class EmptyParams(BaseModel):
 class Strategy(ABC):
     name: ClassVar[str]
     display_name: ClassVar[str | None] = None
+    description: ClassVar[str | None] = None
+    # Structured spec rendered as labeled rows on /analysis. Keys are zh-TW
+    # row labels (e.g. "進場", "出場", "風險", "冷卻"). When set, takes
+    # precedence over `description` for rendering.
+    spec: ClassVar[dict[str, str] | None] = None
     resolutions: ClassVar[list[str]] = ["1m"]
     params_schema: ClassVar[type[BaseModel]] = EmptyParams
     indicator_specs: ClassVar[dict[str, dict]] = {}

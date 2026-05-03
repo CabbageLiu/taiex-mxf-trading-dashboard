@@ -83,10 +83,10 @@ def _client() -> AsyncAnthropic:
 
     settings = get_settings()
     if settings.anthropic_api_key is None:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
+        raise RuntimeError("TAIEX_ANTHROPIC_API_KEY not set")
     api_key = settings.anthropic_api_key.get_secret_value()
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
+        raise RuntimeError("TAIEX_ANTHROPIC_API_KEY not set")
     _client_singleton = AsyncAnthropic(api_key=api_key)
     return _client_singleton
 
