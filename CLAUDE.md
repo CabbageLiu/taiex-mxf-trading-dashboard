@@ -110,6 +110,8 @@ Strategy declares `resolutions: list[str]` + optional `indicator_specs: dict[lab
 
 Strategies recreated per `bar_close` → state lives in module-level **`_STATE: dict[(name, symbol), _StratState]`**. Backtest engine snapshots + restores by introspection. **Convention is `_STATE`-named** — brittle to non-`_STATE` naming; document in any new strategy template.
 
+Strategies may optionally override `on_tick(TickEvent)` for intra-bar firing — `TickEvent` carries raw `tick.ts` and `tick.price` plus the latest closed bars + indicators. When overridden, `Signal.ts` carries tick precision (not bucket-aligned), and `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time. Default impl returns None so existing strategies are unaffected. Currently `strat_1k` is tick-driven (entries + exits); `strat_30k` / `strat_15k` / `trade_strat_v1` / `trade_strat_v2` remain bar_close.
+
 Position tracker pairs LONG/SHORT/EXIT/FLAT into trades. Same-direction = no-op; opposite-direction atomically closes + opens at same price/timestamp; same-id replays idempotent. **Strategies emitting only `LONG` never close a trade** → never contribute to win-rate or PnL. Truth table + worked example in `NOTES.md` §7.
 
 `Signal.payload` carries `entry_ind` (open) + `exit_ind` (close) — 8-key snapshot `{k, d, macd, signal, hist, plus_di, minus_di, adx}` rounded to 2 decimals, NaN → None. `_close` merges via `payload || jsonb_build_object('exit_ind', :exit_ind)` so existing `entry_ind` preserved.

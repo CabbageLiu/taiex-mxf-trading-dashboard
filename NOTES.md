@@ -810,13 +810,15 @@ Three single-resolution LONG-only strategies sharing the same 4-condition entry.
 |-----------|---------|-----------|-----|-----|-------|------------|
 | `strat_30k` | 30K策略 | 30m | 180 | 70 | 80 | — |
 | `strat_15k` | 15K策略 | 15m | 130 | 70 | 80 | — |
-| `strat_1k`  | 1K策略  | 1m  | 50  | 40 | 50  | DI_JUMP_1M: `-DI[-1] − -DI[-2] > 5` |
+| `strat_1k`  | 1K策略  | 1m  | 50  | 40 | 50  | DI_JUMP_1M: `-DI[-1] − -DI[-2] > 10` |
 
 **Trailing stop semantics:** `peak_pnl` tracks from entry, starts at 0. Exit fires when `current_pnl ≤ peak_pnl − trail_points`. SL handles the never-profitable case (SL < trail, so SL fires first). Peak update happens after all priority checks.
 
 **Exit priority:** TP → SL → TRAIL → (strat_1k only) DI_JUMP_1M → hold.
 
-**Cooldown:** 5 bars after EXIT (matches v1 / v2 default).
+**Cooldown:** 5 bars after EXIT for `strat_30k` / `strat_15k`. `strat_1k` uses time-based cooldown — 300 seconds (`cooldown_seconds` param) — so the gate works under tick-driven evaluation.
+
+**Fill convention:** `strat_30k` / `strat_15k` fire on bar close. `strat_1k` is tick-driven — entries fire the moment the four gates align intra-bar (`close>MA` evaluated against tick price), TP/SL/TRAIL fire the moment the tick price crosses the threshold. DI_JUMP_1M still requires a fresh closed bar (closed-bar indicator). `Signal.ts` carries the raw tick timestamp; `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time, not bucket boundaries.
 
 **Indicator specs:** `ma120 (period=120 SMA)`, `kd (9, 3, 3)`, `macd (12, 26, 9)`, `dmi (14)`. MA120 needs ~2.5 days of 30m bars to fully warm up; default `BACKFILL_ON_STARTUP_DAYS=7` covers it. The `entry_ind` / `exit_ind` payload snapshot keeps the existing 8-key shape (`{k, d, macd, signal, hist, plus_di, minus_di, adx}`) — MA120 is intentionally NOT in the snapshot.
 
@@ -1001,7 +1003,7 @@ Cross-cutting items not yet addressed. None of these block live operation; they 
 - No TW holiday calendar (backfill iterates Mon-Fri incl holidays — wasted API calls).
 - `/admin/backfill` synchronous (multi-month windows block).
 - No per-trade fees / slippage / position sizing in backtest engine.
-- Backtest fills at signal-bar close (no `next_bar_open` mode).
+- Backtest fills at signal-bar close (no `next_bar_open` mode). Live `strat_1k` is now tick-driven (entries + exits fire intra-bar); `strat_30k` / `strat_15k` / `trade_strat_v1` / `trade_strat_v2` still bar_close. Backtest does not replay raw ticks, so backtest results for `strat_1k` will diverge slightly from live (DI_JUMP_1M still bar-close in both modes; TP/SL/TRAIL fire at bar close in backtest vs tick price in live).
 - No auth / multi-user.
 - `_STATE` swap convention module-introspection-based; brittle to non-`_STATE` naming.
 - `wipe_and_rebackfill.py` has no env guard — destructive, dev container only.

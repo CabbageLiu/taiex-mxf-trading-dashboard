@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from app.strategies.base import BarEvent
+from app.strategies.base import BarEvent, TickEvent
 from app.strategies.examples import strat_1k as mod
 from app.strategies.examples.strat_1k import (
     _STATE,
@@ -125,6 +125,23 @@ def _event(
     )
 
 
+def _tick_event(
+    bars: pd.DataFrame,
+    inds: dict[str, pd.DataFrame],
+    *,
+    ts: datetime,
+    price: float,
+):
+    return TickEvent(
+        symbol=SYM,
+        resolution=RES,
+        ts=ts,
+        price=price,
+        bars=bars,
+        indicators=inds,
+    )
+
+
 # ─── 1. entry happy path ─────────────────────────────────────────────────
 
 
@@ -143,7 +160,7 @@ def test_entry_happy_path():
     assert sig.payload["tp_points"] == 50.0
     assert sig.payload["sl_points"] == 40.0
     assert sig.payload["trail_points"] == 50.0
-    assert sig.payload["di_jump_points"] == 5.0
+    assert sig.payload["di_jump_points"] == 10.0
 
 
 # ─── 2. MA fail ──────────────────────────────────────────────────────────
@@ -256,7 +273,9 @@ def test_tp_exit_at_threshold():
 
     st = _STATE[(TradeStrat1K.name, SYM)]
     assert st.position is None
-    assert st.cooldown_left == 5
+    # Cooldown is now seconds-based (default 300s); cooldown_until is anchored
+    # at the exit timestamp.
+    assert st.cooldown_until == bucket2 + timedelta(seconds=300)
     assert st.last_long_ready is False
 
 
@@ -324,7 +343,8 @@ def test_trail_exit_after_peak():
 # ─── 11. cooldown ────────────────────────────────────────────────────────
 
 
-def test_cooldown_blocks_reentry_for_5_bars():
+def test_cooldown_blocks_until_window_elapses():
+    """Cooldown is seconds-based: blocks while ts < cooldown_until, then re-arms."""
     st = mod._state_for(TradeStrat1K.name, SYM)
     st.position = _PositionState(
         side="LONG", entry_price=100.0,
@@ -334,27 +354,42 @@ def test_cooldown_blocks_reentry_for_5_bars():
 
     bars = _bars(5, last_close=50.0)  # pnl=−50 ≤ −sl=40 → SL.
     inds = _inds(bars)
-    sig_exit = TradeStrat1K(params=TradeStrat1KParams()).on_bar(_event(bars, inds))
+    exit_ev = _event(bars, inds)
+    sig_exit = TradeStrat1K(params=TradeStrat1KParams()).on_bar(exit_ev)
     assert sig_exit is not None and sig_exit.side == "EXIT"
-    assert st.cooldown_left == 5
+    expected_cooldown_until = exit_ev.bucket + timedelta(seconds=300)
+    assert st.cooldown_until == expected_cooldown_until
+    assert st.position is None
 
+    # Within the cooldown window: each bar suppressed; latch stays False.
+    base_bucket = exit_ev.bucket
     bars_e = _bars(5, last_close=200.0)
     inds_e = _inds(bars_e)
-    for expected_after in (4, 3, 2, 1, 0):
-        sig = TradeStrat1K(params=TradeStrat1KParams()).on_bar(_event(bars_e, inds_e))
+    for offset_seconds in (60, 120, 180, 240, 299):
+        ev = _event(bars_e, inds_e, bucket=base_bucket + timedelta(seconds=offset_seconds))
+        sig = TradeStrat1K(params=TradeStrat1KParams()).on_bar(ev)
         assert sig is None
-        assert st.cooldown_left == expected_after
+        assert st.cooldown_until == expected_cooldown_until
         assert st.position is None
+        assert st.last_long_ready is False
 
+    # Slip a non-firing event past the cooldown so cooldown_until clears + latch
+    # re-arms cleanly without firing on the same bar (gates fail this round).
+    release_bucket = base_bucket + timedelta(seconds=301)
     bars_low = _bars(5, last_close=200.0)
     inds_low = _inds(bars_low, hist_prev=0.5)
     sig_low = TradeStrat1K(params=TradeStrat1KParams()).on_bar(
-        _event(bars_low, inds_low)
+        _event(bars_low, inds_low, bucket=release_bucket)
     )
     assert sig_low is None
+    assert st.cooldown_until is None
     assert st.last_long_ready is False
 
-    sig_fire = TradeStrat1K(params=TradeStrat1KParams()).on_bar(_event(bars_e, inds_e))
+    # Next aligned bar after cooldown clears → entry fires.
+    fire_bucket = base_bucket + timedelta(seconds=360)
+    sig_fire = TradeStrat1K(params=TradeStrat1KParams()).on_bar(
+        _event(bars_e, inds_e, bucket=fire_bucket)
+    )
     assert sig_fire is not None
     assert sig_fire.side == "LONG"
 
@@ -363,7 +398,7 @@ def test_cooldown_blocks_reentry_for_5_bars():
 
 
 def test_di_jump_fires_when_minus_di_jumps_above_threshold():
-    """-DI 15 → 21 (jump=6 > 5) while position open → EXIT DI_JUMP_1M."""
+    """-DI 15 → 27 (jump=12 > 10) while position open → EXIT DI_JUMP_1M."""
     st = mod._state_for(TradeStrat1K.name, SYM)
     st.position = _PositionState(
         side="LONG", entry_price=100.0,
@@ -373,20 +408,21 @@ def test_di_jump_fires_when_minus_di_jumps_above_threshold():
 
     # Close above entry but below TP (pnl=10, tp=50). SL/TRAIL also clear.
     bars = _bars(5, last_close=110.0)
-    # -DI: prev=15, curr=21 → jump=6 > 5 → DI_JUMP fires.
-    inds = _inds(bars, minus_prev=15.0, minus_curr=21.0, plus_curr=28.0)
-    sig = TradeStrat1K(params=TradeStrat1KParams()).on_bar(_event(bars, inds))
+    # -DI: prev=15, curr=27 → jump=12 > 10 → DI_JUMP fires.
+    inds = _inds(bars, minus_prev=15.0, minus_curr=27.0, plus_curr=28.0)
+    exit_ev = _event(bars, inds)
+    sig = TradeStrat1K(params=TradeStrat1KParams()).on_bar(exit_ev)
 
     assert sig is not None
     assert sig.side == "EXIT"
     assert sig.payload["exit_reason"] == "DI_JUMP_1M"
     assert sig.payload["pnl_points"] == 10.0
     assert st.position is None
-    assert st.cooldown_left == 5
+    assert st.cooldown_until == exit_ev.bucket + timedelta(seconds=300)
 
 
 def test_di_jump_no_fire_at_exact_threshold():
-    """-DI jump = 5.0 exactly → no exit (strict `>`)."""
+    """-DI jump = 10.0 exactly → no exit (strict `>`)."""
     st = mod._state_for(TradeStrat1K.name, SYM)
     st.position = _PositionState(
         side="LONG", entry_price=100.0,
@@ -395,7 +431,7 @@ def test_di_jump_no_fire_at_exact_threshold():
     )
 
     bars = _bars(5, last_close=110.0)
-    inds = _inds(bars, minus_prev=15.0, minus_curr=20.0)  # jump=5.0 exactly
+    inds = _inds(bars, minus_prev=15.0, minus_curr=25.0)  # jump=10.0 exactly
     sig = TradeStrat1K(params=TradeStrat1KParams()).on_bar(_event(bars, inds))
 
     assert sig is None
@@ -403,7 +439,7 @@ def test_di_jump_no_fire_at_exact_threshold():
 
 
 def test_di_jump_no_fire_below_threshold():
-    """-DI jump = 4.9 → no exit."""
+    """-DI jump = 9.9 → no exit."""
     st = mod._state_for(TradeStrat1K.name, SYM)
     st.position = _PositionState(
         side="LONG", entry_price=100.0,
@@ -412,8 +448,87 @@ def test_di_jump_no_fire_below_threshold():
     )
 
     bars = _bars(5, last_close=110.0)
-    inds = _inds(bars, minus_prev=15.0, minus_curr=19.9)  # jump=4.9
+    inds = _inds(bars, minus_prev=15.0, minus_curr=24.9)  # jump=9.9
     sig = TradeStrat1K(params=TradeStrat1KParams()).on_bar(_event(bars, inds))
 
     assert sig is None
     assert st.position is not None
+
+
+# ─── 13. on_tick path (tick-driven entries / exits / cooldown) ──────────
+
+
+def test_on_tick_fires_entry_at_tick_ts():
+    """on_tick fires LONG when gates align; Signal.ts == raw tick ts (mid-bucket)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    inds = _inds(bars)
+    bucket = bars.index[-1].to_pydatetime()
+    tick_ts = bucket + timedelta(seconds=17)
+    # Tick price clears MA gate (MA curr = 100.5).
+    ev = _tick_event(bars, inds, ts=tick_ts, price=205.0)
+
+    sig = strat.on_tick(ev)
+    assert sig is not None
+    assert sig.side == "LONG"
+    assert sig.ts == tick_ts
+    assert sig.ts != bucket
+    assert sig.price == 205.0
+    assert sig.payload["fill_hint"] == "tick"
+
+
+def test_on_tick_fires_tp_at_tick_price():
+    """on_bar opens position; on_tick @ entry+tp_points+1 → EXIT TP at tick.ts."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    inds = _inds(bars)
+    sig_open = strat.on_bar(_event(bars, inds))
+    assert sig_open is not None and sig_open.side == "LONG"
+    entry_price = sig_open.price
+
+    tick_ts = bars.index[-1].to_pydatetime() + timedelta(seconds=23)
+    tick_price = entry_price + 50.0 + 1.0  # tp_points = 50
+    ev = _tick_event(bars, inds, ts=tick_ts, price=tick_price)
+    sig = strat.on_tick(ev)
+
+    assert sig is not None
+    assert sig.side == "EXIT"
+    assert sig.payload["exit_reason"] == "TP"
+    assert sig.ts == tick_ts
+    assert sig.payload["fill_hint"] == "tick"
+
+    st = _STATE[(TradeStrat1K.name, SYM)]
+    assert st.position is None
+    assert st.cooldown_until == tick_ts + timedelta(seconds=300)
+
+
+def test_on_tick_cooldown_blocks_then_releases():
+    """After exit at T: tick at T+10s blocked; tick at T+301s with gates fires."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    inds = _inds(bars)
+
+    # Open + immediate TP exit at bucket close.
+    sig_open = strat.on_bar(_event(bars, inds))
+    assert sig_open is not None
+    bucket = bars.index[-1].to_pydatetime()
+    exit_tick_ts = bucket + timedelta(seconds=5)
+    ev_exit = _tick_event(
+        bars, inds, ts=exit_tick_ts, price=sig_open.price + 51.0
+    )
+    sig_exit = strat.on_tick(ev_exit)
+    assert sig_exit is not None and sig_exit.side == "EXIT"
+
+    # Tick during cooldown window → suppressed.
+    early_ts = exit_tick_ts + timedelta(seconds=10)
+    ev_early = _tick_event(bars, inds, ts=early_ts, price=205.0)
+    sig_early = strat.on_tick(ev_early)
+    assert sig_early is None
+
+    # Tick after cooldown clears with gates aligned → entry fires.
+    late_ts = exit_tick_ts + timedelta(seconds=301)
+    ev_late = _tick_event(bars, inds, ts=late_ts, price=205.0)
+    sig_late = strat.on_tick(ev_late)
+    assert sig_late is not None
+    assert sig_late.side == "LONG"
+    assert sig_late.ts == late_ts
