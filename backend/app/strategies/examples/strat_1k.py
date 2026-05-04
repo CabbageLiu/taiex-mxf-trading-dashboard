@@ -6,12 +6,15 @@ tick price crosses the threshold; DI_JUMP_1M still evaluates against
 closed-bar -DI deltas. Both ``on_bar`` (back-compat / backtest path) and
 ``on_tick`` route through the same ``_evaluate`` helper.
 
-Entry gates (all four must hold; LONG only):
+Entry gates (all six must hold; LONG only):
+  0. Entry window: Asia/Taipei time inside [09:15, 12:15) ∪ [15:00, 24:00).
   1. ``price > MA120[-1]`` AND MA120 rising (``ma[-1] > ma[-2]``).
-  2. KD: ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 80``.
-  3. MACD histogram: ``hist[-2] < 0`` AND ``hist[-1] > 0``.
+  2. KD: ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 75``.
+  3. MACD histogram (1m): ``hist[-2] < 0`` AND ``hist[-1] > 0``.
   4. DMI: ``plus[-2] > minus[-2]`` AND ``plus[-1] > minus[-1]`` AND
      ``minus[-1] < minus[-2]``.
+  5. 5m MACD confirmation: most-recent 5m ``hist > 0`` AND last 5m bar is
+     no more than 15 minutes old vs the dispatch ``ts`` (staleness guard).
 
 Exit priority (per tick or bar close, first match wins):
   TP          — pnl ≥ 50
@@ -19,9 +22,16 @@ Exit priority (per tick or bar close, first match wins):
   TRAIL       — pnl ≤ peak_pnl − 50 (peak tracked from entry, starts at 0)
   DI_JUMP_1M  — minus_di[-1] − minus_di[-2] > 10 (strict ``>``, closed bars)
 
+Exits ignore the entry-window gate AND the 5m MACD gate — open positions
+must remain closeable any time, including the 12:15–15:00 break and the
+overnight 00:00–05:00 stretch.
+
 Cooldown: 300 seconds after EXIT (time-based, not bar-counted). While
 ``ts < cooldown_until`` evaluation returns None and resets
 ``last_long_ready`` so the rising-edge latch re-arms once cooldown clears.
+The window gate behaves the same way: when it blocks, the latch resets so
+the first aligned tick after the window reopens fires cleanly as a fresh
+rising edge.
 
 Fill convention: tick-driven (not bar close). ``Signal.ts`` carries the
 raw tick timestamp, so ``signals.ts`` / ``trades.entry_ts`` /
@@ -38,7 +48,8 @@ from typing import ClassVar
 import pandas as pd
 from pydantic import BaseModel, Field
 
-from app.strategies.base import BarEvent, Signal, Strategy, TickEvent
+from app.config import get_settings
+from app.strategies.base import BarEvent, Signal, Strategy, TickEvent, in_entry_window
 from app.strategies.registry import register_strategy
 
 
@@ -48,7 +59,7 @@ class TradeStrat1KParams(BaseModel):
     kd_period: int = 9
     kd_k_smooth: int = 3
     kd_d_smooth: int = 3
-    kd_long_floor: float = 80.0
+    kd_long_floor: float = 75.0
 
     macd_fast: int = 12
     macd_slow: int = 26
@@ -180,30 +191,41 @@ class TradeStrat1K(Strategy):
     name: ClassVar[str] = "strat_1k"
     display_name: ClassVar[str] = "1K策略"
     description: ClassVar[str] = (
-        "1 分鐘多單策略；進場：close>MA120 且 MA120 向上、KD 連兩 KS>DS、"
-        "MACD 直方翻正、+DI>-DI 且 -DI 縮；出場：TP 50 / SL −40 / 移動停損 50 / "
-        "1 分鐘 -DI 跳升 (>10 點)。"
+        "1 分鐘多單策略；開倉時段 09:15-12:15 / 15:00-24:00；進場："
+        "close>MA120 且 MA120 向上、KD 連兩 KS>DS 且首根 KS<75、"
+        "MACD 直方翻正、+DI>-DI 且 -DI 縮、5m MACD>0；"
+        "出場：TP 50 / SL −40 / 移動停損 50 / 1 分鐘 -DI 跳升 (>10 點)。"
     )
     spec: ClassVar[dict[str, str]] = {
         "週期": "1 分鐘",
+        "開倉時段": "09:15-12:15 / 15:00-24:00 (Asia/Taipei)",
         "進場": (
-            "close>MA120 且 MA120 向上；KD 連兩根 KS>DS 且第一根 KS<80；"
-            "MACD 直方圖由負翻正；+DI>-DI 連兩根且第二根 -DI 縮"
+            "close>MA120 且 MA120 向上；KD 連兩根 KS>DS 且第一根 KS<75；"
+            "MACD 直方圖由負翻正；+DI>-DI 連兩根且第二根 -DI 縮；"
+            "5 分鐘 MACD 直方圖>0"
         ),
         "出場": (
             "獲利 50 點 / 虧損 40 點 / 移動停損 50 點 / "
             "1 分鐘 -DI 跳升 (>10 點)"
         ),
         "冷卻": "出場後 5 分鐘 (300 秒)",
-        "備註": "僅多單；訊號逐筆即時觸發",
+        "備註": "僅多單；訊號逐筆即時觸發；出場不受開倉時段與 5m MACD 限制",
     }
     resolutions: ClassVar[list[str]] = ["1m"]
+    tick_resolutions: ClassVar[list[str]] = ["1m"]
     params_schema: ClassVar[type[BaseModel]] = TradeStrat1KParams
     indicator_specs: ClassVar[dict[str, dict]] = {
         "ma120": {"kind": "ma", "params": {"period": 120, "kind": "sma"}},
         "kd": {"kind": "kd", "params": {"period": 9, "k_smooth": 3, "d_smooth": 3}},
         "macd": {"kind": "macd", "params": {"fast": 12, "slow": 26, "signal": 9}},
         "dmi": {"kind": "dmi", "params": {"period": 14}},
+    }
+    aux_indicator_specs: ClassVar[dict[str, dict]] = {
+        "macd_5m": {
+            "kind": "macd",
+            "params": {"fast": 12, "slow": 26, "signal": 9},
+            "resolution": "5m",
+        },
     }
 
     @classmethod
@@ -357,6 +379,39 @@ class TradeStrat1K(Strategy):
         symbol: str,
         resolution: str,
     ) -> Signal | None:
+        # 0a. Entry-window gate. When closed, reset the rising-edge latch so
+        # that pre-aligned gates fire as a fresh rising edge on the first
+        # tick after the window reopens.
+        if not in_entry_window(ts, get_settings().tz):
+            st.last_long_ready = False
+            return None
+
+        # 0b. 5m MACD confirmation gate (entry-only; exits ignore it).
+        # Cold start (no aux bars yet) → block. Staleness guard: 5m bars
+        # should be < 3 × 5m delta = 15 minutes old vs the dispatch ts
+        # (matches the ingest watchdog `>= 3 * delta` retire threshold,
+        # so we treat exactly-15-min as stale, same as the watchdog).
+        # Latch reset on every block path so a recovering 5m gate is
+        # detected as a fresh rising edge, not a phantom one carried over
+        # from a previous tick where the latch was set True before the
+        # 5m gate started failing.
+        macd_5m = indicators.get("macd_5m")
+        if macd_5m is None or len(macd_5m) == 0:
+            st.last_long_ready = False
+            return None
+        last_5m_ts = macd_5m.index[-1]
+        if isinstance(last_5m_ts, pd.Timestamp):
+            last_5m_ts = last_5m_ts.to_pydatetime()
+        if last_5m_ts.tzinfo is None:
+            last_5m_ts = last_5m_ts.replace(tzinfo=ts.tzinfo)
+        if ts - last_5m_ts >= timedelta(minutes=15):
+            st.last_long_ready = False
+            return None
+        hist_5m = _scalar(macd_5m["hist"], idx=-1)
+        if hist_5m is None or hist_5m <= 0:
+            st.last_long_ready = False
+            return None
+
         ma = indicators.get("ma120")
         kd = indicators.get("kd")
         macd = indicators.get("macd")

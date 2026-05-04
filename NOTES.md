@@ -798,27 +798,31 @@ renders the conditions side-by-side.
 
 ### 11.2 strat_30k / strat_15k / strat_1k (MA120 trend strategies)
 
-Three single-resolution LONG-only strategies sharing the same 4-condition entry. Differ in timeframe and exit thresholds.
+Three LONG-only strategies sharing the same 6-gate entry. Differ in primary timeframe and exit thresholds. All three are **tick-driven on their primary resolution** (entries fire intra-bar; price-based exits fire the moment the tick crosses the threshold). Spec authority: `three_strats.md` at repo root.
 
-**Entry (all three; emit only on rising-edge transition false→true):**
-1. close > MA120 AND MA120 rising (`ma[-1] > ma[-2]`)
-2. KD: `k[-2] > d[-2]` AND `k[-1] > d[-1]` AND `k[-2] < 80`
-3. MACD histogram: `hist[-2] < 0` AND `hist[-1] > 0`
-4. DMI: `+DI[-2] > -DI[-2]` AND `+DI[-1] > -DI[-1]` AND `-DI[-1] < -DI[-2]`
+**Entry — all six gates must pass on a rising-edge transition false→true:**
+1. **Window gate** — Taipei time falls in `[09:15, 12:15) ∪ [15:00, 24:00)`. Half-open intervals; strict midnight cutoff (overnight 00:00–05:00 blocked even though TAIFEX continues).
+2. **5m MACD confirmation** — `ev.indicators["macd_5m"]` is loaded by the framework via `aux_indicator_specs` on every dispatch. Last `hist > 0`. Staleness guard: `ts − macd_5m.index[-1] ≤ 15min` (otherwise treat as cold).
+3. close > MA120 AND MA120 rising (`ma[-1] > ma[-2]`). Tick price substitutes `close[-1]` so the gate is intra-bar.
+4. KD: `k[-2] > d[-2]` AND `k[-1] > d[-1]` AND `k[-2] < 75` (was 80 pre-V6.1).
+5. MACD histogram (primary resolution): `hist[-2] < 0` AND `hist[-1] > 0`.
+6. DMI (primary resolution): `+DI[-2] > -DI[-2]` AND `+DI[-1] > -DI[-1]` AND `-DI[-1] < -DI[-2]`.
 
-| canonical | display | resolution | TP | SL | Trail | Extra exit |
-|-----------|---------|-----------|-----|-----|-------|------------|
-| `strat_30k` | 30K策略 | 30m | 180 | 70 | 80 | — |
-| `strat_15k` | 15K策略 | 15m | 130 | 70 | 80 | — |
-| `strat_1k`  | 1K策略  | 1m  | 50  | 40 | 50  | DI_JUMP_1M: `-DI[-1] − -DI[-2] > 10` |
+| canonical | display | primary | TP | SL | Trail | Cooldown | Extra exit |
+|-----------|---------|---------|-----|-----|-------|----------|------------|
+| `strat_30k` | 30K策略 | 30m | 180 | 70 | 80 | 9000s (5×30m) | — |
+| `strat_15k` | 15K策略 | 15m | 130 | 70 | 80 | 4500s (5×15m) | — |
+| `strat_1k`  | 1K策略  | 1m  | 50  | 40 | 50  | 300s (5×1m)   | DI_JUMP_1M: `-DI[-1] − -DI[-2] > 10` (closed bars) |
+
+All three declare `tick_resolutions: ["<primary>"]` and `aux_indicator_specs: {"macd_5m": {kind: "macd", params: {12, 26, 9}, resolution: "5m"}}`.
 
 **Trailing stop semantics:** `peak_pnl` tracks from entry, starts at 0. Exit fires when `current_pnl ≤ peak_pnl − trail_points`. SL handles the never-profitable case (SL < trail, so SL fires first). Peak update happens after all priority checks.
 
-**Exit priority:** TP → SL → TRAIL → (strat_1k only) DI_JUMP_1M → hold.
+**Exit priority:** TP → SL → TRAIL → (strat_1k only) DI_JUMP_1M → hold. **Exits ignore the window gate AND the 5m MACD gate** so an open position is always closeable across the 12:15–15:00 closed gap and across 5m-MACD reversals.
 
-**Cooldown:** 5 bars after EXIT for `strat_30k` / `strat_15k`. `strat_1k` uses time-based cooldown — 300 seconds (`cooldown_seconds` param) — so the gate works under tick-driven evaluation.
+**Cooldown:** time-based (`cooldown_until: datetime | None`). After exit, blocks new entries until `ts ≥ cooldown_until`; resets `last_long_ready` so the rising-edge latch re-arms cleanly when cooldown expires (and same for the window-blocked path — closed window resets the latch so a window reopen with pre-aligned gates fires fresh).
 
-**Fill convention:** `strat_30k` / `strat_15k` fire on bar close. `strat_1k` is tick-driven — entries fire the moment the four gates align intra-bar (`close>MA` evaluated against tick price), TP/SL/TRAIL fire the moment the tick price crosses the threshold. DI_JUMP_1M still requires a fresh closed bar (closed-bar indicator). `Signal.ts` carries the raw tick timestamp; `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time, not bucket boundaries.
+**Fill convention:** tick-driven. `Signal.ts` carries the raw tick timestamp; `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time, not bucket boundaries. DI_JUMP_1M can only fire on the first tick of a new 1m bucket (it depends on the closed-bar -DI delta).
 
 **Indicator specs:** `ma120 (period=120 SMA)`, `kd (9, 3, 3)`, `macd (12, 26, 9)`, `dmi (14)`. MA120 needs ~2.5 days of 30m bars to fully warm up; default `BACKFILL_ON_STARTUP_DAYS=7` covers it. The `entry_ind` / `exit_ind` payload snapshot keeps the existing 8-key shape (`{k, d, macd, signal, hist, plus_di, minus_di, adx}`) — MA120 is intentionally NOT in the snapshot.
 

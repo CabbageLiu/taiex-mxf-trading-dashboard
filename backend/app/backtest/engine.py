@@ -311,6 +311,15 @@ def build_equity_curve(trades: list[BacktestTrade]) -> list[dict[str, Any]]:
 def _build_indicators(
     cls: type[Strategy], bars_per_res: dict[str, pd.DataFrame], symbol: str
 ) -> dict[str, dict[str, pd.DataFrame]]:
+    """Per-resolution indicator dataframes for the schedule loop.
+
+    Returns a nested dict keyed first on the resolution that owns the
+    indicator (the resolution whose bars feed it). Primary indicators
+    are computed at every declared resolution; aux indicators are
+    computed at their declared `aux_indicator_specs[*].resolution` and
+    keyed there so the schedule loop's per-resolution slice picks them
+    up at the correct timestamps.
+    """
     out: dict[str, dict[str, pd.DataFrame]] = {res: {} for res in bars_per_res}
     for res, bars in bars_per_res.items():
         if bars.empty:
@@ -319,12 +328,38 @@ def _build_indicators(
             kind = spec["kind"]
             params = spec.get("params", {})
             out[res][label] = indicator_cache.get(symbol, res, kind, params, bars)
+    for label, spec in cls.aux_indicator_specs.items():
+        aux_res = spec["resolution"]
+        aux_bars = bars_per_res.get(aux_res)
+        if aux_bars is None or aux_bars.empty:
+            continue
+        kind = spec["kind"]
+        params = spec.get("params", {})
+        out.setdefault(aux_res, {})[label] = indicator_cache.get(
+            symbol, aux_res, kind, params, aux_bars
+        )
     return out
 
 
-def _schedule(bars_per_res: dict[str, pd.DataFrame]) -> list[tuple[pd.Timestamp, str]]:
+def _schedule(
+    bars_per_res: dict[str, pd.DataFrame],
+    primary_resolutions: list[str] | None = None,
+) -> list[tuple[pd.Timestamp, str]]:
+    """Build the (ts, resolution) tick list driving the backtest replay.
+
+    `primary_resolutions` (when given) restricts the schedule to those
+    resolutions — auxiliary-only resolutions (loaded for indicator
+    computation but not declared in `cls.resolutions`) MUST NOT trigger
+    on_bar dispatch, otherwise the strategy's primary entry/exit logic
+    fires at every aux bucket boundary.
+    """
+    primary = (
+        set(primary_resolutions) if primary_resolutions is not None else None
+    )
     items: list[tuple[pd.Timestamp, str]] = []
     for res, bars in bars_per_res.items():
+        if primary is not None and res not in primary:
+            continue
         for ts in bars.index:
             items.append((ts, res))
     items.sort(key=lambda p: (p[0], _RES_RANK.get(p[1], 99)))
@@ -349,6 +384,15 @@ async def _gather_inputs(
     for res in cls.resolutions:
         df = await load_bars(symbol, res, start=start, end=end, limit=None)
         bars_per_res[res] = df
+    # Aux indicator resolutions (e.g. 5m MACD on a 30m strategy). Load bars
+    # for them too so _build_indicators can compute them and the schedule
+    # loop can supply ev.indicators[label] sliced up to the current ts.
+    for label, spec in cls.aux_indicator_specs.items():
+        aux_res = spec["resolution"]
+        if aux_res in bars_per_res:
+            continue  # already loaded as a primary resolution
+        df = await load_bars(symbol, aux_res, start=start, end=end, limit=None)
+        bars_per_res[aux_res] = df
     return _RunInputs(
         cls=cls,
         params=cls.params_schema(),  # placeholder; caller overwrites
@@ -420,8 +464,10 @@ async def run_backtest(
         return empty
 
     inds_per_res = _build_indicators(cls, bars_per_res, sym)
-    schedule = _schedule(bars_per_res)
-    bar_indexes = {r: df.index for r, df in bars_per_res.items()}
+    schedule = _schedule(bars_per_res, primary_resolutions=list(cls.resolutions))
+    bar_indexes = {
+        r: df.index for r, df in bars_per_res.items() if r in cls.resolutions
+    }
 
     saved = _swap_state(strategy_name, sym, cls)
     signals: list[Signal] = []
@@ -431,6 +477,13 @@ async def run_backtest(
             inds_slice = {
                 k: df.loc[:ts] for k, df in inds_per_res.get(res, {}).items()
             }
+            # Merge aux indicators sliced from their owning resolution so the
+            # strategy sees ev.indicators[label] just like the live path.
+            for label, spec in cls.aux_indicator_specs.items():
+                aux_res = spec["resolution"]
+                aux_inds = inds_per_res.get(aux_res, {})
+                if label in aux_inds:
+                    inds_slice[label] = aux_inds[label].loc[:ts]
             ev = BarEvent(
                 symbol=sym,
                 resolution=res,

@@ -110,7 +110,14 @@ Strategy declares `resolutions: list[str]` + optional `indicator_specs: dict[lab
 
 Strategies recreated per `bar_close` → state lives in module-level **`_STATE: dict[(name, symbol), _StratState]`**. Backtest engine snapshots + restores by introspection. **Convention is `_STATE`-named** — brittle to non-`_STATE` naming; document in any new strategy template.
 
-Strategies may optionally override `on_tick(TickEvent)` for intra-bar firing — `TickEvent` carries raw `tick.ts` and `tick.price` plus the latest closed bars + indicators. When overridden, `Signal.ts` carries tick precision (not bucket-aligned), and `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time. Default impl returns None so existing strategies are unaffected. Currently `strat_1k` is tick-driven (entries + exits); `strat_30k` / `strat_15k` / `trade_strat_v1` / `trade_strat_v2` remain bar_close.
+Strategies may optionally override `on_tick(TickEvent)` for intra-bar firing. Two ClassVars control routing:
+
+- `tick_resolutions: list[str]` — subset of `resolutions` that route to `on_tick` (raw `bar_update`, ~5s cadence) instead of `on_bar` (closed-bucket boundaries). Default `[]` preserves bar_close behaviour. The `_on_bar_close` filter excludes any resolution in this list, so a strategy that opts in cannot double-fire from both paths on a boundary tick.
+- `aux_indicator_specs: dict[label, {kind, params, resolution}]` — auxiliary cross-resolution indicators. Framework loads bars + computes indicator inline on every dispatch, merging into `ev.indicators` under `label`. Avoids cross-task races / cold-start gaps / staleness windows that a strategy-side cache would expose.
+
+When `on_tick` is overridden, `Signal.ts` carries tick precision (not bucket-aligned), and `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time. All three live strategies (`strat_30k`, `strat_15k`, `strat_1k`) are now tick-driven on their primary resolution and use `aux_indicator_specs` to read 5m MACD as an entry confirmation gate. `trade_strat_v1` / `trade_strat_v2` remain bar_close.
+
+`in_entry_window(ts, tz)` (in `app.strategies.base`) returns True iff Taipei-local time falls in `[09:15, 12:15) ∪ [15:00, 24:00)` — half-open intervals, strict midnight cutoff (overnight 00:00–05:00 NOT in the window even though TAIFEX night session continues there). All three live strategies gate entries on this window; **exits run anytime** so an open position is always closeable across the 12:15–15:00 closed gap.
 
 Position tracker pairs LONG/SHORT/EXIT/FLAT into trades. Same-direction = no-op; opposite-direction atomically closes + opens at same price/timestamp; same-id replays idempotent. **Strategies emitting only `LONG` never close a trade** → never contribute to win-rate or PnL. Truth table + worked example in `NOTES.md` §7.
 

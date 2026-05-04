@@ -20,6 +20,10 @@ RES = "1m"
 FREQ = "1min"
 SYM = "MXF"
 
+# Anchor bar end at 2026-05-01 03:00 UTC = 11:00 Taipei (inside the
+# 09:15-12:15 entry window) so default fixtures fire entries cleanly.
+DEFAULT_BAR_END = datetime(2026, 5, 1, 3, 0, tzinfo=UTC)
+
 
 @pytest.fixture(autouse=True)
 def reset_state():
@@ -28,10 +32,30 @@ def reset_state():
     _STATE.clear()
 
 
-def _bars(n: int, *, last_close: float, slope: float = 0.5) -> pd.DataFrame:
-    idx = pd.date_range(
-        end=datetime(2026, 5, 1, tzinfo=UTC), periods=n, freq=FREQ
+def _macd_5m_df(
+    *, end: datetime, hist_curr: float = 1.0, n: int = 30
+) -> pd.DataFrame:
+    """Build a 5m MACD DataFrame whose last bar lands at `end - 1 * 5min` <
+    `end` ≤ `last_5m_ts + 5min`, satisfying the 15-minute staleness guard
+    for any tick within the next 5 minutes after the bucket close.
+    """
+    idx = pd.date_range(end=end, periods=n, freq="5min", tz="UTC")
+    macd = np.full(n, hist_curr * 0.5, dtype=float)
+    signal = np.zeros(n, dtype=float)
+    hist = np.full(n, hist_curr, dtype=float)
+    return pd.DataFrame(
+        {"macd": macd, "signal": signal, "hist": hist}, index=idx
     )
+
+
+def _bars(
+    n: int,
+    *,
+    last_close: float,
+    slope: float = 0.5,
+    end: datetime | None = None,
+) -> pd.DataFrame:
+    idx = pd.date_range(end=end or DEFAULT_BAR_END, periods=n, freq=FREQ)
     closes = np.linspace(last_close - slope * (n - 1), last_close, n)
     return pd.DataFrame(
         {
@@ -50,7 +74,7 @@ def _inds(
     *,
     ma_prev: float = 100.0,
     ma_curr: float = 100.5,
-    k_prev: float = 75.0,
+    k_prev: float = 70.0,
     d_prev: float = 50.0,
     k_curr: float = 78.0,
     d_curr: float = 60.0,
@@ -63,7 +87,17 @@ def _inds(
     macd_curr: float = 1.0,
     signal_curr: float = 0.0,
     adx_curr: float = 25.0,
+    macd_5m: pd.DataFrame | None | str = "default",
+    macd_5m_hist: float = 1.0,
 ) -> dict[str, pd.DataFrame]:
+    """Build a primary-resolution indicator dict for `bars`.
+
+    `macd_5m` controls the auxiliary 5m MACD frame:
+      - "default" (sentinel) → fresh frame anchored at the last bar's
+        timestamp so the staleness guard passes.
+      - None → omit the key entirely (cold-start scenario).
+      - explicit DataFrame → caller-supplied frame.
+    """
     n = len(bars)
     idx = bars.index
 
@@ -96,7 +130,7 @@ def _inds(
     macd_arr = np.full(n, macd_curr, dtype=float)
     signal_arr = np.full(n, signal_curr, dtype=float)
 
-    return {
+    out: dict[str, pd.DataFrame] = {
         "ma120": pd.DataFrame({"ma": ma}, index=idx),
         "kd": pd.DataFrame({"k": k, "d": d}, index=idx),
         "macd": pd.DataFrame(
@@ -111,6 +145,13 @@ def _inds(
             index=idx,
         ),
     }
+    if isinstance(macd_5m, str) and macd_5m == "default":
+        last_ts = bars.index[-1].to_pydatetime()
+        out["macd_5m"] = _macd_5m_df(end=last_ts, hist_curr=macd_5m_hist)
+    elif isinstance(macd_5m, pd.DataFrame):
+        out["macd_5m"] = macd_5m
+    # else: macd_5m is None → omit (cold-start path)
+    return out
 
 
 def _event(
@@ -191,7 +232,7 @@ def test_no_entry_when_ma_flat():
 def test_no_entry_when_first_k_at_floor():
     strat = TradeStrat1K(params=TradeStrat1KParams())
     bars = _bars(5, last_close=200.0)
-    inds = _inds(bars, k_prev=80.0)
+    inds = _inds(bars, k_prev=75.0)
     sig = strat.on_bar(_event(bars, inds))
     assert sig is None
 
@@ -199,7 +240,7 @@ def test_no_entry_when_first_k_at_floor():
 def test_entry_at_kd_boundary_below_floor():
     strat = TradeStrat1K(params=TradeStrat1KParams())
     bars = _bars(5, last_close=200.0)
-    inds = _inds(bars, k_prev=79.99)
+    inds = _inds(bars, k_prev=74.99)
     sig = strat.on_bar(_event(bars, inds))
     assert sig is not None
     assert sig.side == "LONG"
@@ -532,3 +573,226 @@ def test_on_tick_cooldown_blocks_then_releases():
     assert sig_late is not None
     assert sig_late.side == "LONG"
     assert sig_late.ts == late_ts
+
+
+# ─── 14. 5m MACD gate (entry-only) ───────────────────────────────────────
+
+
+def test_entry_blocked_when_macd_5m_missing():
+    """Cold start: aux 5m frame absent → entry blocked even with all primary
+    gates aligned."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    inds = _inds(bars, macd_5m=None)
+    assert "macd_5m" not in inds
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_entry_blocked_when_macd_5m_empty():
+    """Empty aux frame → entry blocked (defensive cold-start path)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    empty = pd.DataFrame(
+        {"macd": [], "signal": [], "hist": []},
+        index=pd.DatetimeIndex([], tz="UTC"),
+    )
+    inds = _inds(bars, macd_5m=empty)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_entry_blocked_when_macd_5m_negative():
+    """Aux 5m hist[-1] = -0.5 → entry blocked."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    inds = _inds(bars, macd_5m_hist=-0.5)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_entry_blocked_when_macd_5m_zero():
+    """Aux 5m hist[-1] = 0.0 → entry blocked (strict `> 0`)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    inds = _inds(bars, macd_5m_hist=0.0)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_entry_fires_when_macd_5m_positive():
+    """Aux 5m hist[-1] = 0.5 with primary gates aligned → entry fires."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    inds = _inds(bars, macd_5m_hist=0.5)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is not None
+    assert sig.side == "LONG"
+
+
+def test_entry_blocked_when_macd_5m_stale():
+    """5m frame anchored 20 minutes before ts → staleness guard rejects."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    bucket = bars.index[-1].to_pydatetime()
+    stale_5m = _macd_5m_df(end=bucket - timedelta(minutes=20), hist_curr=1.0)
+    inds = _inds(bars, macd_5m=stale_5m)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_exit_ignores_macd_5m():
+    """Open position → tick where 5m hist turns negative AND TP hit →
+    EXIT TP still fires (5m gate is entry-only)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars(5, last_close=200.0)
+    inds_open = _inds(bars)
+    sig_open = strat.on_bar(_event(bars, inds_open))
+    assert sig_open is not None and sig_open.side == "LONG"
+
+    # Now flip 5m MACD negative + send a tick at TP+1.
+    bucket = bars.index[-1].to_pydatetime()
+    tick_ts = bucket + timedelta(seconds=10)
+    inds_exit = _inds(bars, macd_5m_hist=-0.5)
+    ev_tick = _tick_event(
+        bars, inds_exit, ts=tick_ts, price=sig_open.price + 51.0
+    )
+    sig_exit = strat.on_tick(ev_tick)
+    assert sig_exit is not None
+    assert sig_exit.side == "EXIT"
+    assert sig_exit.payload["exit_reason"] == "TP"
+
+
+# ─── 15. Entry-window gate ────────────────────────────────────────────────
+
+
+def _bars_at_taipei(taipei_hms: tuple[int, int, int]) -> pd.DataFrame:
+    """Build bars whose last index lands at the requested Taipei wall time
+    (Asia/Taipei is UTC+8 with no DST, so we subtract 8h to land in UTC)."""
+    h, m, s = taipei_hms
+    end_utc = datetime(2026, 5, 1, h, m, s, tzinfo=UTC) - timedelta(hours=8)
+    return _bars(5, last_close=200.0, end=end_utc)
+
+
+def test_entry_blocked_at_13_00():
+    """13:00 Taipei (between 12:15 and 15:00) → entry blocked."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars_at_taipei((13, 0, 0))
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_entry_allowed_at_11_00():
+    """11:00 Taipei → entry allowed."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars_at_taipei((11, 0, 0))
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is not None
+    assert sig.side == "LONG"
+
+
+def test_entry_allowed_at_16_00():
+    """16:00 Taipei → entry allowed."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars_at_taipei((16, 0, 0))
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is not None
+    assert sig.side == "LONG"
+
+
+def test_entry_blocked_at_03_00():
+    """03:00 Taipei (post-midnight overnight) → entry blocked per strict
+    midnight cutoff."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars_at_taipei((3, 0, 0))
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_entry_window_boundary_open():
+    """09:15:00 Taipei → entry allowed (inclusive lower bound)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars_at_taipei((9, 15, 0))
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is not None
+    assert sig.side == "LONG"
+
+
+def test_entry_window_boundary_close_exclusive():
+    """12:15:00 Taipei → entry blocked (exclusive upper bound)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars_at_taipei((12, 15, 0))
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_entry_window_boundary_15_00():
+    """15:00:00 Taipei → entry allowed (inclusive lower bound of night)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars_at_taipei((15, 0, 0))
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is not None
+    assert sig.side == "LONG"
+
+
+def test_exit_runs_outside_window():
+    """Open position via on_bar at 11:00 Taipei. Subsequent tick at 13:00
+    Taipei with TP hit → EXIT fires (window gate is entry-only)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+    bars = _bars_at_taipei((11, 0, 0))
+    inds_open = _inds(bars)
+    sig_open = strat.on_bar(_event(bars, inds_open))
+    assert sig_open is not None and sig_open.side == "LONG"
+
+    tick_ts = datetime(2026, 5, 1, 13, 0, 0, tzinfo=UTC) - timedelta(hours=8)
+    inds_exit = _inds(bars)
+    ev_tick = _tick_event(
+        bars, inds_exit, ts=tick_ts, price=sig_open.price + 51.0
+    )
+    sig_exit = strat.on_tick(ev_tick)
+    assert sig_exit is not None
+    assert sig_exit.side == "EXIT"
+    assert sig_exit.payload["exit_reason"] == "TP"
+
+
+def test_window_reopen_fires_after_block():
+    """12:14:59 (window open, gates align) → LONG fires.
+    Flush position; 12:15:00 (window closed, gates STILL aligned) → None
+    (latch reset by window block); 15:00:00 (window reopens, gates STILL
+    aligned) → LONG fires (rising-edge re-detection post-reset)."""
+    strat = TradeStrat1K(params=TradeStrat1KParams())
+
+    # Stage 1: 12:14:59 Taipei → first LONG fires.
+    bars1 = _bars_at_taipei((12, 14, 59))
+    inds1 = _inds(bars1)
+    sig1 = strat.on_bar(_event(bars1, inds1))
+    assert sig1 is not None and sig1.side == "LONG"
+
+    # Flush the position (simulate immediate exit) so we can re-test entry.
+    st = _STATE[(TradeStrat1K.name, SYM)]
+    st.position = None
+    st.cooldown_until = None
+    # last_long_ready stays True after the entry fires above.
+    assert st.last_long_ready is True
+
+    # Stage 2: 12:15:00 (window closed, gates still aligned) → None,
+    # AND latch resets to False so the window reopen fires as a fresh edge.
+    bars2 = _bars_at_taipei((12, 15, 0))
+    inds2 = _inds(bars2)
+    sig2 = strat.on_bar(_event(bars2, inds2))
+    assert sig2 is None
+    assert st.last_long_ready is False
+
+    # Stage 3: 15:00:00 (window reopens, gates still aligned) → LONG fires.
+    bars3 = _bars_at_taipei((15, 0, 0))
+    inds3 = _inds(bars3)
+    sig3 = strat.on_bar(_event(bars3, inds3))
+    assert sig3 is not None
+    assert sig3.side == "LONG"
