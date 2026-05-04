@@ -8,7 +8,7 @@ Both ``on_bar`` (back-compat / backtest path) and ``on_tick`` route
 through the same ``_evaluate`` helper.
 
 Entry gates (all must hold; LONG only):
-  0. ``ts`` ∈ [09:15, 12:15) ∪ [15:00, 24:00) Asia/Taipei (half-open).
+  0. ``ts`` ∈ [09:15, 12:15) ∪ [21:00, 24:00) Asia/Taipei (half-open).
   1. ``price > MA120[-1]`` AND MA120 rising (``ma[-1] > ma[-2]``).
   2. KD: ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 75``.
   3. MACD histogram (30m): ``hist[-2] < 0`` AND ``hist[-1] > 0``.
@@ -241,12 +241,12 @@ class TradeStrat30K(Strategy):
     display_name: ClassVar[str] = "30K策略"
     description: ClassVar[str] = (
         "30 分鐘多單策略；進場：close>MA120 且 MA120 向上、KD 連兩 KS>DS 且第一根 KS<75、"
-        "30m MACD 直方翻正、+DI>-DI 且 -DI 縮、5m MACD>0 且時段在 09:15-12:15 / 15:00-24:00；"
+        "30m MACD 直方翻正、+DI>-DI 且 -DI 縮、5m MACD>0 且時段在 09:15-12:15 / 21:00-24:00；"
         "出場：TP 180 / SL −70 / 移動停損 80。"
     )
     spec: ClassVar[dict[str, str]] = {
         "週期": "30 分鐘 (5 分鐘輔助)",
-        "進場時段": "09:15-12:15 與 15:00-24:00 (Asia/Taipei；半開區間)",
+        "進場時段": "09:15-12:15 與 21:00-24:00 (Asia/Taipei；半開區間)",
         "進場": (
             "close>MA120 且 MA120 向上；KD 連兩根 KS>DS 且第一根 KS<75；"
             "30 分鐘 MACD 直方圖由負翻正；+DI>-DI 連兩根且第二根 -DI 縮；"

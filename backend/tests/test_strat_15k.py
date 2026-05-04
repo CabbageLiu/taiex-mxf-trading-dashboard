@@ -21,10 +21,10 @@ RES = "15m"
 FREQ = "15min"
 SYM = "MXF"
 TPE = ZoneInfo("Asia/Taipei")
-# 16:00 Asia/Taipei is inside the night entry window [15:00, 24:00) — UTC 08:00.
-# Using 16:00 leaves > 7 hours of in-window time for cooldown-release tests
+# 21:30 Asia/Taipei is inside the night entry window [21:00, 24:00) — UTC 13:30.
+# Using 21:30 leaves ≥ 2.5 hours of in-window time for cooldown-release tests
 # that advance the timestamp by ~75min (4500s) without crossing the window.
-DEFAULT_END_UTC = datetime(2026, 5, 1, 8, 0, tzinfo=UTC)
+DEFAULT_END_UTC = datetime(2026, 5, 1, 13, 30, tzinfo=UTC)
 
 
 @pytest.fixture(autouse=True)
@@ -657,9 +657,29 @@ def _utc_for_taipei(year, month, day, hour, minute=0, second=0, microsecond=0):
 
 
 def test_no_entry_at_13_00_taipei():
-    """13:00 Taipei (between 12:15 and 15:00) → entry blocked."""
+    """13:00 Taipei (inside 12:15–21:00 closed gap) → entry blocked."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
     end_ts = _utc_for_taipei(2026, 5, 1, 13, 0)
+    bars = _bars(5, last_close=200.0, end_ts=end_ts)
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_no_entry_at_16_00_taipei():
+    """16:00 Taipei (was night-allowed pre-window-narrowing) → blocked."""
+    strat = TradeStrat15K(params=TradeStrat15KParams())
+    end_ts = _utc_for_taipei(2026, 5, 1, 16, 0)
+    bars = _bars(5, last_close=200.0, end_ts=end_ts)
+    inds = _inds(bars)
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
+def test_no_entry_at_20_59_59_boundary():
+    """20:59:59 Taipei → blocked (one second before night-window open)."""
+    strat = TradeStrat15K(params=TradeStrat15KParams())
+    end_ts = _utc_for_taipei(2026, 5, 1, 20, 59, 59, 999000)
     bars = _bars(5, last_close=200.0, end_ts=end_ts)
     inds = _inds(bars)
     sig = strat.on_bar(_event(bars, inds))
@@ -697,10 +717,10 @@ def test_entry_at_11_00_taipei():
     assert sig.side == "LONG"
 
 
-def test_entry_at_16_00_taipei():
-    """16:00 Taipei → entry allowed (night session)."""
+def test_entry_at_22_00_taipei():
+    """22:00 Taipei → entry allowed (night session)."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
-    end_ts = _utc_for_taipei(2026, 5, 1, 16, 0)
+    end_ts = _utc_for_taipei(2026, 5, 1, 22, 0)
     bars = _bars(5, last_close=200.0, end_ts=end_ts)
     inds = _inds(bars)
     sig = strat.on_bar(_event(bars, inds))
@@ -719,10 +739,10 @@ def test_entry_at_09_15_00_taipei_open():
     assert sig.side == "LONG"
 
 
-def test_entry_at_15_00_00_taipei_open():
-    """15:00:00 Taipei → first allowed instant of the night window."""
+def test_entry_at_21_00_00_taipei_open():
+    """21:00:00 Taipei → first allowed instant of the night entry window."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
-    end_ts = _utc_for_taipei(2026, 5, 1, 15, 0, 0)
+    end_ts = _utc_for_taipei(2026, 5, 1, 21, 0, 0)
     bars = _bars(5, last_close=200.0, end_ts=end_ts)
     inds = _inds(bars)
     sig = strat.on_bar(_event(bars, inds))
@@ -749,7 +769,7 @@ def test_exits_run_at_13_00_taipei():
 
 
 def test_window_reopen_rising_edge():
-    """Gates align before 12:15; latch reset at 12:15 close; entry fires at 15:00 reopen."""
+    """Gates align before 12:15; latch reset at 12:15 close; entry fires at 21:00 reopen."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
 
     # 12:00 Taipei — gates align, fires LONG.
@@ -780,8 +800,8 @@ def test_window_reopen_rising_edge():
     assert sig_c is None
     assert st.last_long_ready is False
 
-    # 15:00 Taipei reopen — gates still aligned → fires immediately.
-    end_d = _utc_for_taipei(2026, 5, 1, 15, 0)
+    # 21:00 Taipei reopen — gates still aligned → fires immediately.
+    end_d = _utc_for_taipei(2026, 5, 1, 21, 0)
     bars_d = _bars(5, last_close=200.0, end_ts=end_d)
     inds_d = _inds(bars_d)
     sig_d = strat.on_bar(_event(bars_d, inds_d))

@@ -14,17 +14,19 @@ Side = Literal["LONG", "SHORT", "EXIT", "FLAT"]
 
 _DAY_OPEN = time(9, 15)
 _DAY_CLOSE = time(12, 15)
-_NIGHT_OPEN = time(15, 0)
+_NIGHT_OPEN = time(21, 0)
 
 
 def in_entry_window(ts: datetime, tz: ZoneInfo) -> bool:
     """Entry-allowed iff Taipei-local time falls in
-    [09:15, 12:15) ∪ [15:00, 24:00).
+    [09:15, 12:15) ∪ [21:00, 24:00).
 
     Half-open intervals: at exactly 12:15:00 entries are blocked;
-    at 12:14:59.999 they are allowed. Strict midnight cutoff —
-    overnight 00:00–05:00 (TAIFEX night session continuation) is
-    blocked per spec, even though the market is open.
+    at 12:14:59.999 they are allowed. The 12:15–21:00 stretch
+    (TAIFEX day-session close + first six hours of the night session)
+    is closed for entries even though the market is open from 15:00.
+    Strict midnight cutoff — overnight 00:00–05:00 (TAIFEX night-
+    session continuation) is blocked per spec.
     """
     t = ts.astimezone(tz).time()
     return (_DAY_OPEN <= t < _DAY_CLOSE) or (t >= _NIGHT_OPEN)

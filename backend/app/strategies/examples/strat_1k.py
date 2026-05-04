@@ -1,20 +1,23 @@
 """TAIEX 1-minute Strategy (1K策略).
 
-Single-resolution LONG-only strategy. Entry fires the moment the four gates
+Single-resolution LONG-only strategy. Entry fires the moment the gates
 align intra-bar (tick-driven); exits (TP / SL / TRAIL) fire the moment the
 tick price crosses the threshold; DI_JUMP_1M still evaluates against
 closed-bar -DI deltas. Both ``on_bar`` (back-compat / backtest path) and
 ``on_tick`` route through the same ``_evaluate`` helper.
 
-Entry gates (all six must hold; LONG only):
-  0. Entry window: Asia/Taipei time inside [09:15, 12:15) ∪ [15:00, 24:00).
+Entry gates (all seven must hold; LONG only):
+  0. Entry window: Asia/Taipei time inside [09:15, 12:15) ∪ [21:00, 24:00).
   1. ``price > MA120[-1]`` AND MA120 rising (``ma[-1] > ma[-2]``).
-  2. KD: ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 75``.
+  2. KD (1m): ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 75``.
   3. MACD histogram (1m): ``hist[-2] < 0`` AND ``hist[-1] > 0``.
   4. DMI: ``plus[-2] > minus[-2]`` AND ``plus[-1] > minus[-1]`` AND
      ``minus[-1] < minus[-2]``.
   5. 5m MACD confirmation: most-recent 5m ``hist > 0`` AND last 5m bar is
      no more than 15 minutes old vs the dispatch ``ts`` (staleness guard).
+  6. 5m KD confirmation: ``k_5m[-2] > d_5m[-2]`` AND ``k_5m[-1] > d_5m[-1]``
+     AND ``k_5m[-1] > kd_5m_floor`` (default 65.0). Same 15-minute
+     staleness guard as the 5m MACD gate.
 
 Exit priority (per tick or bar close, first match wins):
   TP          — pnl ≥ 50
@@ -22,9 +25,9 @@ Exit priority (per tick or bar close, first match wins):
   TRAIL       — pnl ≤ peak_pnl − 50 (peak tracked from entry, starts at 0)
   DI_JUMP_1M  — minus_di[-1] − minus_di[-2] > 10 (strict ``>``, closed bars)
 
-Exits ignore the entry-window gate AND the 5m MACD gate — open positions
-must remain closeable any time, including the 12:15–15:00 break and the
-overnight 00:00–05:00 stretch.
+Exits ignore the entry-window gate AND the 5m MACD / 5m KD gates — open
+positions must remain closeable any time, including the 12:15–21:00
+no-entry stretch and the overnight 00:00–05:00 stretch.
 
 Cooldown: 300 seconds after EXIT (time-based, not bar-counted). While
 ``ts < cooldown_until`` evaluation returns None and resets
@@ -66,6 +69,8 @@ class TradeStrat1KParams(BaseModel):
     macd_signal: int = 9
 
     dmi_period: int = 14
+
+    kd_5m_floor: float = 65.0  # second 5m K must exceed this to confirm
 
     tp_points: float = 50.0
     sl_points: float = 40.0
@@ -186,30 +191,69 @@ def _long_entry_now(
     return gate_ma and gate_kd and gate_macd and gate_dmi
 
 
+def _kd_5m_ok(
+    kd_5m: pd.DataFrame | None,
+    ts: datetime,
+    floor: float,
+    *,
+    max_age: timedelta = timedelta(minutes=15),
+) -> bool:
+    """Auxiliary 5-minute KD confirmation gate.
+
+    Block (returns False) when the aux frame is missing/empty, the most
+    recent 5m bar is older than ``max_age`` vs ``ts``, any of the four
+    K/D scalars is None/NaN, the two K/D pairs do not show K>D, or the
+    most recent K does not exceed ``floor``.
+    """
+    if kd_5m is None or len(kd_5m) == 0:
+        return False
+    last_idx = kd_5m.index[-1]
+    if isinstance(last_idx, pd.Timestamp):
+        last_dt = last_idx.to_pydatetime()
+    else:
+        last_dt = last_idx
+    if last_dt.tzinfo is None and ts.tzinfo is not None:
+        last_dt = last_dt.replace(tzinfo=ts.tzinfo)
+    elif last_dt.tzinfo is not None and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=last_dt.tzinfo)
+    if (ts - last_dt) >= max_age:
+        return False
+    k_prev = _scalar(kd_5m["k"], idx=-2) if "k" in kd_5m.columns else None
+    d_prev = _scalar(kd_5m["d"], idx=-2) if "d" in kd_5m.columns else None
+    k_curr = _scalar(kd_5m["k"], idx=-1) if "k" in kd_5m.columns else None
+    d_curr = _scalar(kd_5m["d"], idx=-1) if "d" in kd_5m.columns else None
+    if None in (k_prev, d_prev, k_curr, d_curr):
+        return False
+    return k_prev > d_prev and k_curr > d_curr and k_curr > floor
+
+
 @register_strategy
 class TradeStrat1K(Strategy):
     name: ClassVar[str] = "strat_1k"
     display_name: ClassVar[str] = "1K策略"
     description: ClassVar[str] = (
-        "1 分鐘多單策略；開倉時段 09:15-12:15 / 15:00-24:00；進場："
-        "close>MA120 且 MA120 向上、KD 連兩 KS>DS 且首根 KS<75、"
-        "MACD 直方翻正、+DI>-DI 且 -DI 縮、5m MACD>0；"
+        "1 分鐘多單策略；開倉時段 09:15-12:15 / 21:00-24:00；進場："
+        "close>MA120 且 MA120 向上、1m KD 連兩 KS>DS 且首根 KS<75、"
+        "1m MACD 直方翻正、+DI>-DI 且 -DI 縮、5m MACD>0、"
+        "5m KD 連兩 KS>DS 且第二根 KS>65；"
         "出場：TP 50 / SL −40 / 移動停損 50 / 1 分鐘 -DI 跳升 (>10 點)。"
     )
     spec: ClassVar[dict[str, str]] = {
         "週期": "1 分鐘",
-        "開倉時段": "09:15-12:15 / 15:00-24:00 (Asia/Taipei)",
+        "開倉時段": "09:15-12:15 / 21:00-24:00 (Asia/Taipei)",
         "進場": (
-            "close>MA120 且 MA120 向上；KD 連兩根 KS>DS 且第一根 KS<75；"
-            "MACD 直方圖由負翻正；+DI>-DI 連兩根且第二根 -DI 縮；"
-            "5 分鐘 MACD 直方圖>0"
+            "close>MA120 且 MA120 向上；1 分鐘 KD 連兩根 KS>DS 且第一根 KS<75；"
+            "1 分鐘 MACD 直方圖由負翻正；+DI>-DI 連兩根且第二根 -DI 縮；"
+            "5 分鐘 MACD 直方圖>0；5 分鐘 KD 連兩根 KS>DS 且第二根 KS>65"
         ),
         "出場": (
             "獲利 50 點 / 虧損 40 點 / 移動停損 50 點 / "
             "1 分鐘 -DI 跳升 (>10 點)"
         ),
         "冷卻": "出場後 5 分鐘 (300 秒)",
-        "備註": "僅多單；訊號逐筆即時觸發；出場不受開倉時段與 5m MACD 限制",
+        "備註": (
+            "僅多單；訊號逐筆即時觸發；出場不受開倉時段與 5m MACD / 5m KD 限制"
+        ),
     }
     resolutions: ClassVar[list[str]] = ["1m"]
     tick_resolutions: ClassVar[list[str]] = ["1m"]
@@ -224,6 +268,11 @@ class TradeStrat1K(Strategy):
         "macd_5m": {
             "kind": "macd",
             "params": {"fast": 12, "slow": 26, "signal": 9},
+            "resolution": "5m",
+        },
+        "kd_5m": {
+            "kind": "kd",
+            "params": {"period": 9, "k_smooth": 3, "d_smooth": 3},
             "resolution": "5m",
         },
     }
@@ -409,6 +458,14 @@ class TradeStrat1K(Strategy):
             return None
         hist_5m = _scalar(macd_5m["hist"], idx=-1)
         if hist_5m is None or hist_5m <= 0:
+            st.last_long_ready = False
+            return None
+
+        # 0c. 5m KD confirmation gate. Same shape as the 5m MACD gate:
+        # cold/empty/stale (≥15min)/K-not-above-D / second-K-below-floor
+        # all reset the rising-edge latch and block.
+        kd_5m = indicators.get("kd_5m")
+        if not _kd_5m_ok(kd_5m, ts, p.kd_5m_floor):
             st.last_long_ready = False
             return None
 

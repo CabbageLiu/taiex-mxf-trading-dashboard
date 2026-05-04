@@ -9,7 +9,7 @@ gate and the 5m MACD gate so an open position is always closeable. Both
 same ``_evaluate`` helper.
 
 Entry gates (all four 15m gates AND window AND 5m MACD must hold; LONG only):
-  Window — Asia/Taipei local time in [09:15, 12:15) ∪ [15:00, 24:00).
+  Window — Asia/Taipei local time in [09:15, 12:15) ∪ [21:00, 24:00).
   5m MACD — auxiliary 5m MACD histogram > 0 at the latest closed 5m bar
             (cold/empty/stale-by-more-than-15min all block).
   1. ``price > MA120[-1]`` AND MA120 rising (``ma[-1] > ma[-2]``).
@@ -222,13 +222,13 @@ class TradeStrat15K(Strategy):
     name: ClassVar[str] = "strat_15k"
     display_name: ClassVar[str] = "15K策略"
     description: ClassVar[str] = (
-        "15 分鐘多單策略；進場時段 09:15-12:15 / 15:00-24:00；進場：close>MA120 "
+        "15 分鐘多單策略；進場時段 09:15-12:15 / 21:00-24:00；進場：close>MA120 "
         "且 MA120 向上、KD 連兩 KS>DS 且第一根 KS<75、MACD 直方翻正、+DI>-DI 且 -DI 縮、"
         "5 分鐘 MACD 直方>0；出場：TP 130 / SL −70 / 移動停損 80。"
     )
     spec: ClassVar[dict[str, str]] = {
         "週期": "15 分鐘",
-        "進場時段": "09:15-12:15 / 15:00-24:00 (Asia/Taipei)",
+        "進場時段": "09:15-12:15 / 21:00-24:00 (Asia/Taipei)",
         "進場": (
             "close>MA120 且 MA120 向上；KD 連兩根 KS>DS 且第一根 KS<75；"
             "MACD 直方圖由負翻正；+DI>-DI 連兩根且第二根 -DI 縮；"
@@ -392,7 +392,7 @@ class TradeStrat15K(Strategy):
         resolution: str,
     ) -> Signal | None:
         # Window gate first — block entries outside [09:15, 12:15) ∪
-        # [15:00, 24:00) Asia/Taipei. Reset latch so a window-reopen with
+        # [21:00, 24:00) Asia/Taipei. Reset latch so a window-reopen with
         # pre-aligned gates fires cleanly as a fresh rising edge.
         if not in_entry_window(ts, _TAIPEI):
             st.last_long_ready = False
