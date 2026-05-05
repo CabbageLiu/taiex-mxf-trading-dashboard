@@ -2,19 +2,20 @@
 
 Single-resolution LONG-only strategy. Entry fires the moment the four 15m
 gates align intra-bar (tick-driven), provided the entry-window gate and the
-5-minute MACD-histogram-positive gate also pass. Exits (TP / SL / TRAIL) fire
+30-minute MACD zero-cross gate also pass. Exits (TP / SL / TRAIL) fire
 the moment the tick price crosses the threshold; exits ignore the window
-gate and the 5m MACD gate so an open position is always closeable. Both
+gate and the 30m MACD gate so an open position is always closeable. Both
 ``on_bar`` (back-compat / backtest path) and ``on_tick`` route through the
 same ``_evaluate`` helper.
 
-Entry gates (all four 15m gates AND window AND 5m MACD must hold; LONG only):
-  Window — Asia/Taipei local time in [09:15, 12:15) ∪ [21:00, 24:00).
-  5m MACD — auxiliary 5m MACD histogram > 0 at the latest closed 5m bar
-            (cold/empty/stale-by-more-than-15min all block).
+Entry gates (all four 15m gates AND window AND 30m MACD must hold; LONG only):
+  Window — Asia/Taipei local time in [09:10, 12:15) ∪ [15:00, 24:00).
+  30m MACD — auxiliary 30m MACD histogram zero-cross neg→pos at the
+            latest closed 30m bar: ``hist[-2] < 0`` AND ``hist[-1] > 0``.
+            Cold/empty/stale-by-more-than-90min all block.
   1. ``price > MA120[-1]`` AND MA120 rising (``ma[-1] > ma[-2]``).
-  2. KD: ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 75``.
-  3. MACD histogram: ``hist[-2] < 0`` AND ``hist[-1] > 0``.
+  2. KD: ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 65``.
+  3. MACD histogram (15m): ``hist[-2] < 0`` AND ``hist[-1] > 0``.
   4. DMI: ``plus[-2] > minus[-2]`` AND ``plus[-1] > minus[-1]`` AND
      ``minus[-1] < minus[-2]``.
 
@@ -36,7 +37,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import ClassVar
 from zoneinfo import ZoneInfo
 
@@ -53,7 +54,10 @@ from app.strategies.base import (
 from app.strategies.registry import register_strategy
 
 _TAIPEI = ZoneInfo("Asia/Taipei")
-_AUX_STALENESS = timedelta(minutes=15)
+_AUX_STALENESS = timedelta(minutes=90)  # 3 × 30m
+_DAY_OPEN = time(9, 10)
+_DAY_CLOSE = time(12, 15)
+_NIGHT_OPEN = time(15, 0)
 
 
 class TradeStrat15KParams(BaseModel):
@@ -62,7 +66,7 @@ class TradeStrat15KParams(BaseModel):
     kd_period: int = 9
     kd_k_smooth: int = 3
     kd_d_smooth: int = 3
-    kd_long_floor: float = 75.0
+    kd_long_floor: float = 65.0
 
     macd_fast: int = 12
     macd_slow: int = 26
@@ -188,33 +192,39 @@ def _long_entry_now(
     return gate_ma and gate_kd and gate_macd and gate_dmi
 
 
-def _aux_macd_5m_positive(
-    macd_5m: pd.DataFrame | None,
+def _aux_macd_30m_cross_up(
+    macd_30m: pd.DataFrame | None,
     ts: datetime,
 ) -> bool:
-    """Auxiliary 5-minute MACD histogram > 0 gate.
+    """Auxiliary 30-minute MACD histogram zero-cross gate (neg→pos).
 
     Returns False (block entry) when the aux indicator is missing, empty,
-    stale by more than 15 minutes vs ``ts``, or has a non-positive last
-    histogram value. The staleness guard covers FinMind outages where 5m
-    bars stop arriving — without it, a stale positive snapshot would let
-    entries through indefinitely.
+    stale by more than 90 minutes vs ``ts`` (3 × 30m delta — matches the
+    ingest watchdog retire threshold), missing either of the last two
+    histogram values, or fails the ``hist[-2] < 0 AND hist[-1] > 0``
+    pattern. The staleness guard covers FinMind outages where 30m bars
+    stop arriving.
     """
-    if macd_5m is None or len(macd_5m) == 0:
+    if macd_30m is None or len(macd_30m) == 0:
         return False
-    last_idx = macd_5m.index[-1]
+    last_idx = macd_30m.index[-1]
     if isinstance(last_idx, pd.Timestamp):
         last_dt = last_idx.to_pydatetime()
     else:
         last_dt = last_idx  # already datetime-like
-    # Both `ts` and the indicator index are tz-aware in production
-    # (Timescale returns UTC-aware timestamps). Compare directly.
+    if last_dt.tzinfo is None and ts.tzinfo is not None:
+        last_dt = last_dt.replace(tzinfo=ts.tzinfo)
+    elif last_dt.tzinfo is not None and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=last_dt.tzinfo)
     if (ts - last_dt) >= _AUX_STALENESS:
         return False
-    hist = _scalar(macd_5m["hist"], idx=-1) if "hist" in macd_5m.columns else None
-    if hist is None:
+    if "hist" not in macd_30m.columns:
         return False
-    return hist > 0
+    hist_prev = _scalar(macd_30m["hist"], idx=-2)
+    hist_curr = _scalar(macd_30m["hist"], idx=-1)
+    if hist_prev is None or hist_curr is None:
+        return False
+    return hist_prev < 0 and hist_curr > 0
 
 
 @register_strategy
@@ -222,21 +232,21 @@ class TradeStrat15K(Strategy):
     name: ClassVar[str] = "strat_15k"
     display_name: ClassVar[str] = "15K策略"
     description: ClassVar[str] = (
-        "15 分鐘多單策略；進場時段 09:15-12:15 / 21:00-24:00；進場：close>MA120 "
-        "且 MA120 向上、KD 連兩 KS>DS 且第一根 KS<75、MACD 直方翻正、+DI>-DI 且 -DI 縮、"
-        "5 分鐘 MACD 直方>0；出場：TP 130 / SL −70 / 移動停損 80。"
+        "15 分鐘多單策略；進場時段 09:10-12:15 / 15:00-24:00；進場：close>MA120 "
+        "且 MA120 向上、KD 連兩 KS>DS 且第一根 KS<65、MACD 直方翻正、+DI>-DI 且 -DI 縮、"
+        "30 分鐘 MACD 直方由負翻正；出場：TP 130 / SL −70 / 移動停損 80。"
     )
     spec: ClassVar[dict[str, str]] = {
-        "週期": "15 分鐘",
-        "進場時段": "09:15-12:15 / 21:00-24:00 (Asia/Taipei)",
+        "週期": "15 分鐘 (30 分鐘輔助)",
+        "進場時段": "09:10-12:15 / 15:00-24:00 (Asia/Taipei)",
         "進場": (
-            "close>MA120 且 MA120 向上；KD 連兩根 KS>DS 且第一根 KS<75；"
+            "close>MA120 且 MA120 向上；KD 連兩根 KS>DS 且第一根 KS<65；"
             "MACD 直方圖由負翻正；+DI>-DI 連兩根且第二根 -DI 縮；"
-            "5 分鐘 MACD 直方>0 (近 15 分鐘內)"
+            "30 分鐘 MACD 直方由負翻正 (近 90 分鐘內)"
         ),
         "出場": "獲利 130 點 / 虧損 70 點 / 移動停損 80 點",
         "冷卻": "出場後 5 根 15 分鐘 (4500 秒)",
-        "備註": "僅多單；訊號逐筆即時觸發；出場不受時段與 5 分鐘 MACD 限制",
+        "備註": "僅多單；訊號逐筆即時觸發；出場不受時段與 30 分鐘 MACD 限制",
     }
     resolutions: ClassVar[list[str]] = ["15m"]
     tick_resolutions: ClassVar[list[str]] = ["15m"]
@@ -248,10 +258,10 @@ class TradeStrat15K(Strategy):
         "dmi": {"kind": "dmi", "params": {"period": 14}},
     }
     aux_indicator_specs: ClassVar[dict[str, dict]] = {
-        "macd_5m": {
+        "macd_30m": {
             "kind": "macd",
             "params": {"fast": 12, "slow": 26, "signal": 9},
-            "resolution": "5m",
+            "resolution": "30m",
         },
     }
 
@@ -391,17 +401,24 @@ class TradeStrat15K(Strategy):
         symbol: str,
         resolution: str,
     ) -> Signal | None:
-        # Window gate first — block entries outside [09:15, 12:15) ∪
-        # [21:00, 24:00) Asia/Taipei. Reset latch so a window-reopen with
+        # Window gate first — block entries outside [09:10, 12:15) ∪
+        # [15:00, 24:00) Asia/Taipei. Reset latch so a window-reopen with
         # pre-aligned gates fires cleanly as a fresh rising edge.
-        if not in_entry_window(ts, _TAIPEI):
+        if not in_entry_window(
+            ts,
+            _TAIPEI,
+            day_open=_DAY_OPEN,
+            day_close=_DAY_CLOSE,
+            night_open=_NIGHT_OPEN,
+        ):
             st.last_long_ready = False
             return None
 
-        # 5m MACD gate — block on missing/empty/stale (>15min)/non-positive
-        # histogram. Reset latch so a flip back to positive re-arms cleanly.
-        macd_5m = indicators.get("macd_5m")
-        if not _aux_macd_5m_positive(macd_5m, ts):
+        # 30m MACD gate — block on missing/empty/stale (>90min) or when the
+        # neg→pos zero-cross pattern hist[-2]<0 AND hist[-1]>0 is not satisfied.
+        # Reset latch so the next clean cross re-arms cleanly.
+        macd_30m = indicators.get("macd_30m")
+        if not _aux_macd_30m_cross_up(macd_30m, ts):
             st.last_long_ready = False
             return None
 

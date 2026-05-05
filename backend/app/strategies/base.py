@@ -12,24 +12,30 @@ from pydantic import BaseModel
 Side = Literal["LONG", "SHORT", "EXIT", "FLAT"]
 
 
-_DAY_OPEN = time(9, 15)
-_DAY_CLOSE = time(12, 15)
-_NIGHT_OPEN = time(21, 0)
+_DEFAULT_DAY_OPEN = time(9, 15)
+_DEFAULT_DAY_CLOSE = time(12, 15)
+_DEFAULT_NIGHT_OPEN = time(21, 0)
 
 
-def in_entry_window(ts: datetime, tz: ZoneInfo) -> bool:
-    """Entry-allowed iff Taipei-local time falls in
-    [09:15, 12:15) ∪ [21:00, 24:00).
+def in_entry_window(
+    ts: datetime,
+    tz: ZoneInfo,
+    *,
+    day_open: time = _DEFAULT_DAY_OPEN,
+    day_close: time = _DEFAULT_DAY_CLOSE,
+    night_open: time = _DEFAULT_NIGHT_OPEN,
+) -> bool:
+    """Entry-allowed iff local-tz time falls in
+    [day_open, day_close) ∪ [night_open, 24:00).
 
-    Half-open intervals: at exactly 12:15:00 entries are blocked;
-    at 12:14:59.999 they are allowed. The 12:15–21:00 stretch
-    (TAIFEX day-session close + first six hours of the night session)
-    is closed for entries even though the market is open from 15:00.
-    Strict midnight cutoff — overnight 00:00–05:00 (TAIFEX night-
-    session continuation) is blocked per spec.
+    Half-open intervals on both ends. Strict midnight cutoff —
+    overnight 00:00 onward (TAIFEX night-session continuation) is
+    blocked. Each strategy passes its own bounds via kwargs; defaults
+    preserve the legacy [09:15, 12:15) ∪ [21:00, 24:00) for any
+    caller that does not specify them.
     """
     t = ts.astimezone(tz).time()
-    return (_DAY_OPEN <= t < _DAY_CLOSE) or (t >= _NIGHT_OPEN)
+    return (day_open <= t < day_close) or (t >= night_open)
 
 
 @dataclass(slots=True)

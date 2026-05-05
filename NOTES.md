@@ -798,16 +798,31 @@ renders the conditions side-by-side.
 
 ### 11.2 strat_30k / strat_15k / strat_1k (MA120 trend strategies)
 
-Three LONG-only strategies sharing the same primary-resolution entry recipe. Differ in primary timeframe, exit thresholds, and aux confirmation gates (`strat_1k` adds a 5m KD confirmation on top of the shared 5m MACD one). All three are **tick-driven on their primary resolution** (entries fire intra-bar; price-based exits fire the moment the tick crosses the threshold). Spec authority: `three_strats.md` at repo root.
+Three LONG-only strategies. All three are **tick-driven on their primary resolution** (entries fire intra-bar; price-based exits fire the moment the tick crosses the threshold). Spec authority: `three_strats.md` at repo root. Per-strategy windows + aux gates have diverged — see the table below.
 
-**Entry — all gates must pass on a rising-edge transition false→true:**
-1. **Window gate** — Taipei time falls in `[09:15, 12:15) ∪ [21:00, 24:00)`. Half-open intervals; strict midnight cutoff (overnight 00:00–05:00 blocked). The 12:15–21:00 stretch is closed for entries despite the market reopening at 15:00.
-2. **5m MACD confirmation** — `ev.indicators["macd_5m"]` is loaded by the framework via `aux_indicator_specs` on every dispatch. Last `hist > 0`. Staleness guard: `ts − macd_5m.index[-1] ≤ 15min` (otherwise treat as cold).
-3. close > MA120 AND MA120 rising (`ma[-1] > ma[-2]`). Tick price substitutes `close[-1]` so the gate is intra-bar.
-4. KD (primary): `k[-2] > d[-2]` AND `k[-1] > d[-1]` AND `k[-2] < 75` (was 80 pre-V6.1).
-5. MACD histogram (primary resolution): `hist[-2] < 0` AND `hist[-1] > 0`.
-6. DMI (primary resolution): `+DI[-2] > -DI[-2]` AND `+DI[-1] > -DI[-1]` AND `-DI[-1] < -DI[-2]`.
-7. **(strat_1k only) 5m KD confirmation** — `ev.indicators["kd_5m"]`: `k[-2] > d[-2]` AND `k[-1] > d[-1]` AND `k[-1] > kd_5m_floor` (default 65). Same 15-minute staleness guard.
+**Per-strategy entry windows (Asia/Taipei, half-open, strict midnight cutoff):**
+
+| canonical | window |
+|-----------|--------|
+| `strat_30k` | `[09:10, 12:15) ∪ [15:00, 24:00)` |
+| `strat_15k` | `[09:10, 12:15) ∪ [15:00, 24:00)` |
+| `strat_1k`  | `[09:10, 11:15) ∪ [15:00, 24:00)` |
+
+**Per-strategy entry gates** (all must pass on a rising-edge false→true; `strat_30k` / `strat_15k` use the close>MA120 + MA-rising gate, `strat_1k` does NOT).
+
+| gate | strat_30k | strat_15k | strat_1k |
+|------|-----------|-----------|----------|
+| MA120 trend | close>MA AND MA rising (30m) | close>MA AND MA rising (15m) | — (dropped) |
+| Primary KD | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<75` (30m) | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<65` (15m) | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<65` (1m) |
+| Primary MACD hist | `hist_prev<0 AND hist_curr>0` (zero-cross, 30m) | `hist_prev<0 AND hist_curr>0` (zero-cross, 15m) | `hist_curr>hist_prev` (rising, 1m) |
+| Primary DMI | `+DI>-DI` both rows AND `-DI` shrinking (30m) | same (15m) | same (1m) |
+| Aux MACD | 5m `hist[-1] > 0` (positive only, ≤15min staleness) | 30m `hist_prev<0 AND hist_curr>0` (zero-cross, ≤90min) | 3m `hist_curr>hist_prev` (rising, ≤9min) |
+| Aux KD | — | — | 3m `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<65` (≤9min) |
+| Aux DMI | — | — | 3m `+DI>-DI` both AND `-DI` shrinking (≤9min) |
+
+Staleness thresholds use the `3 × delta` convention (matches the ingest watchdog retire threshold).
+
+**Per-strategy exit / cooldown / extra exit:**
 
 | canonical | display | primary | TP | SL | Trail | Cooldown | Extra exit |
 |-----------|---------|---------|-----|-----|-------|----------|------------|
@@ -815,17 +830,21 @@ Three LONG-only strategies sharing the same primary-resolution entry recipe. Dif
 | `strat_15k` | 15K策略 | 15m | 130 | 70 | 80 | 4500s (5×15m) | — |
 | `strat_1k`  | 1K策略  | 1m  | 50  | 40 | 50  | 300s (5×1m)   | DI_JUMP_1M: `-DI[-1] − -DI[-2] > 10` (closed bars) |
 
-All three declare `tick_resolutions: ["<primary>"]`. `strat_30k` / `strat_15k` aux: `{"macd_5m": macd(12, 26, 9) @ 5m}`. `strat_1k` aux: `{"macd_5m": ..., "kd_5m": kd(9, 3, 3) @ 5m}`.
+All three declare `tick_resolutions: ["<primary>"]`.
+
+- `strat_30k` aux specs: `{"macd_5m": macd(12, 26, 9) @ 5m}`.
+- `strat_15k` aux specs: `{"macd_30m": macd(12, 26, 9) @ 30m}`.
+- `strat_1k` aux specs: `{"kd_3m": kd(9, 3, 3) @ 3m, "macd_3m": macd(12, 26, 9) @ 3m, "dmi_3m": dmi(14) @ 3m}` (no MA120 in `indicator_specs`).
 
 **Trailing stop semantics:** `peak_pnl` tracks from entry, starts at 0. Exit fires when `current_pnl ≤ peak_pnl − trail_points`. SL handles the never-profitable case (SL < trail, so SL fires first). Peak update happens after all priority checks.
 
-**Exit priority:** TP → SL → TRAIL → (strat_1k only) DI_JUMP_1M → hold. **Exits ignore the window gate AND the 5m MACD / 5m KD gates** so an open position is always closeable across the 12:15–21:00 no-entry gap and across 5m aux reversals.
+**Exit priority:** TP → SL → TRAIL → (strat_1k only) DI_JUMP_1M → hold. **Exits ignore the window gate AND every aux gate** so an open position is always closeable across the no-entry gap (`12:15–15:00` for 30K/15K, `11:15–15:00` for 1K) and across aux reversals.
 
 **Cooldown:** time-based (`cooldown_until: datetime | None`). After exit, blocks new entries until `ts ≥ cooldown_until`; resets `last_long_ready` so the rising-edge latch re-arms cleanly when cooldown expires (and same for the window-blocked path — closed window resets the latch so a window reopen with pre-aligned gates fires fresh).
 
 **Fill convention:** tick-driven. `Signal.ts` carries the raw tick timestamp; `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time, not bucket boundaries. DI_JUMP_1M can only fire on the first tick of a new 1m bucket (it depends on the closed-bar -DI delta).
 
-**Indicator specs:** `ma120 (period=120 SMA)`, `kd (9, 3, 3)`, `macd (12, 26, 9)`, `dmi (14)`. MA120 needs ~2.5 days of 30m bars to fully warm up; default `BACKFILL_ON_STARTUP_DAYS=7` covers it. The `entry_ind` / `exit_ind` payload snapshot keeps the existing 8-key shape (`{k, d, macd, signal, hist, plus_di, minus_di, adx}`) — MA120 is intentionally NOT in the snapshot.
+**Indicator specs:** `ma120 (period=120 SMA)` for `strat_30k` / `strat_15k` only, `kd (9, 3, 3)`, `macd (12, 26, 9)`, `dmi (14)`. MA120 needs ~2.5 days of primary bars to fully warm up; default `BACKFILL_ON_STARTUP_DAYS=7` covers it. The `entry_ind` / `exit_ind` payload snapshot keeps the existing 8-key shape (`{k, d, macd, signal, hist, plus_di, minus_di, adx}`) — MA120 is intentionally NOT in the snapshot.
 
 **Operator deploy step:** restart backend; the registry autodiscovers the new modules. Default `enabled=False` in `strategy_config`. Operator enables the three new strategies in the Strategies UI; toggles `trade_strat_v1` / `trade_strat_v2` off if previously enabled.
 

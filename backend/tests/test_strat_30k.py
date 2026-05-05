@@ -599,6 +599,15 @@ def test_no_entry_when_macd_5m_missing():
     assert st.last_long_ready is False
 
 
+def test_no_entry_when_macd_5m_empty():
+    """Empty 5m MACD DataFrame → entry blocked."""
+    strat = TradeStrat30K(params=TradeStrat30KParams())
+    bars = _bars(5, last_close=200.0)
+    inds = _inds(bars, macd_5m=pd.DataFrame())
+    sig = strat.on_bar(_event(bars, inds))
+    assert sig is None
+
+
 def test_no_entry_when_macd_5m_negative():
     strat = TradeStrat30K(params=TradeStrat30KParams())
     bars = _bars(5, last_close=200.0)
@@ -680,25 +689,25 @@ def _make_event_at(local_ts: datetime, *, price: float = 200.0):
 
 
 def test_no_entry_outside_window_midday():
-    """13:00 Taipei (inside 12:15–21:00 closed gap) → entry blocked."""
+    """13:00 Taipei (inside 12:15–15:00 closed gap) → entry blocked."""
     strat = TradeStrat30K(params=TradeStrat30KParams())
     bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 13, 0))
     sig = strat.on_bar(_event(bars, inds, bucket=bucket))
     assert sig is None
 
 
-def test_no_entry_at_16_00_taipei():
-    """16:00 Taipei (was night-allowed pre-window-narrowing) → blocked."""
+def test_no_entry_at_14_59_59_boundary():
+    """14:59:59 Taipei → blocked (one second before night-window open)."""
     strat = TradeStrat30K(params=TradeStrat30KParams())
-    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 16, 0))
+    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 14, 59, 59, 999000))
     sig = strat.on_bar(_event(bars, inds, bucket=bucket))
     assert sig is None
 
 
-def test_no_entry_at_20_59_59_boundary():
-    """20:59:59 Taipei → blocked (one second before night-window open)."""
+def test_no_entry_at_09_09_59_boundary():
+    """09:09:59 Taipei → blocked (one second before day-window open)."""
     strat = TradeStrat30K(params=TradeStrat30KParams())
-    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 20, 59, 59, 999000))
+    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 9, 9, 59, 999000))
     sig = strat.on_bar(_event(bars, inds, bucket=bucket))
     assert sig is None
 
@@ -729,18 +738,18 @@ def test_entry_just_before_window_close():
 
 
 def test_entry_at_day_window_open_boundary():
-    """09:15:00 Taipei → allowed (closed left edge: [09:15,...))."""
+    """09:10:00 Taipei → allowed (closed left edge: [09:10,...))."""
     strat = TradeStrat30K(params=TradeStrat30KParams())
-    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 9, 15, 0, 0))
+    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 9, 10, 0, 0))
     sig = strat.on_bar(_event(bars, inds, bucket=bucket))
     assert sig is not None
     assert sig.side == "LONG"
 
 
 def test_entry_at_night_window_open_boundary():
-    """21:00:00 Taipei → allowed (closed left edge of night entry window)."""
+    """15:00:00 Taipei → allowed (closed left edge of night entry window)."""
     strat = TradeStrat30K(params=TradeStrat30KParams())
-    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 21, 0, 0, 0))
+    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 15, 0, 0, 0))
     sig = strat.on_bar(_event(bars, inds, bucket=bucket))
     assert sig is not None
     assert sig.side == "LONG"
@@ -788,17 +797,10 @@ def test_exit_runs_at_13_00_taipei():
 
 def test_window_reopen_rising_edge_redetect():
     """Gates align before 12:15; latch reset across the closed window;
-    gates STILL aligned at 21:00 reopen → entry fires immediately on
-    first tick after 21:00 (rising-edge re-detection).
+    gates STILL aligned at 15:00 reopen → entry fires immediately on
+    first tick after 15:00 (rising-edge re-detection).
     """
     p = TradeStrat30KParams()
-
-    # Tick during day window — gates aligned but suppressed by some other
-    # condition? Actually we want to set up a scenario where:
-    #  1. Gates align inside day window → entry fires (sets last_long_ready=True
-    #     transiently, but since we open a position, exit branch takes over).
-    # So instead: test latch reset directly. Block via window mid-day, latch
-    # gets reset; then at window-reopen with gates aligned, fire.
 
     # Step 1: pre-set latch = True manually as if previous tick fired ready.
     st = mod._state_for(TradeStrat30K.name, SYM)
@@ -814,9 +816,9 @@ def test_window_reopen_rising_edge_redetect():
     assert sig_mid is None
     assert st.last_long_ready is False
 
-    # Step 3: tick at 21:00 (window reopens) with gates still aligned → fires.
-    bars2, inds2, _ = _make_event_at(_tpe_dt(2026, 5, 1, 21, 0))
-    reopen_ts = _tpe_dt(2026, 5, 1, 21, 0)
+    # Step 3: tick at 15:00 (window reopens) with gates still aligned → fires.
+    bars2, inds2, _ = _make_event_at(_tpe_dt(2026, 5, 1, 15, 0))
+    reopen_ts = _tpe_dt(2026, 5, 1, 15, 0)
     sig_open = TradeStrat30K(params=p).on_tick(
         _tick_event(bars2, inds2, ts=reopen_ts, price=200.0)
     )

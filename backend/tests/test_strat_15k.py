@@ -21,7 +21,7 @@ RES = "15m"
 FREQ = "15min"
 SYM = "MXF"
 TPE = ZoneInfo("Asia/Taipei")
-# 21:30 Asia/Taipei is inside the night entry window [21:00, 24:00) — UTC 13:30.
+# 21:30 Asia/Taipei is inside the night entry window [15:00, 24:00) — UTC 13:30.
 # Using 21:30 leaves ≥ 2.5 hours of in-window time for cooldown-release tests
 # that advance the timestamp by ~75min (4500s) without crossing the window.
 DEFAULT_END_UTC = datetime(2026, 5, 1, 13, 30, tzinfo=UTC)
@@ -61,7 +61,7 @@ def _inds(
     *,
     ma_prev: float = 100.0,
     ma_curr: float = 100.5,
-    k_prev: float = 70.0,
+    k_prev: float = 60.0,  # < kd_long_floor=65
     d_prev: float = 50.0,
     k_curr: float = 73.0,
     d_curr: float = 60.0,
@@ -124,21 +124,31 @@ def _inds(
     }
 
 
-def _macd_5m(
+def _macd_30m(
     *,
     end_ts: datetime,
     n: int = 5,
+    hist_prev: float = -0.5,
     hist_curr: float = 0.5,
     macd_curr: float = 0.5,
     signal_curr: float = 0.0,
 ) -> pd.DataFrame:
-    """Build a TZ-aware 5m MACD indicator DataFrame ending at ``end_ts``."""
-    idx = pd.date_range(end=end_ts, periods=n, freq="5min")
+    """Build a TZ-aware 30m MACD indicator DataFrame ending at ``end_ts``.
+
+    Default produces a neg→pos zero-cross at the latest bar so the
+    `_aux_macd_30m_cross_up` gate passes: ``hist[-2] = hist_prev = -0.5``
+    AND ``hist[-1] = hist_curr = 0.5``.
+    """
+    idx = pd.date_range(end=end_ts, periods=n, freq="30min")
+    hist = np.full(n, hist_prev, dtype=float)
+    if n >= 2:
+        hist[-2] = hist_prev
+    hist[-1] = hist_curr
     return pd.DataFrame(
         {
             "macd": np.full(n, macd_curr, dtype=float),
             "signal": np.full(n, signal_curr, dtype=float),
-            "hist": np.full(n, hist_curr, dtype=float),
+            "hist": hist,
         },
         index=idx,
     )
@@ -149,20 +159,20 @@ def _event(
     inds: dict[str, pd.DataFrame],
     bucket=None,
     *,
-    aux_macd_5m: pd.DataFrame | None = None,
+    aux_macd_30m: pd.DataFrame | None = None,
     inject_aux: bool = True,
 ) -> BarEvent:
     bucket_ts = bucket or bars.index[-1].to_pydatetime()
     payload = dict(inds)
-    if inject_aux and "macd_5m" not in payload:
-        # Default: aux 5m MACD positive at the bucket time so primary gates
-        # are decisive unless a test overrides via aux_macd_5m or
-        # inject_aux=False.
-        payload["macd_5m"] = aux_macd_5m if aux_macd_5m is not None else (
-            _macd_5m(end_ts=bucket_ts)
+    if inject_aux and "macd_30m" not in payload:
+        # Default: aux 30m MACD zero-cross neg→pos at the bucket time so
+        # primary gates are decisive unless a test overrides via
+        # aux_macd_30m or inject_aux=False.
+        payload["macd_30m"] = aux_macd_30m if aux_macd_30m is not None else (
+            _macd_30m(end_ts=bucket_ts)
         )
-    elif aux_macd_5m is not None:
-        payload["macd_5m"] = aux_macd_5m
+    elif aux_macd_30m is not None:
+        payload["macd_30m"] = aux_macd_30m
     return BarEvent(
         symbol=SYM,
         resolution=RES,
@@ -178,16 +188,16 @@ def _tick_event(
     *,
     ts: datetime,
     price: float,
-    aux_macd_5m: pd.DataFrame | None = None,
+    aux_macd_30m: pd.DataFrame | None = None,
     inject_aux: bool = True,
 ) -> TickEvent:
     payload = dict(inds)
-    if inject_aux and "macd_5m" not in payload:
-        payload["macd_5m"] = aux_macd_5m if aux_macd_5m is not None else (
-            _macd_5m(end_ts=ts)
+    if inject_aux and "macd_30m" not in payload:
+        payload["macd_30m"] = aux_macd_30m if aux_macd_30m is not None else (
+            _macd_30m(end_ts=ts)
         )
-    elif aux_macd_5m is not None:
-        payload["macd_5m"] = aux_macd_5m
+    elif aux_macd_30m is not None:
+        payload["macd_30m"] = aux_macd_30m
     return TickEvent(
         symbol=SYM,
         resolution=RES,
@@ -241,13 +251,13 @@ def test_no_entry_when_ma_flat():
     assert sig is None
 
 
-# ─── 4. KD floor (now 75) ────────────────────────────────────────────────
+# ─── 4. KD floor (now 65) ────────────────────────────────────────────────
 
 
 def test_no_entry_when_first_k_at_floor():
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
-    inds = _inds(bars, k_prev=75.0)
+    inds = _inds(bars, k_prev=65.0)
     sig = strat.on_bar(_event(bars, inds))
     assert sig is None
 
@@ -255,17 +265,17 @@ def test_no_entry_when_first_k_at_floor():
 def test_entry_at_kd_boundary_below_floor():
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
-    inds = _inds(bars, k_prev=74.99)
+    inds = _inds(bars, k_prev=64.99)
     sig = strat.on_bar(_event(bars, inds))
     assert sig is not None
     assert sig.side == "LONG"
 
 
 def test_no_entry_when_first_k_above_new_floor():
-    """KD floor lowered 80 → 75: K=78 (passed under old spec) now blocks."""
+    """KD floor lowered 75 → 65: K=70 (passed under old spec) now blocks."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
-    inds = _inds(bars, k_prev=78.0)
+    inds = _inds(bars, k_prev=70.0)
     sig = strat.on_bar(_event(bars, inds))
     assert sig is None
 
@@ -529,7 +539,7 @@ def test_on_tick_cooldown_blocks_then_releases():
     late_ts = exit_tick_ts + timedelta(seconds=4501)
     ev_late = _tick_event(
         bars, inds, ts=late_ts, price=205.0,
-        aux_macd_5m=_macd_5m(end_ts=late_ts),
+        aux_macd_30m=_macd_30m(end_ts=late_ts),
     )
     sig_late = strat.on_tick(ev_late)
     assert sig_late is not None
@@ -537,96 +547,99 @@ def test_on_tick_cooldown_blocks_then_releases():
     assert sig_late.ts == late_ts
 
 
-# ─── 13. 5m MACD aux gate (entry-only) ───────────────────────────────────
+# ─── 13. 30m MACD aux gate (entry-only) ──────────────────────────────────
 
 
-def test_no_entry_when_macd_5m_missing():
+def test_no_entry_when_macd_30m_missing():
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
     inds = _inds(bars)
     # Build event with no aux indicator at all.
     ev = _event(bars, inds, inject_aux=False)
-    assert "macd_5m" not in ev.indicators
+    assert "macd_30m" not in ev.indicators
     sig = strat.on_bar(ev)
     assert sig is None
 
 
-def test_no_entry_when_macd_5m_empty():
+def test_no_entry_when_macd_30m_empty():
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
     inds = _inds(bars)
     ev = _event(
         bars, inds, inject_aux=False,
-        aux_macd_5m=pd.DataFrame(),
+        aux_macd_30m=pd.DataFrame(),
     )
     sig = strat.on_bar(ev)
     assert sig is None
 
 
-def test_no_entry_when_macd_5m_negative():
+def test_no_entry_when_macd_30m_no_cross_up():
+    """Already-positive aux histogram (no neg→pos cross) blocks entry."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
     inds = _inds(bars)
     bucket = bars.index[-1].to_pydatetime()
     ev = _event(
         bars, inds,
-        aux_macd_5m=_macd_5m(end_ts=bucket, hist_curr=-0.1),
+        aux_macd_30m=_macd_30m(end_ts=bucket, hist_prev=0.1, hist_curr=0.5),
     )
     sig = strat.on_bar(ev)
     assert sig is None
 
 
-def test_no_entry_when_macd_5m_zero():
+def test_no_entry_when_macd_30m_curr_zero():
+    """Strict ``hist_curr > 0`` — exactly zero blocks."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
     inds = _inds(bars)
     bucket = bars.index[-1].to_pydatetime()
     ev = _event(
         bars, inds,
-        aux_macd_5m=_macd_5m(end_ts=bucket, hist_curr=0.0),
+        aux_macd_30m=_macd_30m(end_ts=bucket, hist_prev=-0.5, hist_curr=0.0),
     )
     sig = strat.on_bar(ev)
     assert sig is None
 
 
-def test_no_entry_when_macd_5m_stale_beyond_15min():
+def test_no_entry_when_macd_30m_stale_beyond_90min():
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
     inds = _inds(bars)
     bucket = bars.index[-1].to_pydatetime()
-    # Aux ends 16 min before the bucket → staleness guard blocks.
-    stale_end = bucket - timedelta(minutes=16)
+    # Aux ends 91 min before the bucket → staleness guard (3 × 30m) blocks.
+    stale_end = bucket - timedelta(minutes=91)
     ev = _event(
         bars, inds,
-        aux_macd_5m=_macd_5m(end_ts=stale_end, hist_curr=0.5),
+        aux_macd_30m=_macd_30m(end_ts=stale_end),
     )
     sig = strat.on_bar(ev)
     assert sig is None
 
 
-def test_entry_fires_when_macd_5m_within_staleness_window():
-    """Aux ends just inside the 15-minute staleness boundary (half-open).
+def test_entry_fires_when_macd_30m_within_staleness_window():
+    """Aux ends just inside the 90-minute staleness boundary (half-open).
 
-    Exactly 15 minutes is treated as stale (matches the ingest watchdog's
-    `>= 3 * delta` retire threshold), so we use 14m59s here to assert the
-    fresh-side of the boundary still fires.
+    Exactly 90 minutes is treated as stale (matches the ingest watchdog's
+    `>= 3 * delta` retire threshold for 30m bars), so we use 89m59s here
+    to assert the fresh-side of the boundary still fires.
     """
     strat = TradeStrat15K(params=TradeStrat15KParams())
     bars = _bars(5, last_close=200.0)
     inds = _inds(bars)
     bucket = bars.index[-1].to_pydatetime()
-    fresh_end = bucket - timedelta(minutes=14, seconds=59)
+    fresh_end = bucket - timedelta(minutes=89, seconds=59)
     ev = _event(
         bars, inds,
-        aux_macd_5m=_macd_5m(end_ts=fresh_end, hist_curr=0.5),
+        aux_macd_30m=_macd_30m(end_ts=fresh_end),
     )
     sig = strat.on_bar(ev)
     assert sig is not None
     assert sig.side == "LONG"
 
 
-def test_exit_ignores_macd_5m_gate():
-    """With an open position, a tick where 5m MACD is negative still TPs."""
+def test_exit_ignores_macd_30m_gate():
+    """With an open position, a tick where 30m MACD has not crossed up
+    still TPs."""
     st = mod._state_for(TradeStrat15K.name, SYM)
     bucket = DEFAULT_END_UTC
     st.position = _PositionState(
@@ -639,7 +652,8 @@ def test_exit_ignores_macd_5m_gate():
     inds = _inds(bars)
     ev = _event(
         bars, inds,
-        aux_macd_5m=_macd_5m(end_ts=bucket, hist_curr=-1.0),  # negative
+        # both negative — would block entry, but exit ignores the gate.
+        aux_macd_30m=_macd_30m(end_ts=bucket, hist_prev=-1.0, hist_curr=-0.5),
     )
     sig = TradeStrat15K(params=TradeStrat15KParams()).on_bar(ev)
     assert sig is not None
@@ -657,7 +671,7 @@ def _utc_for_taipei(year, month, day, hour, minute=0, second=0, microsecond=0):
 
 
 def test_no_entry_at_13_00_taipei():
-    """13:00 Taipei (inside 12:15–21:00 closed gap) → entry blocked."""
+    """13:00 Taipei (inside 12:15–15:00 closed gap) → entry blocked."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
     end_ts = _utc_for_taipei(2026, 5, 1, 13, 0)
     bars = _bars(5, last_close=200.0, end_ts=end_ts)
@@ -666,20 +680,20 @@ def test_no_entry_at_13_00_taipei():
     assert sig is None
 
 
-def test_no_entry_at_16_00_taipei():
-    """16:00 Taipei (was night-allowed pre-window-narrowing) → blocked."""
+def test_no_entry_at_14_59_59_boundary():
+    """14:59:59 Taipei → blocked (one second before night-window open at 15:00)."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
-    end_ts = _utc_for_taipei(2026, 5, 1, 16, 0)
+    end_ts = _utc_for_taipei(2026, 5, 1, 14, 59, 59, 999000)
     bars = _bars(5, last_close=200.0, end_ts=end_ts)
     inds = _inds(bars)
     sig = strat.on_bar(_event(bars, inds))
     assert sig is None
 
 
-def test_no_entry_at_20_59_59_boundary():
-    """20:59:59 Taipei → blocked (one second before night-window open)."""
+def test_no_entry_at_09_09_59_boundary():
+    """09:09:59 Taipei → blocked (one second before day-window open at 09:10)."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
-    end_ts = _utc_for_taipei(2026, 5, 1, 20, 59, 59, 999000)
+    end_ts = _utc_for_taipei(2026, 5, 1, 9, 9, 59, 999000)
     bars = _bars(5, last_close=200.0, end_ts=end_ts)
     inds = _inds(bars)
     sig = strat.on_bar(_event(bars, inds))
@@ -728,10 +742,10 @@ def test_entry_at_22_00_taipei():
     assert sig.side == "LONG"
 
 
-def test_entry_at_09_15_00_taipei_open():
-    """09:15:00 Taipei → first allowed instant of the day window."""
+def test_entry_at_09_10_00_taipei_open():
+    """09:10:00 Taipei → first allowed instant of the day window."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
-    end_ts = _utc_for_taipei(2026, 5, 1, 9, 15, 0)
+    end_ts = _utc_for_taipei(2026, 5, 1, 9, 10, 0)
     bars = _bars(5, last_close=200.0, end_ts=end_ts)
     inds = _inds(bars)
     sig = strat.on_bar(_event(bars, inds))
@@ -739,10 +753,10 @@ def test_entry_at_09_15_00_taipei_open():
     assert sig.side == "LONG"
 
 
-def test_entry_at_21_00_00_taipei_open():
-    """21:00:00 Taipei → first allowed instant of the night entry window."""
+def test_entry_at_15_00_00_taipei_open():
+    """15:00:00 Taipei → first allowed instant of the night entry window."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
-    end_ts = _utc_for_taipei(2026, 5, 1, 21, 0, 0)
+    end_ts = _utc_for_taipei(2026, 5, 1, 15, 0, 0)
     bars = _bars(5, last_close=200.0, end_ts=end_ts)
     inds = _inds(bars)
     sig = strat.on_bar(_event(bars, inds))
@@ -769,7 +783,7 @@ def test_exits_run_at_13_00_taipei():
 
 
 def test_window_reopen_rising_edge():
-    """Gates align before 12:15; latch reset at 12:15 close; entry fires at 21:00 reopen."""
+    """Gates align before 12:15; latch reset at 12:15 close; entry fires at 15:00 reopen."""
     strat = TradeStrat15K(params=TradeStrat15KParams())
 
     # 12:00 Taipei — gates align, fires LONG.
@@ -800,8 +814,8 @@ def test_window_reopen_rising_edge():
     assert sig_c is None
     assert st.last_long_ready is False
 
-    # 21:00 Taipei reopen — gates still aligned → fires immediately.
-    end_d = _utc_for_taipei(2026, 5, 1, 21, 0)
+    # 15:00 Taipei reopen — gates still aligned → fires immediately.
+    end_d = _utc_for_taipei(2026, 5, 1, 15, 0)
     bars_d = _bars(5, last_close=200.0, end_ts=end_d)
     inds_d = _inds(bars_d)
     sig_d = strat.on_bar(_event(bars_d, inds_d))

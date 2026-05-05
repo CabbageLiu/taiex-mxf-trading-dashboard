@@ -6,18 +6,24 @@ tick price crosses the threshold; DI_JUMP_1M still evaluates against
 closed-bar -DI deltas. Both ``on_bar`` (back-compat / backtest path) and
 ``on_tick`` route through the same ``_evaluate`` helper.
 
-Entry gates (all seven must hold; LONG only):
-  0. Entry window: Asia/Taipei time inside [09:15, 12:15) ∪ [21:00, 24:00).
-  1. ``price > MA120[-1]`` AND MA120 rising (``ma[-1] > ma[-2]``).
-  2. KD (1m): ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 75``.
-  3. MACD histogram (1m): ``hist[-2] < 0`` AND ``hist[-1] > 0``.
-  4. DMI: ``plus[-2] > minus[-2]`` AND ``plus[-1] > minus[-1]`` AND
+Entry gates (all must hold; LONG only):
+  0. Entry window: Asia/Taipei time inside [09:10, 11:15) ∪ [15:00, 24:00).
+  1. KD (1m): ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 65``.
+  2. MACD histogram (1m): ``hist[-1] > hist[-2]`` (rising; allows
+     ``hist[-2] >= 0`` cases as long as second value is strictly larger).
+  3. DMI (1m): ``plus[-2] > minus[-2]`` AND ``plus[-1] > minus[-1]`` AND
      ``minus[-1] < minus[-2]``.
-  5. 5m MACD confirmation: most-recent 5m ``hist > 0`` AND last 5m bar is
-     no more than 15 minutes old vs the dispatch ``ts`` (staleness guard).
-  6. 5m KD confirmation: ``k_5m[-2] > d_5m[-2]`` AND ``k_5m[-1] > d_5m[-1]``
-     AND ``k_5m[-1] > kd_5m_floor`` (default 65.0). Same 15-minute
-     staleness guard as the 5m MACD gate.
+  4. 3m KD confirmation: ``k_3m[-2] > d_3m[-2]`` AND
+     ``k_3m[-1] > d_3m[-1]`` AND ``k_3m[-2] < 65``. Cold/empty/stale
+     beyond 9 minutes (3 × 3m) all block.
+  5. 3m MACD confirmation: ``hist_3m[-1] > hist_3m[-2]`` (rising). Same
+     9-minute staleness guard.
+  6. 3m DMI confirmation: ``plus_3m[-2] > minus_3m[-2]`` AND
+     ``plus_3m[-1] > minus_3m[-1]`` AND ``minus_3m[-1] < minus_3m[-2]``.
+     Same 9-minute staleness guard.
+
+Note: the spec does NOT include an MA120 trend gate for 1K. The previous
+revision required ``close > MA120 AND MA120 rising``; the gate is removed.
 
 Exit priority (per tick or bar close, first match wins):
   TP          — pnl ≥ 50
@@ -25,9 +31,9 @@ Exit priority (per tick or bar close, first match wins):
   TRAIL       — pnl ≤ peak_pnl − 50 (peak tracked from entry, starts at 0)
   DI_JUMP_1M  — minus_di[-1] − minus_di[-2] > 10 (strict ``>``, closed bars)
 
-Exits ignore the entry-window gate AND the 5m MACD / 5m KD gates — open
-positions must remain closeable any time, including the 12:15–21:00
-no-entry stretch and the overnight 00:00–05:00 stretch.
+Exits ignore the entry-window gate AND the 3m aux gates — open positions
+must remain closeable any time, including the 11:15–15:00 no-entry stretch
+and the overnight 00:00–05:00 stretch.
 
 Cooldown: 300 seconds after EXIT (time-based, not bar-counted). While
 ``ts < cooldown_until`` evaluation returns None and resets
@@ -45,7 +51,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import ClassVar
 
 import pandas as pd
@@ -55,6 +61,11 @@ from app.config import get_settings
 from app.strategies.base import BarEvent, Signal, Strategy, TickEvent, in_entry_window
 from app.strategies.registry import register_strategy
 
+_DAY_OPEN = time(9, 10)
+_DAY_CLOSE = time(11, 15)
+_NIGHT_OPEN = time(15, 0)
+_AUX_STALENESS = timedelta(minutes=9)  # 3 × 3m
+
 
 class TradeStrat1KParams(BaseModel):
     enable_short: bool = False
@@ -62,7 +73,7 @@ class TradeStrat1KParams(BaseModel):
     kd_period: int = 9
     kd_k_smooth: int = 3
     kd_d_smooth: int = 3
-    kd_long_floor: float = 75.0
+    kd_long_floor: float = 65.0  # first 1m K must be below this
 
     macd_fast: int = 12
     macd_slow: int = 26
@@ -70,7 +81,7 @@ class TradeStrat1KParams(BaseModel):
 
     dmi_period: int = 14
 
-    kd_5m_floor: float = 65.0  # second 5m K must exceed this to confirm
+    kd_3m_floor: float = 65.0  # first 3m K must be below this to confirm
 
     tp_points: float = 50.0
     sl_points: float = 40.0
@@ -158,9 +169,6 @@ def _snapshot_ind(
 
 
 def _long_entry_now(
-    close_curr: float | None,
-    ma_prev: float | None,
-    ma_curr: float | None,
     k_prev: float | None,
     d_prev: float | None,
     k_curr: float | None,
@@ -173,41 +181,43 @@ def _long_entry_now(
     minus_curr: float | None,
     kd_long_floor: float,
 ) -> bool:
+    """Evaluate the three primary 1m entry gates (KD / MACD / DMI).
+
+    Spec drops the MA120 trend gate (close>MA + MA rising) at 1K — the
+    helper signature reflects that. The MACD gate is "rising" semantics:
+    ``hist_curr > hist_prev`` (both non-None), permitting both
+    ``hist_prev < 0`` and ``hist_prev >= 0`` cases as long as the second
+    histogram strictly exceeds the first.
+    """
     if None in (
-        close_curr, ma_prev, ma_curr,
         k_prev, d_prev, k_curr, d_curr,
         hist_prev, hist_curr,
         plus_prev, plus_curr, minus_prev, minus_curr,
     ):
         return False
-    gate_ma = close_curr > ma_curr and ma_curr > ma_prev
     gate_kd = k_prev > d_prev and k_curr > d_curr and k_prev < kd_long_floor
-    gate_macd = hist_prev < 0 and hist_curr > 0
+    gate_macd = hist_curr > hist_prev
     gate_dmi = (
         plus_prev > minus_prev
         and plus_curr > minus_curr
         and minus_curr < minus_prev
     )
-    return gate_ma and gate_kd and gate_macd and gate_dmi
+    return gate_kd and gate_macd and gate_dmi
 
 
-def _kd_5m_ok(
-    kd_5m: pd.DataFrame | None,
+def _aux_fresh(
+    df: pd.DataFrame | None,
     ts: datetime,
-    floor: float,
-    *,
-    max_age: timedelta = timedelta(minutes=15),
+    max_age: timedelta = _AUX_STALENESS,
 ) -> bool:
-    """Auxiliary 5-minute KD confirmation gate.
+    """Common staleness check for 3m aux frames.
 
-    Block (returns False) when the aux frame is missing/empty, the most
-    recent 5m bar is older than ``max_age`` vs ``ts``, any of the four
-    K/D scalars is None/NaN, the two K/D pairs do not show K>D, or the
-    most recent K does not exceed ``floor``.
+    Returns True when ``df`` exists, has at least one row, and the most
+    recent index entry is younger than ``max_age`` vs ``ts``.
     """
-    if kd_5m is None or len(kd_5m) == 0:
+    if df is None or len(df) == 0:
         return False
-    last_idx = kd_5m.index[-1]
+    last_idx = df.index[-1]
     if isinstance(last_idx, pd.Timestamp):
         last_dt = last_idx.to_pydatetime()
     else:
@@ -216,15 +226,81 @@ def _kd_5m_ok(
         last_dt = last_dt.replace(tzinfo=ts.tzinfo)
     elif last_dt.tzinfo is not None and ts.tzinfo is None:
         ts = ts.replace(tzinfo=last_dt.tzinfo)
-    if (ts - last_dt) >= max_age:
+    return (ts - last_dt) < max_age
+
+
+def _kd_3m_ok(
+    kd_3m: pd.DataFrame | None,
+    ts: datetime,
+    floor: float,
+) -> bool:
+    """Auxiliary 3-minute KD confirmation gate.
+
+    Block when the aux frame is missing/empty/stale (>=9min) or any of the
+    four K/D scalars is None/NaN, the two K/D pairs do not show K>D, or
+    the FIRST K is not strictly below ``floor`` (default 65). This matches
+    spec wording "first KS<65".
+    """
+    if not _aux_fresh(kd_3m, ts):
         return False
-    k_prev = _scalar(kd_5m["k"], idx=-2) if "k" in kd_5m.columns else None
-    d_prev = _scalar(kd_5m["d"], idx=-2) if "d" in kd_5m.columns else None
-    k_curr = _scalar(kd_5m["k"], idx=-1) if "k" in kd_5m.columns else None
-    d_curr = _scalar(kd_5m["d"], idx=-1) if "d" in kd_5m.columns else None
+    if "k" not in kd_3m.columns or "d" not in kd_3m.columns:
+        return False
+    k_prev = _scalar(kd_3m["k"], idx=-2)
+    d_prev = _scalar(kd_3m["d"], idx=-2)
+    k_curr = _scalar(kd_3m["k"], idx=-1)
+    d_curr = _scalar(kd_3m["d"], idx=-1)
     if None in (k_prev, d_prev, k_curr, d_curr):
         return False
-    return k_prev > d_prev and k_curr > d_curr and k_curr > floor
+    return k_prev > d_prev and k_curr > d_curr and k_prev < floor
+
+
+def _macd_3m_rising(
+    macd_3m: pd.DataFrame | None,
+    ts: datetime,
+) -> bool:
+    """Auxiliary 3-minute MACD-histogram rising gate.
+
+    Block when missing/empty/stale (>=9min) or either of the last two
+    histogram scalars is None/NaN or the second histogram is not strictly
+    larger than the first. Matches spec wording "second MACD histogram >
+    first MACD histogram" — no zero-cross requirement.
+    """
+    if not _aux_fresh(macd_3m, ts):
+        return False
+    if "hist" not in macd_3m.columns:
+        return False
+    hist_prev = _scalar(macd_3m["hist"], idx=-2)
+    hist_curr = _scalar(macd_3m["hist"], idx=-1)
+    if hist_prev is None or hist_curr is None:
+        return False
+    return hist_curr > hist_prev
+
+
+def _dmi_3m_ok(
+    dmi_3m: pd.DataFrame | None,
+    ts: datetime,
+) -> bool:
+    """Auxiliary 3-minute DMI confirmation gate.
+
+    Block when missing/empty/stale (>=9min) or any +DI / -DI scalar is
+    None/NaN, the two +DI / -DI pairs do not show +DI > -DI, or the second
+    -DI is not strictly less than the first -DI.
+    """
+    if not _aux_fresh(dmi_3m, ts):
+        return False
+    if "plus_di" not in dmi_3m.columns or "minus_di" not in dmi_3m.columns:
+        return False
+    plus_prev = _scalar(dmi_3m["plus_di"], idx=-2)
+    plus_curr = _scalar(dmi_3m["plus_di"], idx=-1)
+    minus_prev = _scalar(dmi_3m["minus_di"], idx=-2)
+    minus_curr = _scalar(dmi_3m["minus_di"], idx=-1)
+    if None in (plus_prev, plus_curr, minus_prev, minus_curr):
+        return False
+    return (
+        plus_prev > minus_prev
+        and plus_curr > minus_curr
+        and minus_curr < minus_prev
+    )
 
 
 @register_strategy
@@ -232,19 +308,22 @@ class TradeStrat1K(Strategy):
     name: ClassVar[str] = "strat_1k"
     display_name: ClassVar[str] = "1K策略"
     description: ClassVar[str] = (
-        "1 分鐘多單策略；開倉時段 09:15-12:15 / 21:00-24:00；進場："
-        "close>MA120 且 MA120 向上、1m KD 連兩 KS>DS 且首根 KS<75、"
-        "1m MACD 直方翻正、+DI>-DI 且 -DI 縮、5m MACD>0、"
-        "5m KD 連兩 KS>DS 且第二根 KS>65；"
+        "1 分鐘多單策略；開倉時段 09:10-11:15 / 15:00-24:00；進場："
+        "1m KD 連兩 KS>DS 且首根 KS<65、1m MACD 直方上升 (第二根>第一根)、"
+        "+DI>-DI 且 -DI 縮、3m KD 連兩 KS>DS 且首根 KS<65、3m MACD 直方上升、"
+        "3m +DI>-DI 且 -DI 縮；"
         "出場：TP 50 / SL −40 / 移動停損 50 / 1 分鐘 -DI 跳升 (>10 點)。"
     )
     spec: ClassVar[dict[str, str]] = {
-        "週期": "1 分鐘",
-        "開倉時段": "09:15-12:15 / 21:00-24:00 (Asia/Taipei)",
+        "週期": "1 分鐘 (3 分鐘輔助)",
+        "開倉時段": "09:10-11:15 / 15:00-24:00 (Asia/Taipei)",
         "進場": (
-            "close>MA120 且 MA120 向上；1 分鐘 KD 連兩根 KS>DS 且第一根 KS<75；"
-            "1 分鐘 MACD 直方圖由負翻正；+DI>-DI 連兩根且第二根 -DI 縮；"
-            "5 分鐘 MACD 直方圖>0；5 分鐘 KD 連兩根 KS>DS 且第二根 KS>65"
+            "1 分鐘 KD 連兩根 KS>DS 且第一根 KS<65；"
+            "1 分鐘 MACD 直方圖第二根>第一根；"
+            "1 分鐘 +DI>-DI 連兩根且第二根 -DI 縮；"
+            "3 分鐘 KD 連兩根 KS>DS 且第一根 KS<65；"
+            "3 分鐘 MACD 直方圖第二根>第一根；"
+            "3 分鐘 +DI>-DI 連兩根且第二根 -DI 縮"
         ),
         "出場": (
             "獲利 50 點 / 虧損 40 點 / 移動停損 50 點 / "
@@ -252,28 +331,32 @@ class TradeStrat1K(Strategy):
         ),
         "冷卻": "出場後 5 分鐘 (300 秒)",
         "備註": (
-            "僅多單；訊號逐筆即時觸發；出場不受開倉時段與 5m MACD / 5m KD 限制"
+            "僅多單；訊號逐筆即時觸發；出場不受開倉時段與 3m 輔助條件限制"
         ),
     }
     resolutions: ClassVar[list[str]] = ["1m"]
     tick_resolutions: ClassVar[list[str]] = ["1m"]
     params_schema: ClassVar[type[BaseModel]] = TradeStrat1KParams
     indicator_specs: ClassVar[dict[str, dict]] = {
-        "ma120": {"kind": "ma", "params": {"period": 120, "kind": "sma"}},
         "kd": {"kind": "kd", "params": {"period": 9, "k_smooth": 3, "d_smooth": 3}},
         "macd": {"kind": "macd", "params": {"fast": 12, "slow": 26, "signal": 9}},
         "dmi": {"kind": "dmi", "params": {"period": 14}},
     }
     aux_indicator_specs: ClassVar[dict[str, dict]] = {
-        "macd_5m": {
-            "kind": "macd",
-            "params": {"fast": 12, "slow": 26, "signal": 9},
-            "resolution": "5m",
-        },
-        "kd_5m": {
+        "kd_3m": {
             "kind": "kd",
             "params": {"period": 9, "k_smooth": 3, "d_smooth": 3},
-            "resolution": "5m",
+            "resolution": "3m",
+        },
+        "macd_3m": {
+            "kind": "macd",
+            "params": {"fast": 12, "slow": 26, "signal": 9},
+            "resolution": "3m",
+        },
+        "dmi_3m": {
+            "kind": "dmi",
+            "params": {"period": 14},
+            "resolution": "3m",
         },
     }
 
@@ -431,53 +514,41 @@ class TradeStrat1K(Strategy):
         # 0a. Entry-window gate. When closed, reset the rising-edge latch so
         # that pre-aligned gates fire as a fresh rising edge on the first
         # tick after the window reopens.
-        if not in_entry_window(ts, get_settings().tz):
+        if not in_entry_window(
+            ts,
+            get_settings().tz,
+            day_open=_DAY_OPEN,
+            day_close=_DAY_CLOSE,
+            night_open=_NIGHT_OPEN,
+        ):
             st.last_long_ready = False
             return None
 
-        # 0b. 5m MACD confirmation gate (entry-only; exits ignore it).
-        # Cold start (no aux bars yet) → block. Staleness guard: 5m bars
-        # should be < 3 × 5m delta = 15 minutes old vs the dispatch ts
-        # (matches the ingest watchdog `>= 3 * delta` retire threshold,
-        # so we treat exactly-15-min as stale, same as the watchdog).
-        # Latch reset on every block path so a recovering 5m gate is
+        # 0b. 3m KD / MACD / DMI confirmation gates (entry-only; exits ignore
+        # them). Each helper handles missing/empty/stale (>=9min) → block.
+        # Latch reset on every block path so a recovering aux gate is
         # detected as a fresh rising edge, not a phantom one carried over
-        # from a previous tick where the latch was set True before the
-        # 5m gate started failing.
-        macd_5m = indicators.get("macd_5m")
-        if macd_5m is None or len(macd_5m) == 0:
+        # from a previous tick where the latch was set True before the gate
+        # started failing.
+        kd_3m = indicators.get("kd_3m")
+        if not _kd_3m_ok(kd_3m, ts, p.kd_3m_floor):
             st.last_long_ready = False
             return None
-        last_5m_ts = macd_5m.index[-1]
-        if isinstance(last_5m_ts, pd.Timestamp):
-            last_5m_ts = last_5m_ts.to_pydatetime()
-        if last_5m_ts.tzinfo is None:
-            last_5m_ts = last_5m_ts.replace(tzinfo=ts.tzinfo)
-        if ts - last_5m_ts >= timedelta(minutes=15):
+        macd_3m = indicators.get("macd_3m")
+        if not _macd_3m_rising(macd_3m, ts):
             st.last_long_ready = False
             return None
-        hist_5m = _scalar(macd_5m["hist"], idx=-1)
-        if hist_5m is None or hist_5m <= 0:
+        dmi_3m = indicators.get("dmi_3m")
+        if not _dmi_3m_ok(dmi_3m, ts):
             st.last_long_ready = False
             return None
 
-        # 0c. 5m KD confirmation gate. Same shape as the 5m MACD gate:
-        # cold/empty/stale (≥15min)/K-not-above-D / second-K-below-floor
-        # all reset the rising-edge latch and block.
-        kd_5m = indicators.get("kd_5m")
-        if not _kd_5m_ok(kd_5m, ts, p.kd_5m_floor):
-            st.last_long_ready = False
-            return None
-
-        ma = indicators.get("ma120")
         kd = indicators.get("kd")
         macd = indicators.get("macd")
         dmi = indicators.get("dmi")
-        if ma is None or kd is None or macd is None or dmi is None:
+        if kd is None or macd is None or dmi is None:
             return None
 
-        ma_prev = _scalar(ma["ma"], idx=-2)
-        ma_curr = _scalar(ma["ma"], idx=-1)
         k_prev = _scalar(kd["k"], idx=-2)
         d_prev = _scalar(kd["d"], idx=-2)
         k_curr = _scalar(kd["k"], idx=-1)
@@ -489,10 +560,7 @@ class TradeStrat1K(Strategy):
         minus_prev = _scalar(dmi["minus_di"], idx=-2)
         minus_curr = _scalar(dmi["minus_di"], idx=-1)
 
-        # Pass tick `price` as `close_curr` so close>MA gate evaluates against
-        # live tick price (intra-bar firing).
         long_now = _long_entry_now(
-            price, ma_prev, ma_curr,
             k_prev, d_prev, k_curr, d_curr,
             hist_prev, hist_curr,
             plus_prev, plus_curr, minus_prev, minus_curr,
