@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from typing import Any
 
+import pandas as pd
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.adapters.base import MarketDataAdapter, Tick
@@ -16,6 +17,8 @@ from app.db.engine import session_scope
 from app.db.models import Tick as TickRow
 
 log = logging.getLogger("taiex.ingest")
+
+_BAR_BUFFER_MAXLEN = 600
 
 RESOLUTIONS = ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "1h", "4h", "12h", "1d", "1w", "1mo"]
 RESOLUTION_DELTAS = {
@@ -56,6 +59,7 @@ class IngestRunner:
         self._task: asyncio.Task[None] | None = None
         self._watchdog_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._ready = asyncio.Event()
         self._subscribers: dict[str, set[asyncio.Queue]] = defaultdict(set)
         self._open_buckets: dict[str, datetime] = {}
         # Tombstones: bucket starts that have already been bar_close'd, kept
@@ -64,11 +68,38 @@ class IngestRunner:
         # second close on the next bucket boundary.
         self._closed_buckets: dict[str, list[datetime]] = defaultdict(list)
         self._last_tick: Tick | None = None
+        # Per-resolution OHLC accumulator for the currently-open bucket. On
+        # bucket boundary the accumulator is finalized into ``_closed_bars``.
+        # Strategies read from ``_closed_bars`` via ``snapshot_bars`` — this
+        # is the strategy-path source of truth and bypasses the cagg refresh
+        # lag entirely (cagg remains source of truth for the /bars REST + UI
+        # + backtest paths).
+        self._bucket_ohlc: dict[str, dict[str, Any]] = {}
+        self._closed_bars: dict[str, deque[dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=_BAR_BUFFER_MAXLEN)
+        )
+        # Per-resolution last bar_close timestamp. Powers /status liveness.
+        self._last_close_ts: dict[str, datetime] = {}
+        # Per-resolution count of subscriber-queue overflow drops.
+        self._dropped: dict[str, int] = defaultdict(int)
 
     async def start(self) -> None:
         if self._task is not None:
             return
         self._stop.clear()
+        self._ready.clear()
+        # Pre-ready phase: hydrate the in-memory bar buffer from cagg AND
+        # backfill recent ticks BEFORE flipping the ready event. Subscribers
+        # that await `ready()` (e.g. StrategyLoop) are guaranteed a warm
+        # buffer + recent ticks persisted before the live tick stream begins.
+        # If hydration ran AFTER `_ready.set()`, `snapshot_bars` could return
+        # stale data while live ticks were already flowing.
+        await self._hydrate_bar_buffer()
+        try:
+            await self._backfill_recent()
+        except Exception:
+            log.exception("backfill failed; continuing to live ingest")
+        self._ready.set()
         self._task = asyncio.create_task(self._run(), name="ingest-runner")
         self._watchdog_task = asyncio.create_task(
             self._watchdog_loop(), name="ingest-watchdog"
@@ -103,12 +134,83 @@ class IngestRunner:
     def last_tick(self) -> Tick | None:
         return self._last_tick
 
-    async def _run(self) -> None:
-        try:
-            await self._backfill_recent()
-        except Exception:
-            log.exception("backfill failed; continuing to live ingest")
+    async def ready(self) -> None:
+        """Block until the bar buffer has been hydrated from cagg."""
+        await self._ready.wait()
 
+    @property
+    def is_ready(self) -> bool:
+        return self._ready.is_set()
+
+    @property
+    def dropped_counts(self) -> dict[str, int]:
+        return dict(self._dropped)
+
+    @property
+    def last_close_ts(self) -> dict[str, datetime]:
+        return dict(self._last_close_ts)
+
+    def snapshot_bars(self, resolution: str, limit: int | None = None) -> pd.DataFrame:
+        """Return the closed bars for ``resolution`` as a pandas DataFrame.
+
+        Index is ``bucket`` (UTC datetime), columns: open / high / low /
+        close / tick_count. Returns an empty DataFrame with the expected
+        columns when the buffer is cold or the resolution is unknown.
+        """
+        bars = list(self._closed_bars.get(resolution, ()))
+        if not bars:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "tick_count"])
+        if limit is not None and limit > 0 and limit < len(bars):
+            bars = bars[-limit:]
+        df = pd.DataFrame(bars).set_index("bucket")
+        # Buffer entries may carry naive (test) or tz-aware (cagg) datetimes.
+        # `utc=True` normalises both to a UTC tz-aware index — required for
+        # downstream indicator math + matches cagg-via-`load_bars` semantics.
+        df.index = pd.to_datetime(df.index, utc=True)
+        return df
+
+    async def _hydrate_bar_buffer(self) -> None:
+        """Fill the per-resolution closed-bar buffer from cagg.
+
+        Best effort — any failure (DB cold, cagg empty, transient error)
+        leaves the affected resolution's deque empty; the live tick path
+        will populate it as ticks flow. Strategies tolerate undersized
+        windows by returning False from gate evaluation when there are
+        not enough bars (e.g. ``MA120`` requires 120 bars, otherwise
+        ``_scalar(series, idx=-2)`` returns None and entries block).
+        """
+        # Local import: app.api.routes.bars imports from app.ingest.runner
+        # in some indirect chains; keeping this lazy avoids any import cycle.
+        from app.api.routes.bars import load_bars
+
+        symbol = self._settings.symbol_display
+        for res in RESOLUTIONS:
+            try:
+                df = await load_bars(symbol, res, limit=_BAR_BUFFER_MAXLEN)
+            except Exception:
+                log.exception("hydrate buffer failed for %s; continuing cold", res)
+                continue
+            if df is None or df.empty:
+                continue
+            buf = self._closed_bars[res]
+            buf.clear()
+            for ts, row in df.iterrows():
+                buf.append(
+                    {
+                        "bucket": ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "tick_count": int(row.get("tick_count", 0) or 0),
+                    }
+                )
+            if buf:
+                self._last_close_ts[res] = buf[-1]["bucket"]
+
+    async def _run(self) -> None:
+        # `_backfill_recent` ran during `start()` (pre-ready phase) so the
+        # buffer + tick table are warm before live streaming begins.
         while not self._stop.is_set():
             try:
                 async for tick in self._adapter.stream_ticks():
@@ -143,7 +245,48 @@ class IngestRunner:
                 await self._emit_close(res, prev)
                 self._mark_closed(res, prev)
             self._open_buckets[res] = bucket
+            self._update_bucket_ohlc(res, bucket, tick)
             await self._emit_update(res, bucket, tick)
+
+    def _update_bucket_ohlc(self, resolution: str, bucket: datetime, tick: Tick) -> None:
+        """Maintain the OHLC accumulator for the currently-open bucket.
+
+        First tick of a bucket initialises (open=high=low=close=price); each
+        subsequent tick updates high/low/close and tick_count. The finalised
+        OHLC is appended to ``_closed_bars`` inside ``_emit_close``.
+        """
+        price = float(tick.price)
+        st = self._bucket_ohlc.get(resolution)
+        if st is None or st["bucket"] != bucket:
+            self._bucket_ohlc[resolution] = {
+                "bucket": bucket,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "tick_count": 1,
+            }
+            return
+        if price > st["high"]:
+            st["high"] = price
+        if price < st["low"]:
+            st["low"] = price
+        st["close"] = price
+        st["tick_count"] += 1
+
+    def _finalize_bucket(self, resolution: str, bucket: datetime) -> None:
+        """Append the bucket's accumulated OHLC to ``_closed_bars``.
+
+        Append-only: never mutates earlier rows. ``IndicatorCache`` keys on
+        ``bars.index[-1]`` so monotonic appends preserve cache correctness.
+        Idempotent — calling twice for the same bucket pops the accumulator
+        on the first call and is a no-op on the second.
+        """
+        st = self._bucket_ohlc.get(resolution)
+        if st is None or st["bucket"] != bucket:
+            return
+        self._closed_bars[resolution].append(dict(st))
+        self._bucket_ohlc.pop(resolution, None)
 
     async def _watchdog_tick(self) -> None:
         """Force-close any open bucket that is clearly stale.
@@ -213,6 +356,11 @@ class IngestRunner:
         await self._fanout(resolution, msg)
 
     async def _emit_close(self, resolution: str, bucket: datetime) -> None:
+        # Finalize the in-memory bar buffer FIRST so any subscriber that
+        # immediately calls `snapshot_bars` sees the just-closed bucket.
+        # Idempotent if called twice for the same bucket.
+        self._finalize_bucket(resolution, bucket)
+        self._last_close_ts[resolution] = bucket
         msg = {
             "type": "bar_close",
             "resolution": resolution,
@@ -226,7 +374,13 @@ class IngestRunner:
             try:
                 q.put_nowait(msg)
             except asyncio.QueueFull:
-                log.warning("subscriber queue full; dropping message")
+                self._dropped[resolution] += 1
+                log.error(
+                    "subscriber queue full for %s; dropping %s (total dropped=%d)",
+                    resolution,
+                    msg.get("type"),
+                    self._dropped[resolution],
+                )
 
     async def stream(self, resolution: str) -> AsyncIterator[dict[str, Any]]:
         q = self.subscribe(resolution)

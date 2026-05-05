@@ -200,6 +200,8 @@ async def test_start_creates_watchdog_task_and_stop_cancels_it():
     runner = IngestRunner(adapter=_SilentAdapter())
     # Avoid running the heavy _backfill_recent path inside _run().
     runner._backfill_recent = AsyncMock()  # type: ignore[method-assign]
+    # Hydration would try to query cagg — short-circuit it.
+    runner._hydrate_bar_buffer = AsyncMock()  # type: ignore[method-assign]
 
     await runner.start()
     try:
@@ -222,3 +224,134 @@ async def test_watchdog_loop_cancels_cleanly():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# ---------------------------------------------------------------------------
+# In-memory bar buffer (Phase 2.1) — append-only, snapshot accessor,
+# OHLC accumulator, ready event.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_snapshot_bars_returns_just_closed_bucket():
+    """After ``_emit_close`` finalizes a bucket, ``snapshot_bars`` must
+    surface it immediately — no DB roundtrip, no cagg dependency.
+    """
+    from app.adapters.base import Tick
+
+    runner = IngestRunner(adapter=_SilentAdapter())
+    runner._persist = AsyncMock()  # type: ignore[method-assign]
+
+    tz = runner._settings.tz
+    base = _bucket_start(datetime(2026, 5, 5, 12, 0, tzinfo=tz), "1m")
+    # Two ticks in bucket A (one open + one updating high/close).
+    await runner._handle_tick(Tick(ts=base + timedelta(seconds=10), symbol="MXF", price=41200.0, source="TEST"))
+    await runner._handle_tick(Tick(ts=base + timedelta(seconds=40), symbol="MXF", price=41250.0, source="TEST"))
+    # First tick of bucket B → triggers _emit_close for bucket A.
+    await runner._handle_tick(Tick(ts=base + timedelta(seconds=70), symbol="MXF", price=41260.0, source="TEST"))
+
+    df = runner.snapshot_bars("1m", limit=10)
+    assert not df.empty
+    # The just-closed bucket A must be in the snapshot, with OHLC built
+    # from the two A-bucket ticks.
+    assert df.index[-1] == base
+    assert df.loc[base, "open"] == 41200.0
+    assert df.loc[base, "high"] == 41250.0
+    assert df.loc[base, "low"] == 41200.0
+    assert df.loc[base, "close"] == 41250.0
+    assert int(df.loc[base, "tick_count"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_snapshot_bars_cold_returns_empty_dataframe():
+    runner = IngestRunner(adapter=_SilentAdapter())
+    df = runner.snapshot_bars("15m")
+    assert df.empty
+    assert list(df.columns) == ["open", "high", "low", "close", "tick_count"]
+
+
+@pytest.mark.asyncio
+async def test_buffer_is_append_only_for_indicator_cache_invariant():
+    """``IndicatorCache`` invalidates only when ``bars.index[-1]`` changes.
+    The buffer must never mutate earlier rows in place — ``_emit_close``
+    is the only path that may grow the deque, and it appends only.
+    """
+    from app.adapters.base import Tick
+
+    runner = IngestRunner(adapter=_SilentAdapter())
+    runner._persist = AsyncMock()  # type: ignore[method-assign]
+
+    tz = runner._settings.tz
+    base = _bucket_start(datetime(2026, 5, 5, 12, 0, tzinfo=tz), "1m")
+    # Three buckets: snapshot the first two, then close the third.
+    for i in range(3):
+        await runner._handle_tick(Tick(
+            ts=base + timedelta(minutes=i, seconds=10),
+            symbol="MXF", price=41000.0 + i, source="TEST",
+        ))
+    # At this point bucket 0 + 1 are closed (deque has 2 entries); bucket 2
+    # is the open accumulator.
+    df_before = runner.snapshot_bars("1m")
+    snapshot_first_two = df_before.copy()
+
+    # Drive one more boundary so bucket 2 closes.
+    await runner._handle_tick(Tick(
+        ts=base + timedelta(minutes=3, seconds=5),
+        symbol="MXF", price=41010.0, source="TEST",
+    ))
+
+    df_after = runner.snapshot_bars("1m")
+    # New bucket appended at the end.
+    assert len(df_after) == len(df_before) + 1
+    # The first two rows are byte-for-byte unchanged (no in-place mutation).
+    assert df_after.iloc[: len(snapshot_first_two)].equals(snapshot_first_two)
+
+
+@pytest.mark.asyncio
+async def test_dropped_counter_increments_on_queue_overflow():
+    """Subscriber-queue overflow must increment a per-resolution counter
+    and log loudly so an operator can detect feed/consumer back-pressure.
+    """
+    runner = IngestRunner(adapter=_SilentAdapter())
+
+    # Tiny queue we control: maxsize=1 so a single un-consumed message
+    # forces the second `put_nowait` to drop.
+    q: asyncio.Queue = asyncio.Queue(maxsize=1)
+    runner._subscribers["1m"].add(q)
+
+    await runner._emit_update("1m", _bucket_start(datetime.now(runner._settings.tz), "1m"),
+                               type("T", (), {"price": 100.0, "ts": datetime.now(runner._settings.tz), "symbol": "MXF"})())
+    await runner._emit_update("1m", _bucket_start(datetime.now(runner._settings.tz), "1m"),
+                               type("T", (), {"price": 101.0, "ts": datetime.now(runner._settings.tz), "symbol": "MXF"})())
+
+    assert runner.dropped_counts.get("1m", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_last_close_ts_records_per_resolution_close():
+    """Phase 2.2: ``last_close_ts`` exposes the most recent bar_close per
+    resolution for /status liveness."""
+    runner = IngestRunner(adapter=_SilentAdapter())
+    bucket = _bucket_start(datetime(2026, 5, 5, 12, 30, tzinfo=runner._settings.tz), "15m")
+    runner._open_buckets["15m"] = bucket
+    await runner._emit_close("15m", bucket)
+    assert runner.last_close_ts.get("15m") == bucket
+
+
+@pytest.mark.asyncio
+async def test_ready_blocks_until_hydration_completes():
+    """``runner.ready()`` must not return until ``start()``'s hydration
+    pass has completed."""
+    runner = IngestRunner(adapter=_SilentAdapter())
+    runner._backfill_recent = AsyncMock()  # type: ignore[method-assign]
+    # Stub hydration to a no-op (no DB) so start() doesn't hit the engine.
+    runner._hydrate_bar_buffer = AsyncMock()  # type: ignore[method-assign]
+
+    assert not runner.is_ready
+    await runner.start()
+    try:
+        assert runner.is_ready
+        # ready() resolves immediately when already set.
+        await asyncio.wait_for(runner.ready(), timeout=0.1)
+    finally:
+        await runner.stop()

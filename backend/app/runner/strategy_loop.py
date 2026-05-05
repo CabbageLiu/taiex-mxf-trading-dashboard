@@ -54,45 +54,72 @@ class StrategyLoop:
         self._tasks.clear()
 
     async def _loop(self, resolution: str) -> None:
-        q = self._ingest.subscribe(resolution)
+        # The entire body — including `ready()` await + `subscribe()` — is
+        # wrapped in the outer crash handler so that any error during start
+        # (e.g. AttributeError raised inside `ready()` itself) is logged via
+        # `strategy loop %s crashed` rather than escaping silently into the
+        # task. `q` is initialised to None so the `finally` unsubscribe is
+        # safe even when subscribe never ran.
+        q: asyncio.Queue | None = None
         try:
+            # Block until the IngestRunner has hydrated its in-memory bar
+            # buffer. `IngestRunner.start()` awaits hydration before
+            # returning, so under normal `app/main.py` ordering this
+            # resolves immediately — but the explicit await guards against
+            # any future re-ordering and makes the dependency
+            # self-documenting. `hasattr` (not try/except) so an internal
+            # AttributeError surfaces.
+            if hasattr(self._ingest, "ready") and callable(self._ingest.ready):
+                await self._ingest.ready()
+            q = self._ingest.subscribe(resolution)
             while not self._stop.is_set():
-                msg = await q.get()
-                msg_type = msg.get("type")
-                if msg_type == "bar_close":
-                    bucket = datetime.fromisoformat(msg["bucket"])
-                    await self._on_bar_close(resolution, bucket)
-                elif msg_type == "bar_update":
-                    ts = datetime.fromisoformat(msg["ts"])
-                    price = float(msg["price"])
-                    await self._on_tick(resolution, ts, price)
-                else:
-                    continue
+                # Per-iteration try/except so one bad tick / bar_close
+                # cannot retire the per-resolution loop. The outer except
+                # below is the safety net for non-iteration-level failures.
+                try:
+                    msg = await q.get()
+                    msg_type = msg.get("type")
+                    if msg_type == "bar_close":
+                        bucket = datetime.fromisoformat(msg["bucket"])
+                        await self._on_bar_close(resolution, bucket)
+                    elif msg_type == "bar_update":
+                        ts = datetime.fromisoformat(msg["ts"])
+                        price = float(msg["price"])
+                        await self._on_tick(resolution, ts, price)
+                    else:
+                        continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "strategy loop %s iteration error; continuing",
+                        resolution,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("strategy loop %s crashed", resolution)
         finally:
-            self._ingest.unsubscribe(resolution, q)
+            if q is not None:
+                self._ingest.unsubscribe(resolution, q)
 
     async def _on_bar_close(self, resolution: str, bucket: datetime) -> None:
+        # Tick-mode strategies (those that declare ``resolution`` in
+        # ``tick_resolutions``) ALSO receive bar_close dispatch — paired
+        # with the in-memory bar buffer in ``IngestRunner`` (which appends
+        # the just-closed bucket to its deque inside ``_emit_close`` BEFORE
+        # this fan-out fires), bar_close gives a deterministic per-bucket
+        # evaluation point that does not depend on cagg refresh latency.
+        # Position-based dedupe (``st.position`` short-circuit in
+        # ``_evaluate``) prevents double-fire when a tick arrives shortly
+        # after this bar_close.
         configs = await self._enabled_configs()
-        # Tick-routed resolutions are excluded so the on_bar shim never
-        # fires ahead of the on_tick dispatch (ingest queues bar_close
-        # before bar_update on a boundary tick). Bar-close path still
-        # delivers events for resolutions a strategy declares but does
-        # NOT include in `tick_resolutions` (e.g. backtest path, or
-        # auxiliary subscriptions if any strategy ever needs them).
         candidates = [
             (cls, configs.get(cls.name))
             for cls in all_strategies().values()
             if resolution in cls.resolutions
-            and resolution not in cls.tick_resolutions
         ]
         if not candidates:
-            return
-        bars = await self._load_bars(resolution)
-        if bars.empty:
             return
 
         for cls, cfg in candidates:
@@ -100,23 +127,22 @@ class StrategyLoop:
                 continue
             try:
                 params = cls.params_schema(**(cfg["params"] or {}))
-            except Exception:
-                log.exception("invalid params for %s; skipping", cls.name)
-                continue
-            indicators = self._compute_indicators(cls, bars, resolution)
-            indicators.update(await self._compute_aux_indicators(cls))
-            ev = BarEvent(
-                symbol=self._symbol,
-                resolution=resolution,
-                bucket=bucket,
-                bars=bars,
-                indicators=indicators,
-            )
-            try:
+                bars = await self._load_bars(resolution)
+                if bars.empty:
+                    continue
+                indicators = self._compute_indicators(cls, bars, resolution)
+                indicators.update(await self._compute_aux_indicators(cls))
+                ev = BarEvent(
+                    symbol=self._symbol,
+                    resolution=resolution,
+                    bucket=bucket,
+                    bars=bars,
+                    indicators=indicators,
+                )
                 strat: Strategy = cls(params=params)
                 signal = strat.on_bar(ev)
             except Exception:
-                log.exception("strategy %s on_bar raised", cls.name)
+                log.exception("strategy %s on_bar dispatch failed", cls.name)
                 continue
             if signal is None:
                 continue
@@ -135,9 +161,6 @@ class StrategyLoop:
         if not candidates:
             return
         configs = await self._enabled_configs()
-        bars = await self._load_bars(resolution)
-        if bars.empty:
-            return
 
         for cls in candidates:
             cfg = configs.get(cls.name)
@@ -145,24 +168,23 @@ class StrategyLoop:
                 continue
             try:
                 params = cls.params_schema(**(cfg["params"] or {}))
-            except Exception:
-                log.exception("invalid params for %s; skipping", cls.name)
-                continue
-            indicators = self._compute_indicators(cls, bars, resolution)
-            indicators.update(await self._compute_aux_indicators(cls))
-            ev = TickEvent(
-                symbol=self._symbol,
-                resolution=resolution,
-                ts=ts,
-                price=price,
-                bars=bars,
-                indicators=indicators,
-            )
-            try:
+                bars = await self._load_bars(resolution)
+                if bars.empty:
+                    continue
+                indicators = self._compute_indicators(cls, bars, resolution)
+                indicators.update(await self._compute_aux_indicators(cls))
+                ev = TickEvent(
+                    symbol=self._symbol,
+                    resolution=resolution,
+                    ts=ts,
+                    price=price,
+                    bars=bars,
+                    indicators=indicators,
+                )
                 strat: Strategy = cls(params=params)
                 signal = strat.on_tick(ev)
             except Exception:
-                log.exception("strategy %s on_tick raised", cls.name)
+                log.exception("strategy %s on_tick dispatch failed", cls.name)
                 continue
             if signal is None:
                 continue
@@ -219,9 +241,10 @@ class StrategyLoop:
         }
 
     async def _load_bars(self, resolution: str) -> pd.DataFrame:
-        from app.api.routes.bars import load_bars
-
-        return await load_bars(self._symbol, resolution, limit=self._bar_window)
+        # Strategy-path source of truth: IngestRunner's in-memory closed-bar
+        # buffer. Bypasses cagg refresh lag at bucket boundaries. Cagg
+        # remains source of truth for /bars REST + UI + backtest.
+        return self._ingest.snapshot_bars(resolution, limit=self._bar_window)
 
     def _compute_indicators(
         self, cls: type[Strategy], bars: pd.DataFrame, resolution: str
