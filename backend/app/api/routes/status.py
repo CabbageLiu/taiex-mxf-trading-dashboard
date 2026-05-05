@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Request
 from sqlalchemy import text
@@ -69,6 +70,69 @@ def _notifier_presence(hub) -> dict[str, bool]:
     return out
 
 
+def _per_resolution(ingest) -> dict[str, dict[str, Any]]:
+    """Per-resolution dispatch liveness for ops dashboards.
+
+    Surfaces the four signals an operator needs to detect a stalled
+    pipeline before signals start getting missed:
+    - ``last_bar_close_ts`` — when the runner last finalized a bucket
+    - ``queue_depth``       — sum across subscribers (most recent first)
+    - ``queue_dropped_total`` — cumulative subscriber-queue overflow drops
+    - ``subscribers_count`` — number of consumers attached to the resolution
+    """
+    if ingest is None:
+        return {}
+    last_close: dict[str, datetime] = getattr(ingest, "last_close_ts", None) or {}
+    dropped: dict[str, int] = getattr(ingest, "dropped_counts", None) or {}
+    subscribers: dict = getattr(ingest, "_subscribers", {}) or {}
+
+    keys = set(last_close.keys()) | set(dropped.keys()) | set(subscribers.keys())
+    out: dict[str, dict[str, Any]] = {}
+    for res in sorted(keys):
+        subs = list(subscribers.get(res, ()))
+        ts = last_close.get(res)
+        out[res] = {
+            "last_bar_close_ts": ts.isoformat() if ts is not None else None,
+            "queue_depth": sum(getattr(q, "qsize", lambda: 0)() for q in subs),
+            "queue_dropped_total": int(dropped.get(res, 0)),
+            "subscribers_count": len(subs),
+        }
+    return out
+
+
+async def _signals_fired_today() -> int:
+    """Count signals persisted today (UTC) — proxy for "is anything firing?"."""
+    try:
+        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with session_scope() as s:
+            row = (
+                await s.execute(
+                    text("SELECT COUNT(*) FROM signals WHERE ts >= :start"),
+                    {"start": today},
+                )
+            ).scalar_one()
+        return int(row or 0)
+    except Exception:
+        log.exception("signals_fired_today count failed")
+        return 0
+
+
+def _detector_state(detector) -> dict[str, Any] | None:
+    """Surface the missed-entry detector's last-pass timestamp + counts."""
+    if detector is None:
+        return None
+    return {
+        "running": bool(getattr(detector, "running", False)),
+        "last_pass_ts": (
+            ts.isoformat()
+            if (ts := getattr(detector, "last_pass_ts", None)) is not None
+            else None
+        ),
+        "alerts_total": int(getattr(detector, "alerts_total", 0)),
+        "autofire_enabled": bool(getattr(detector, "autofire_enabled", False)),
+    }
+
+
 @router.get("/status")
 async def status(request: Request) -> dict:
     state = request.app.state
@@ -76,16 +140,20 @@ async def status(request: Request) -> dict:
     hub = getattr(state, "hub", None)
     strategies = getattr(state, "strategies", None)
     tracker = getattr(state, "position_tracker", None)
+    detector = getattr(state, "missed_entry_detector", None)
 
     ingest_running, last_tick_ts, lag = _ingest_state(ingest)
     db_ok = await _db_ok()
     loop_running = _strategy_loop_running(strategies)
     tracker_running = bool(tracker is not None and getattr(tracker, "running", False))
     notifiers = _notifier_presence(hub)
+    per_res = _per_resolution(ingest)
+    signals_today = await _signals_fired_today() if db_ok else 0
+    detector_state = _detector_state(detector)
 
     ok = ingest_running and loop_running and tracker_running and db_ok
 
-    return {
+    payload: dict[str, Any] = {
         "ok": ok,
         "ingest_running": ingest_running,
         "last_tick_ts": last_tick_ts.isoformat() if last_tick_ts else None,
@@ -94,4 +162,9 @@ async def status(request: Request) -> dict:
         "position_tracker_running": tracker_running,
         "db_ok": db_ok,
         "notifiers": notifiers,
+        "per_resolution": per_res,
+        "signals_fired_today": signals_today,
     }
+    if detector_state is not None:
+        payload["missed_entry_detector"] = detector_state
+    return payload

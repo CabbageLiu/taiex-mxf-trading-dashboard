@@ -24,6 +24,7 @@ from app.db.engine import dispose_engine, init_engine
 from app.ingest.backfill import BackfillService
 from app.ingest.runner import IngestRunner
 from app.notify.hub import NotifierHub
+from app.runner.missed_entry_detector import MissedEntryDetector
 from app.runner.position_tracker import PositionTracker
 from app.runner.strategy_loop import StrategyLoop
 
@@ -55,6 +56,8 @@ async def lifespan(app: FastAPI):
     await strat.start()
     tracker = PositionTracker(hub=hub)
     await tracker.start()
+    detector = MissedEntryDetector(hub=hub, ingest=ingest)
+    await detector.start()
 
     settings = get_settings()
     backfill_task = asyncio.create_task(
@@ -66,6 +69,7 @@ async def lifespan(app: FastAPI):
     app.state.hub = hub
     app.state.strategies = strat
     app.state.position_tracker = tracker
+    app.state.missed_entry_detector = detector
     app.state.backfill_task = backfill_task
 
     try:
@@ -76,6 +80,7 @@ async def lifespan(app: FastAPI):
             await backfill_task
         except (asyncio.CancelledError, Exception):
             pass
+        await detector.stop()
         await tracker.stop()
         await strat.stop()
         await ingest.stop()
