@@ -217,6 +217,10 @@ class IngestRunner:
                     await self._handle_tick(tick)
                     if self._stop.is_set():
                         break
+                # Yield control even when the adapter's generator returns
+                # immediately (e.g. test fakes with no ticks), so cancellation
+                # via `stop()` can be serviced instead of busy-looping.
+                await asyncio.sleep(0)
             except Exception:
                 log.exception("adapter stream error; reconnecting in 5s")
                 await asyncio.sleep(5)
