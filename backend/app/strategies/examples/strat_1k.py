@@ -1,46 +1,53 @@
 """TAIEX 1-minute Strategy (1K策略).
 
 Single-resolution LONG-only strategy. Entry fires the moment the gates
-align intra-bar (tick-driven); exits (TP / SL / TRAIL) fire the moment the
-tick price crosses the threshold; DI_JUMP_1M still evaluates against
-closed-bar -DI deltas. Both ``on_bar`` (back-compat / backtest path) and
-``on_tick`` route through the same ``_evaluate`` helper.
+align intra-bar (tick-driven); exits (TP / TRAIL) fire the moment the
+tick price crosses the threshold for the active time-of-day bucket. Both
+``on_bar`` (back-compat / backtest path) and ``on_tick`` route through
+the same ``_evaluate`` helper.
 
-Entry gates (all must hold; LONG only):
-  0. Entry window: Asia/Taipei time inside [09:10, 11:15) ∪ [15:00, 24:00).
-  1. KD (1m): ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 65``.
-  2. MACD histogram (1m): ``hist[-1] > hist[-2]`` (rising; allows
-     ``hist[-2] >= 0`` cases as long as second value is strictly larger).
-  3. DMI (1m): ``plus[-2] > minus[-2]`` AND ``plus[-1] > minus[-1]`` AND
-     ``minus[-1] < minus[-2]``.
-  4. 3m KD confirmation: ``k_3m[-2] > d_3m[-2]`` AND
-     ``k_3m[-1] > d_3m[-1]`` AND ``k_3m[-2] < 65``. Cold/empty/stale
-     beyond 9 minutes (3 × 3m) all block.
-  5. 3m MACD confirmation: ``hist_3m[-1] > hist_3m[-2]`` (rising). Same
-     9-minute staleness guard.
-  6. 3m DMI confirmation: ``plus_3m[-2] > minus_3m[-2]`` AND
-     ``plus_3m[-1] > minus_3m[-1]`` AND ``minus_3m[-1] < minus_3m[-2]``.
-     Same 9-minute staleness guard.
-
-Note: the spec does NOT include an MA120 trend gate for 1K. The previous
-revision required ``close > MA120 AND MA120 rising``; the gate is removed.
+Entry gates (LONG only — all must hold on the same evaluation):
+  0. Entry window: Asia/Taipei time inside
+     [08:45, 13:45) ∪ [15:00, 05:00 next-day). The night window wraps
+     past midnight; ``in_entry_window`` handles the wrap when
+     ``night_close < night_open``.
+  1. 1m DMI rising: ``plus_di[-1] > plus_di[-2]`` AND
+     ``minus_di[-1] < minus_di[-2]``.
+  2. 1m KD: ``k[-2] > d[-2]`` AND ``k[-1] > d[-1]`` AND ``k[-2] < 70``.
+  3. 1m MACD histogram positive: ``hist[-1] > 0`` (strict; equality at
+     zero blocks).
 
 Exit priority (per tick or bar close, first match wins):
-  TP          — pnl ≥ 50
-  SL          — pnl ≤ −40
-  TRAIL       — pnl ≤ peak_pnl − 50 (peak tracked from entry, starts at 0)
-  DI_JUMP_1M  — minus_di[-1] − minus_di[-2] > 10 (strict ``>``, closed bars)
+  TP    — pnl ≥ tp_for_bucket
+  TRAIL — pnl ≤ peak_pnl − 40 (peak tracked from entry, starts at 0)
 
-Exits ignore the entry-window gate AND the 3m aux gates — open positions
-must remain closeable any time, including the 11:15–15:00 no-entry stretch
-and the overnight 00:00–05:00 stretch.
+TP is a function of the Taipei wall-clock time of the evaluation
+timestamp (half-open intervals, mirroring ``in_entry_window``):
+
+  [08:45, 10:31)  →  TP=50
+  [10:31, 13:45)  →  TP=40
+  [15:00, 18:01)  →  TP=30
+  [18:01, 23:31)  →  TP=50
+  [23:31, 24:00) ∪ [00:00, 05:00)  →  TP=30
+  closed gaps [13:45, 15:00) ∪ [05:00, 08:45)  →  TP=40 (fallback;
+    market closed so this is rarely exercised)
+
+TRAIL is uniformly 40 across all buckets.
+
+Hard SL and the prior ``DI_JUMP_1M`` exit are removed: the trailing
+stop alone caps downside (a 40-pt drop from peak — including a 40-pt
+drawdown from the entry, which has peak_pnl=0 — closes the position).
+
+Exits ignore the entry-window gate — open positions must remain
+closeable any time, including the 13:45–15:00 day-close gap and the
+05:00–08:45 morning gap.
 
 Cooldown: 300 seconds after EXIT (time-based, not bar-counted). While
 ``ts < cooldown_until`` evaluation returns None and resets
-``last_long_ready`` so the rising-edge latch re-arms once cooldown clears.
-The window gate behaves the same way: when it blocks, the latch resets so
-the first aligned tick after the window reopens fires cleanly as a fresh
-rising edge.
+``last_long_ready`` so the rising-edge latch re-arms once cooldown
+clears. The window gate behaves the same way: when it blocks, the latch
+resets so the first aligned tick after the window reopens fires
+cleanly as a fresh rising edge.
 
 Fill convention: tick-driven (not bar close). ``Signal.ts`` carries the
 raw tick timestamp, so ``signals.ts`` / ``trades.entry_ts`` /
@@ -51,7 +58,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, tzinfo
 from typing import ClassVar
 
 import pandas as pd
@@ -61,10 +68,12 @@ from app.config import get_settings
 from app.strategies.base import BarEvent, Signal, Strategy, TickEvent, in_entry_window
 from app.strategies.registry import register_strategy
 
-_DAY_OPEN = time(9, 10)
-_DAY_CLOSE = time(11, 15)
+_DAY_OPEN = time(8, 45)
+_DAY_CLOSE = time(13, 45)
 _NIGHT_OPEN = time(15, 0)
-_AUX_STALENESS = timedelta(minutes=9)  # 3 × 3m
+_NIGHT_CLOSE = time(5, 0)  # overnight wrap; exclusive upper bound
+
+_TRAIL_POINTS = 40.0  # uniform across all ToD buckets
 
 
 class TradeStrat1KParams(BaseModel):
@@ -73,20 +82,13 @@ class TradeStrat1KParams(BaseModel):
     kd_period: int = 9
     kd_k_smooth: int = 3
     kd_d_smooth: int = 3
-    kd_long_floor: float = 65.0  # first 1m K must be below this
+    kd_long_floor: float = 70.0  # first 1m K must be strictly below this
 
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
 
     dmi_period: int = 14
-
-    kd_3m_floor: float = 65.0  # first 3m K must be below this to confirm
-
-    tp_points: float = 50.0
-    sl_points: float = 40.0
-    trail_points: float = 50.0
-    di_jump_points: float = 10.0
 
     cooldown_seconds: int = Field(default=300, ge=0)
 
@@ -173,7 +175,6 @@ def _long_entry_now(
     d_prev: float | None,
     k_curr: float | None,
     d_curr: float | None,
-    hist_prev: float | None,
     hist_curr: float | None,
     plus_prev: float | None,
     plus_curr: float | None,
@@ -181,126 +182,59 @@ def _long_entry_now(
     minus_curr: float | None,
     kd_long_floor: float,
 ) -> bool:
-    """Evaluate the three primary 1m entry gates (KD / MACD / DMI).
+    """Evaluate the 1-minute primary entry gates (all AND-ed).
 
-    Spec drops the MA120 trend gate (close>MA + MA rising) at 1K — the
-    helper signature reflects that. The MACD gate is "rising" semantics:
-    ``hist_curr > hist_prev`` (both non-None), permitting both
-    ``hist_prev < 0`` and ``hist_prev >= 0`` cases as long as the second
-    histogram strictly exceeds the first.
+    Returns True iff every gate holds:
+      DMI rising — ``plus_curr > plus_prev`` AND ``minus_curr < minus_prev``.
+      KD         — ``k_prev > d_prev`` AND ``k_curr > d_curr`` AND
+                   ``k_prev < kd_long_floor``.
+      MACD       — ``hist_curr > 0`` (strict).
     """
     if None in (
         k_prev, d_prev, k_curr, d_curr,
-        hist_prev, hist_curr,
+        hist_curr,
         plus_prev, plus_curr, minus_prev, minus_curr,
     ):
         return False
-    gate_kd = k_prev > d_prev and k_curr > d_curr and k_prev < kd_long_floor
-    gate_macd = hist_curr > hist_prev
-    gate_dmi = (
-        plus_prev > minus_prev
-        and plus_curr > minus_curr
-        and minus_curr < minus_prev
-    )
-    return gate_kd and gate_macd and gate_dmi
+    if not (plus_curr > plus_prev and minus_curr < minus_prev):
+        return False
+    if not (k_prev > d_prev and k_curr > d_curr and k_prev < kd_long_floor):
+        return False
+    if not (hist_curr > 0.0):
+        return False
+    return True
 
 
-def _aux_fresh(
-    df: pd.DataFrame | None,
-    ts: datetime,
-    max_age: timedelta = _AUX_STALENESS,
-) -> bool:
-    """Common staleness check for 3m aux frames.
+_DAY_SPLIT = time(10, 31)
+_NIGHT_FIRST_END = time(18, 1)
+_NIGHT_SECOND_END = time(23, 31)
 
-    Returns True when ``df`` exists, has at least one row, and the most
-    recent index entry is younger than ``max_age`` vs ``ts``.
+
+def _exit_params_for(ts: datetime, tz: tzinfo) -> tuple[float, float]:
+    """Return ``(tp_points, trail_points)`` for the Taipei-local ``ts``.
+
+    ToD buckets (half-open):
+      [08:45, 10:31)            → TP 50
+      [10:31, 13:45)            → TP 40
+      [15:00, 18:01)            → TP 30
+      [18:01, 23:31)            → TP 50
+      [23:31, 24:00) ∪ [00:00, 05:00)  → TP 30
+      otherwise (market-closed gaps)   → TP 40 (safe fallback)
+
+    TRAIL is uniformly 40 across all buckets.
     """
-    if df is None or len(df) == 0:
-        return False
-    last_idx = df.index[-1]
-    if isinstance(last_idx, pd.Timestamp):
-        last_dt = last_idx.to_pydatetime()
-    else:
-        last_dt = last_idx
-    if last_dt.tzinfo is None and ts.tzinfo is not None:
-        last_dt = last_dt.replace(tzinfo=ts.tzinfo)
-    elif last_dt.tzinfo is not None and ts.tzinfo is None:
-        ts = ts.replace(tzinfo=last_dt.tzinfo)
-    return (ts - last_dt) < max_age
-
-
-def _kd_3m_ok(
-    kd_3m: pd.DataFrame | None,
-    ts: datetime,
-    floor: float,
-) -> bool:
-    """Auxiliary 3-minute KD confirmation gate.
-
-    Block when the aux frame is missing/empty/stale (>=9min) or any of the
-    four K/D scalars is None/NaN, the two K/D pairs do not show K>D, or
-    the FIRST K is not strictly below ``floor`` (default 65). This matches
-    spec wording "first KS<65".
-    """
-    if not _aux_fresh(kd_3m, ts):
-        return False
-    if "k" not in kd_3m.columns or "d" not in kd_3m.columns:
-        return False
-    k_prev = _scalar(kd_3m["k"], idx=-2)
-    d_prev = _scalar(kd_3m["d"], idx=-2)
-    k_curr = _scalar(kd_3m["k"], idx=-1)
-    d_curr = _scalar(kd_3m["d"], idx=-1)
-    if None in (k_prev, d_prev, k_curr, d_curr):
-        return False
-    return k_prev > d_prev and k_curr > d_curr and k_prev < floor
-
-
-def _macd_3m_rising(
-    macd_3m: pd.DataFrame | None,
-    ts: datetime,
-) -> bool:
-    """Auxiliary 3-minute MACD-histogram rising gate.
-
-    Block when missing/empty/stale (>=9min) or either of the last two
-    histogram scalars is None/NaN or the second histogram is not strictly
-    larger than the first. Matches spec wording "second MACD histogram >
-    first MACD histogram" — no zero-cross requirement.
-    """
-    if not _aux_fresh(macd_3m, ts):
-        return False
-    if "hist" not in macd_3m.columns:
-        return False
-    hist_prev = _scalar(macd_3m["hist"], idx=-2)
-    hist_curr = _scalar(macd_3m["hist"], idx=-1)
-    if hist_prev is None or hist_curr is None:
-        return False
-    return hist_curr > hist_prev
-
-
-def _dmi_3m_ok(
-    dmi_3m: pd.DataFrame | None,
-    ts: datetime,
-) -> bool:
-    """Auxiliary 3-minute DMI confirmation gate.
-
-    Block when missing/empty/stale (>=9min) or any +DI / -DI scalar is
-    None/NaN, the two +DI / -DI pairs do not show +DI > -DI, or the second
-    -DI is not strictly less than the first -DI.
-    """
-    if not _aux_fresh(dmi_3m, ts):
-        return False
-    if "plus_di" not in dmi_3m.columns or "minus_di" not in dmi_3m.columns:
-        return False
-    plus_prev = _scalar(dmi_3m["plus_di"], idx=-2)
-    plus_curr = _scalar(dmi_3m["plus_di"], idx=-1)
-    minus_prev = _scalar(dmi_3m["minus_di"], idx=-2)
-    minus_curr = _scalar(dmi_3m["minus_di"], idx=-1)
-    if None in (plus_prev, plus_curr, minus_prev, minus_curr):
-        return False
-    return (
-        plus_prev > minus_prev
-        and plus_curr > minus_curr
-        and minus_curr < minus_prev
-    )
+    local = ts.astimezone(tz).time() if ts.tzinfo is not None else ts.time()
+    if _DAY_OPEN <= local < _DAY_SPLIT:
+        return 50.0, _TRAIL_POINTS
+    if _DAY_SPLIT <= local < _DAY_CLOSE:
+        return 40.0, _TRAIL_POINTS
+    if _NIGHT_OPEN <= local < _NIGHT_FIRST_END:
+        return 30.0, _TRAIL_POINTS
+    if _NIGHT_FIRST_END <= local < _NIGHT_SECOND_END:
+        return 50.0, _TRAIL_POINTS
+    if local >= _NIGHT_SECOND_END or local < _NIGHT_CLOSE:
+        return 30.0, _TRAIL_POINTS
+    return 40.0, _TRAIL_POINTS
 
 
 @register_strategy
@@ -308,30 +242,28 @@ class TradeStrat1K(Strategy):
     name: ClassVar[str] = "strat_1k"
     display_name: ClassVar[str] = "1K策略"
     description: ClassVar[str] = (
-        "1 分鐘多單策略；開倉時段 09:10-11:15 / 15:00-24:00；進場："
-        "1m KD 連兩 KS>DS 且首根 KS<65、1m MACD 直方上升 (第二根>第一根)、"
-        "+DI>-DI 且 -DI 縮、3m KD 連兩 KS>DS 且首根 KS<65、3m MACD 直方上升、"
-        "3m +DI>-DI 且 -DI 縮；"
-        "出場：TP 50 / SL −40 / 移動停損 50 / 1 分鐘 -DI 跳升 (>10 點)。"
+        "1 分鐘多單策略；開倉時段 08:45-13:45 / 15:00-05:00 (隔夜)；進場 (全部成立)："
+        "1m +DI 上升 -DI 下降、1m KD 連兩 KS>DS 且首根 KS<70、1m MACD 直方>0；"
+        "出場：依時段獲利 30/40/50 點；移動停損 40 點。"
     )
     spec: ClassVar[dict[str, str]] = {
-        "週期": "1 分鐘 (3 分鐘輔助)",
-        "開倉時段": "09:10-11:15 / 15:00-24:00 (Asia/Taipei)",
+        "週期": "1 分鐘",
+        "開倉時段": "08:45-13:45 / 15:00-05:00 (隔夜) (Asia/Taipei)",
         "進場": (
-            "1 分鐘 KD 連兩根 KS>DS 且第一根 KS<65；"
-            "1 分鐘 MACD 直方圖第二根>第一根；"
-            "1 分鐘 +DI>-DI 連兩根且第二根 -DI 縮；"
-            "3 分鐘 KD 連兩根 KS>DS 且第一根 KS<65；"
-            "3 分鐘 MACD 直方圖第二根>第一根；"
-            "3 分鐘 +DI>-DI 連兩根且第二根 -DI 縮"
+            "1 分鐘 +DI 上升、-DI 下降；"
+            "1 分鐘 KD 連兩 KS>DS 且第一根 KS<70；"
+            "1 分鐘 MACD 直方圖>0 (全部成立)"
         ),
         "出場": (
-            "獲利 50 點 / 虧損 40 點 / 移動停損 50 點 / "
-            "1 分鐘 -DI 跳升 (>10 點)"
+            "獲利 (依時段): "
+            "08:45-10:30 → 50 點；10:31-13:44 → 40 點；"
+            "15:00-18:00 → 30 點；18:01-23:30 → 50 點；"
+            "23:31-04:59 → 30 點；移動停損固定 40 點"
         ),
         "冷卻": "出場後 5 分鐘 (300 秒)",
         "備註": (
-            "僅多單；訊號逐筆即時觸發；出場不受開倉時段與 3m 輔助條件限制"
+            "僅多單；訊號逐筆即時觸發；出場不受開倉時段限制 "
+            "(隔夜 13:45-15:00 / 05:00-08:45 收盤空檔仍可出場)"
         ),
     }
     resolutions: ClassVar[list[str]] = ["1m"]
@@ -342,23 +274,7 @@ class TradeStrat1K(Strategy):
         "macd": {"kind": "macd", "params": {"fast": 12, "slow": 26, "signal": 9}},
         "dmi": {"kind": "dmi", "params": {"period": 14}},
     }
-    aux_indicator_specs: ClassVar[dict[str, dict]] = {
-        "kd_3m": {
-            "kind": "kd",
-            "params": {"period": 9, "k_smooth": 3, "d_smooth": 3},
-            "resolution": "3m",
-        },
-        "macd_3m": {
-            "kind": "macd",
-            "params": {"fast": 12, "slow": 26, "signal": 9},
-            "resolution": "3m",
-        },
-        "dmi_3m": {
-            "kind": "dmi",
-            "params": {"period": 14},
-            "resolution": "3m",
-        },
-    }
+    aux_indicator_specs: ClassVar[dict[str, dict]] = {}
 
     @classmethod
     def dump_state(cls, symbol: str) -> dict:
@@ -412,22 +328,18 @@ class TradeStrat1K(Strategy):
         symbol: str,
         resolution: str,
     ) -> Signal | None:
-        # 1. Cooldown gate. While inside the window, suppress and re-arm latch
-        # so the first tick after release re-evaluates as a rising edge.
         if st.cooldown_until is not None:
             if ts < st.cooldown_until:
                 st.last_long_ready = False
                 return None
             st.cooldown_until = None
 
-        # 2. Manage open position.
         if st.position is not None:
             return self._manage_open_position(
                 ts, price, indicators, st, p,
                 symbol=symbol, resolution=resolution,
             )
 
-        # 3. Maybe enter.
         return self._maybe_enter(
             ts, price, bars, indicators, st, p,
             symbol=symbol, resolution=resolution,
@@ -460,41 +372,20 @@ class TradeStrat1K(Strategy):
         if all(v is None for v in snapshot.values()) and pos.entry_ind:
             snapshot = dict(pos.entry_ind)
 
-        # Priority order: TP → SL → TRAIL → DI_JUMP_1M.
-        if pnl >= p.tp_points:
+        tp, trail = _exit_params_for(ts, get_settings().tz)
+
+        if pnl >= tp:
             return self._close_position(
                 ts, price, "TP", pnl,
                 st=st, p=p, exit_ind=snapshot,
                 symbol=symbol, resolution=resolution,
             )
-        if pnl <= -p.sl_points:
-            return self._close_position(
-                ts, price, "SL", pnl,
-                st=st, p=p, exit_ind=snapshot,
-                symbol=symbol, resolution=resolution,
-            )
-        if pnl <= pos.peak_pnl - p.trail_points:
+        if pnl <= pos.peak_pnl - trail:
             return self._close_position(
                 ts, price, "TRAIL", pnl,
                 st=st, p=p, exit_ind=snapshot,
                 symbol=symbol, resolution=resolution,
             )
-
-        # DI_JUMP: -DI just jumped > di_jump_points across the last two
-        # closed bars (closed-bar indicator only updates at bucket roll).
-        if dmi is not None:
-            minus_prev = _scalar(dmi["minus_di"], idx=-2)
-            minus_curr = _scalar(dmi["minus_di"], idx=-1)
-            if (
-                minus_prev is not None
-                and minus_curr is not None
-                and (minus_curr - minus_prev) > p.di_jump_points
-            ):
-                return self._close_position(
-                    ts, price, "DI_JUMP_1M", pnl,
-                    st=st, p=p, exit_ind=snapshot,
-                    symbol=symbol, resolution=resolution,
-                )
 
         pos.peak_pnl = max(pos.peak_pnl, pnl)
         return None
@@ -511,49 +402,27 @@ class TradeStrat1K(Strategy):
         symbol: str,
         resolution: str,
     ) -> Signal | None:
-        # 0a. Entry-window gate. When closed, reset the rising-edge latch so
-        # that pre-aligned gates fire as a fresh rising edge on the first
-        # tick after the window reopens.
         if not in_entry_window(
             ts,
             get_settings().tz,
             day_open=_DAY_OPEN,
             day_close=_DAY_CLOSE,
             night_open=_NIGHT_OPEN,
+            night_close=_NIGHT_CLOSE,
         ):
-            st.last_long_ready = False
-            return None
-
-        # 0b. 3m KD / MACD / DMI confirmation gates (entry-only; exits ignore
-        # them). Each helper handles missing/empty/stale (>=9min) → block.
-        # Latch reset on every block path so a recovering aux gate is
-        # detected as a fresh rising edge, not a phantom one carried over
-        # from a previous tick where the latch was set True before the gate
-        # started failing.
-        kd_3m = indicators.get("kd_3m")
-        if not _kd_3m_ok(kd_3m, ts, p.kd_3m_floor):
-            st.last_long_ready = False
-            return None
-        macd_3m = indicators.get("macd_3m")
-        if not _macd_3m_rising(macd_3m, ts):
-            st.last_long_ready = False
-            return None
-        dmi_3m = indicators.get("dmi_3m")
-        if not _dmi_3m_ok(dmi_3m, ts):
             st.last_long_ready = False
             return None
 
         kd = indicators.get("kd")
         macd = indicators.get("macd")
         dmi = indicators.get("dmi")
-        if kd is None or macd is None or dmi is None:
+        if dmi is None or kd is None or macd is None:
             return None
 
         k_prev = _scalar(kd["k"], idx=-2)
         d_prev = _scalar(kd["d"], idx=-2)
         k_curr = _scalar(kd["k"], idx=-1)
         d_curr = _scalar(kd["d"], idx=-1)
-        hist_prev = _scalar(macd["hist"], idx=-2)
         hist_curr = _scalar(macd["hist"], idx=-1)
         plus_prev = _scalar(dmi["plus_di"], idx=-2)
         plus_curr = _scalar(dmi["plus_di"], idx=-1)
@@ -562,7 +431,7 @@ class TradeStrat1K(Strategy):
 
         long_now = _long_entry_now(
             k_prev, d_prev, k_curr, d_curr,
-            hist_prev, hist_curr,
+            hist_curr,
             plus_prev, plus_curr, minus_prev, minus_curr,
             kd_long_floor=p.kd_long_floor,
         )
@@ -587,9 +456,9 @@ class TradeStrat1K(Strategy):
         side: str,
         st: _StratState,
         p: TradeStrat1KParams,
-        kd: pd.DataFrame,
-        macd: pd.DataFrame,
-        dmi: pd.DataFrame,
+        kd: pd.DataFrame | None,
+        macd: pd.DataFrame | None,
+        dmi: pd.DataFrame | None,
         symbol: str,
         resolution: str,
     ) -> Signal:
@@ -598,6 +467,7 @@ class TradeStrat1K(Strategy):
             side=side, entry_price=price, entry_ts=ts,
             entry_ind=dict(snap), peak_pnl=0.0,
         )
+        tp_at_entry, trail_at_entry = _exit_params_for(ts, get_settings().tz)
         nan = float("nan")
         k_disp = snap.get("k") if snap.get("k") is not None else nan
         d_disp = snap.get("d") if snap.get("d") is not None else nan
@@ -616,10 +486,8 @@ class TradeStrat1K(Strategy):
             ),
             payload={
                 "entry_ind": snap,
-                "tp_points": p.tp_points,
-                "sl_points": p.sl_points,
-                "trail_points": p.trail_points,
-                "di_jump_points": p.di_jump_points,
+                "tp_points": tp_at_entry,
+                "trail_points": trail_at_entry,
                 "fill_hint": "tick",
             },
         )
