@@ -387,7 +387,7 @@ async def _gather_inputs(
     # Aux indicator resolutions (e.g. 5m MACD on a 30m strategy). Load bars
     # for them too so _build_indicators can compute them and the schedule
     # loop can supply ev.indicators[label] sliced up to the current ts.
-    for label, spec in cls.aux_indicator_specs.items():
+    for spec in cls.aux_indicator_specs.values():
         aux_res = spec["resolution"]
         if aux_res in bars_per_res:
             continue  # already loaded as a primary resolution
