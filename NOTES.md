@@ -800,27 +800,25 @@ renders the conditions side-by-side.
 
 Three LONG-only strategies. All three are **tick-driven on their primary resolution** (entries fire intra-bar; price-based exits fire the moment the tick crosses the threshold). Spec authority: `three_strats.md` at repo root. Per-strategy windows + aux gates have diverged — see the table below.
 
-**Per-strategy entry windows (Asia/Taipei, half-open, strict midnight cutoff):**
+**Per-strategy entry windows (Asia/Taipei, half-open; 30K/15K block past midnight, 1K wraps overnight to 05:00):**
 
 | canonical | window |
 |-----------|--------|
 | `strat_30k` | `[09:10, 12:15) ∪ [15:00, 24:00)` |
 | `strat_15k` | `[09:10, 12:15) ∪ [15:00, 24:00)` |
-| `strat_1k`  | `[09:10, 11:15) ∪ [15:00, 24:00)` |
+| `strat_1k`  | `[08:45, 13:45) ∪ [15:00, 05:00 next-day)` |
 
 **Per-strategy entry gates** (all must pass on a rising-edge false→true; `strat_30k` / `strat_15k` use the close>MA120 + MA-rising gate, `strat_1k` does NOT).
 
 | gate | strat_30k | strat_15k | strat_1k |
 |------|-----------|-----------|----------|
 | MA120 trend | close>MA AND MA rising (30m) | close>MA AND MA rising (15m) | — (dropped) |
-| Primary KD | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<75` (30m) | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<65` (15m) | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<65` (1m) |
-| Primary MACD hist | `hist_prev<0 AND hist_curr>0` (zero-cross, 30m) | `hist_prev<0 AND hist_curr>0` (zero-cross, 15m) | `hist_curr>hist_prev` (rising, 1m) |
-| Primary DMI | `+DI>-DI` both rows AND `-DI` shrinking (30m) | same (15m) | same (1m) |
-| Aux MACD | 5m `hist[-1] > 0` (positive only, ≤15min staleness) | 30m `hist_prev<0 AND hist_curr>0` (zero-cross, ≤90min) | 3m `hist_curr>hist_prev` (rising, ≤9min) |
-| Aux KD | — | — | 3m `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<65` (≤9min) |
-| Aux DMI | — | — | 3m `+DI>-DI` both AND `-DI` shrinking (≤9min) |
+| Primary KD | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<75` (30m) | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<65` (15m) | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<70` (1m, mandatory) |
+| Primary MACD hist | `hist_prev<0 AND hist_curr>0` (zero-cross, 30m) | `hist_prev<0 AND hist_curr>0` (zero-cross, 15m) | `hist_curr > 0` (strict positive, 1m, mandatory) |
+| Primary DMI | `+DI>-DI` both rows AND `-DI` shrinking (30m) | same (15m) | rising — `+DI[-1]>+DI[-2] AND -DI[-1]<-DI[-2]` (1m, mandatory) |
+| Aux MACD | 5m `hist[-1] > 0` (positive only, ≤15min staleness) | 30m `hist_prev<0 AND hist_curr>0` (zero-cross, ≤90min) | — (dropped) |
 
-Staleness thresholds use the `3 × delta` convention (matches the ingest watchdog retire threshold).
+`strat_1k` entry is now a pure AND across the three 1m gates above (no branches, no aux). Staleness thresholds (where applicable) use the `3 × delta` convention (matches the ingest watchdog retire threshold).
 
 **Per-strategy exit / cooldown / extra exit:**
 
@@ -828,21 +826,34 @@ Staleness thresholds use the `3 × delta` convention (matches the ingest watchdo
 |-----------|---------|---------|-----|-----|-------|----------|------------|
 | `strat_30k` | 30K策略 | 30m | 180 | 70 | 80 | 9000s (5×30m) | — |
 | `strat_15k` | 15K策略 | 15m | 130 | 70 | 80 | 4500s (5×15m) | — |
-| `strat_1k`  | 1K策略  | 1m  | 50  | 40 | 50  | 300s (5×1m)   | DI_JUMP_1M: `-DI[-1] − -DI[-2] > 10` (closed bars) |
+| `strat_1k`  | 1K策略  | 1m  | ToD-segmented (see below) | — (dropped) | 40 | 300s (5×1m) | — (DI_JUMP_1M removed) |
+
+**`strat_1k` ToD-segmented TP** (Asia/Taipei wall-clock of the evaluation `ts`, half-open):
+
+| bucket | TP |
+|--------|----|
+| `[08:45, 10:31)` | 50 |
+| `[10:31, 13:45)` | 40 |
+| `[15:00, 18:01)` | 30 |
+| `[18:01, 23:31)` | 50 |
+| `[23:31, 24:00) ∪ [00:00, 05:00)` | 30 |
+| closed gaps `[13:45, 15:00) ∪ [05:00, 08:45)` | 40 (fallback; market closed) |
+
+`strat_1k` trail is uniformly 40 across all buckets. Hard SL and DI_JUMP_1M are removed: the trailing stop alone caps downside (a 40-pt drop from peak — including a 40-pt drawdown from the entry, where peak_pnl=0 — closes the position).
 
 All three declare `tick_resolutions: ["<primary>"]`.
 
 - `strat_30k` aux specs: `{"macd_5m": macd(12, 26, 9) @ 5m}`.
 - `strat_15k` aux specs: `{"macd_30m": macd(12, 26, 9) @ 30m}`.
-- `strat_1k` aux specs: `{"kd_3m": kd(9, 3, 3) @ 3m, "macd_3m": macd(12, 26, 9) @ 3m, "dmi_3m": dmi(14) @ 3m}` (no MA120 in `indicator_specs`).
+- `strat_1k` aux specs: `{}` (no aux indicators; entry is AND across three 1m gates only).
 
-**Trailing stop semantics:** `peak_pnl` tracks from entry, starts at 0. Exit fires when `current_pnl ≤ peak_pnl − trail_points`. SL handles the never-profitable case (SL < trail, so SL fires first). Peak update happens after all priority checks.
+**Trailing stop semantics:** `peak_pnl` tracks from entry, starts at 0. Exit fires when `current_pnl ≤ peak_pnl − trail_points`. For `strat_30k` / `strat_15k` SL handles the never-profitable case (SL < trail, so SL fires first). For `strat_1k` SL is gone — trail alone caps the immediate-drawdown case. Peak update happens after all priority checks.
 
-**Exit priority:** TP → SL → TRAIL → (strat_1k only) DI_JUMP_1M → hold. **Exits ignore the window gate AND every aux gate** so an open position is always closeable across the no-entry gap (`12:15–15:00` for 30K/15K, `11:15–15:00` for 1K) and across aux reversals.
+**Exit priority:** TP → SL → TRAIL → hold for `strat_30k` / `strat_15k`; TP → TRAIL → hold for `strat_1k` (no SL, no DI_JUMP_1M). **Exits ignore the window gate AND every aux gate** so an open position is always closeable across the no-entry gap (`12:15–15:00` for 30K/15K, `13:45–15:00` + `05:00–08:45` for 1K).
 
 **Cooldown:** time-based (`cooldown_until: datetime | None`). After exit, blocks new entries until `ts ≥ cooldown_until`; resets `last_long_ready` so the rising-edge latch re-arms cleanly when cooldown expires (and same for the window-blocked path — closed window resets the latch so a window reopen with pre-aligned gates fires fresh).
 
-**Fill convention:** tick-driven. `Signal.ts` carries the raw tick timestamp; `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time, not bucket boundaries. DI_JUMP_1M can only fire on the first tick of a new 1m bucket (it depends on the closed-bar -DI delta).
+**Fill convention:** tick-driven. `Signal.ts` carries the raw tick timestamp; `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time, not bucket boundaries.
 
 **Indicator specs:** `ma120 (period=120 SMA)` for `strat_30k` / `strat_15k` only, `kd (9, 3, 3)`, `macd (12, 26, 9)`, `dmi (14)`. MA120 needs ~2.5 days of primary bars to fully warm up; default `BACKFILL_ON_STARTUP_DAYS=7` covers it. The `entry_ind` / `exit_ind` payload snapshot keeps the existing 8-key shape (`{k, d, macd, signal, hist, plus_di, minus_di, adx}`) — MA120 is intentionally NOT in the snapshot.
 
@@ -1027,7 +1038,7 @@ Cross-cutting items not yet addressed. None of these block live operation; they 
 - No TW holiday calendar (backfill iterates Mon-Fri incl holidays — wasted API calls).
 - `/admin/backfill` synchronous (multi-month windows block).
 - No per-trade fees / slippage / position sizing in backtest engine.
-- Backtest fills at signal-bar close (no `next_bar_open` mode). Live `strat_1k` is now tick-driven (entries + exits fire intra-bar); `strat_30k` / `strat_15k` / `trade_strat_v1` / `trade_strat_v2` still bar_close. Backtest does not replay raw ticks, so backtest results for `strat_1k` will diverge slightly from live (DI_JUMP_1M still bar-close in both modes; TP/SL/TRAIL fire at bar close in backtest vs tick price in live).
+- Backtest fills at signal-bar close (no `next_bar_open` mode). Live `strat_1k` is now tick-driven (entries + exits fire intra-bar); `strat_30k` / `strat_15k` / `trade_strat_v1` / `trade_strat_v2` still bar_close. Backtest does not replay raw ticks, so backtest results for `strat_1k` will diverge slightly from live (TP/TRAIL fire at bar close in backtest vs tick price in live).
 - No auth / multi-user.
 - `_STATE` swap convention module-introspection-based; brittle to non-`_STATE` naming.
 - `wipe_and_rebackfill.py` has no env guard — destructive, dev container only.
