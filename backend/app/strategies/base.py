@@ -24,18 +24,32 @@ def in_entry_window(
     day_open: time = _DEFAULT_DAY_OPEN,
     day_close: time = _DEFAULT_DAY_CLOSE,
     night_open: time = _DEFAULT_NIGHT_OPEN,
+    night_close: time | None = None,
 ) -> bool:
     """Entry-allowed iff local-tz time falls in
-    [day_open, day_close) ∪ [night_open, 24:00).
+    [day_open, day_close) ∪ <night-window>.
 
-    Half-open intervals on both ends. Strict midnight cutoff —
-    overnight 00:00 onward (TAIFEX night-session continuation) is
-    blocked. Each strategy passes its own bounds via kwargs; defaults
-    preserve the legacy [09:15, 12:15) ∪ [21:00, 24:00) for any
-    caller that does not specify them.
+    Day half-open: ``day_open <= t < day_close``.
+
+    Night half-open semantics depend on ``night_close``:
+      - ``None`` (default): ``t >= night_open``. Strict midnight cutoff —
+        00:00 onward is blocked. Preserves legacy behaviour.
+      - ``night_close > night_open``: same-day ``[night_open, night_close)``.
+      - ``night_close < night_open``: overnight wrap —
+        ``t >= night_open OR t < night_close`` (upper bound exclusive).
+      - ``night_close == night_open``: empty night window.
     """
     t = ts.astimezone(tz).time()
-    return (day_open <= t < day_close) or (t >= night_open)
+    in_day = day_open <= t < day_close
+    if night_close is None:
+        in_night = t >= night_open
+    elif night_close > night_open:
+        in_night = night_open <= t < night_close
+    elif night_close < night_open:
+        in_night = t >= night_open or t < night_close
+    else:
+        in_night = False
+    return in_day or in_night
 
 
 @dataclass(slots=True)

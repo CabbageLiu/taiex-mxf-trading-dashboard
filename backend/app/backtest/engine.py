@@ -445,6 +445,17 @@ async def run_backtest(
     for res in cls.resolutions:
         df = await load_bars(sym, res, start=start, end=end, limit=None)
         bars_per_res[res] = df
+    # Aux resolutions (e.g. 2m on a 1m strategy). Without loading these,
+    # `_build_indicators` skips every aux indicator and aux-gated entries
+    # never fire under backtest. Aux bars are NOT added to the schedule
+    # (see `_schedule(primary_resolutions=...)` below) so they only feed
+    # indicator computation, not on_bar dispatch.
+    for spec in cls.aux_indicator_specs.values():
+        aux_res = spec["resolution"]
+        if aux_res in bars_per_res:
+            continue
+        df = await load_bars(sym, aux_res, start=start, end=end, limit=None)
+        bars_per_res[aux_res] = df
 
     if all(df.empty for df in bars_per_res.values()):
         empty = BacktestResult(

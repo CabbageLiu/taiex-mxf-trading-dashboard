@@ -18,7 +18,7 @@ from app.backtest.engine import (
     run_backtest,
 )
 from app.strategies.base import BarEvent, Signal, Strategy
-from app.strategies.registry import _registry
+from app.strategies.registry import _registry, register_strategy
 
 
 def _sig(ts_off_min: int, side: str, price: float, res: str = "30m") -> Signal:
@@ -226,6 +226,75 @@ async def test_run_backtest_404_unknown():
             start=datetime(2026, 4, 22, tzinfo=UTC),
             end=datetime(2026, 4, 23, tzinfo=UTC),
         )
+
+
+@pytest.mark.asyncio
+async def test_run_backtest_loads_aux_indicator_resolutions(monkeypatch):
+    """Aux resolutions declared via `aux_indicator_specs` must be loaded
+    so `_build_indicators` can compute them and the strategy actually
+    sees `ev.indicators[label]`. Without this fix, aux-gated strategies
+    silently fire nothing under backtest.
+    """
+
+    @register_strategy
+    class _AuxProbe(Strategy):
+        name: ClassVar[str] = "_aux_probe_test_only"
+        resolutions: ClassVar[list[str]] = ["1m"]
+        aux_indicator_specs: ClassVar[dict[str, dict]] = {
+            "macd_2m": {
+                "kind": "macd",
+                "params": {"fast": 12, "slow": 26, "signal": 9},
+                "resolution": "2m",
+            },
+        }
+
+        def on_bar(self, ev: BarEvent):
+            aux = ev.indicators.get("macd_2m")
+            if aux is None or len(aux) == 0:
+                return None
+            return Signal(
+                ts=ev.bucket, symbol=ev.symbol, resolution=ev.resolution,
+                strategy=self.name, side="LONG",
+                price=float(ev.bars["close"].iloc[-1]),
+            )
+
+    end = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    bars_1m = _fake_bars_freq(120, "1min", end)
+    bars_2m = _fake_bars_freq(60, "2min", end)
+
+    async def fake_load_bars(symbol, resolution, *, start=None, end=None, limit=None):
+        if resolution == "1m":
+            return bars_1m
+        if resolution == "2m":
+            return bars_2m
+        return pd.DataFrame(columns=["open", "high", "low", "close", "tick_count"])
+
+    monkeypatch.setattr(engine_mod, "load_bars", fake_load_bars)
+    engine_mod.clear_backtest_cache()
+
+    try:
+        result = await run_backtest(
+            strategy_name=_AuxProbe.name,
+            symbol="MXF",
+            start=end - timedelta(hours=2),
+            end=end,
+        )
+    finally:
+        _registry.pop(_AuxProbe.name, None)
+
+    assert "2m" in result.bar_counts
+    assert result.bar_counts["2m"] > 0
+    assert len(result.signals) > 0
+
+
+def _fake_bars_freq(n: int, freq: str, end: datetime) -> pd.DataFrame:
+    idx = pd.date_range(end=end, periods=n, freq=freq, tz="UTC")
+    closes = np.linspace(100.0, 100.0 + n - 1, n)
+    return pd.DataFrame(
+        {"open": closes, "high": closes, "low": closes, "close": closes,
+         "tick_count": np.full(n, 1, dtype=int)},
+        index=idx,
+    )
 
 
 @pytest.mark.asyncio
