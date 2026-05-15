@@ -1,0 +1,67 @@
+services:
+  db:
+    image: timescale/timescaledb-ha:pg16
+    container_name: taiex-timescale
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: taiex
+      POSTGRES_USER: taiex
+      # Default password for LOCAL DEV ONLY. Bound to 127.0.0.1 below so it is not
+      # reachable from the network. CHANGE THIS (and DATABASE_URL below) before
+      # running on any host that exposes port 5432 externally.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taiex}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - taiex-pg:/home/postgres/pgdata/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taiex -d taiex"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    container_name: taiex-backend
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://taiex:taiex@db:5432/taiex
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./backend:/app
+      - /app/.venv
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    build: ./frontend
+    container_name: taiex-frontend
+    restart: unless-stopped
+    environment:
+      API_BASE: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    # Bind on all interfaces (was 127.0.0.1) so other devices on the LAN can
+    # reach the dashboard at http://<host-lan-ip>:3000. The Next dev server
+    # already listens on 0.0.0.0 inside the container; this exposes the host
+    # port. Backend stays on 127.0.0.1 — only the rewrite proxy from Next is
+    # public, no direct DB / FastAPI exposure.
+    ports:
+      - "0.0.0.0:3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+
+volumes:
+  taiex-pg:

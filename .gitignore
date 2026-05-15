@@ -1,0 +1,50 @@
+# env
+.env
+.env.local
+.env.*.local
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv
+# (keep uv.lock — committed for reproducible installs)
+
+# node / next
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# jupyter
+.ipynb_checkpoints/
+
+# logs
+*.log
+
+# private trading-strategy source (kept local, never committed)
+backend/app/strategies/examples/strat_*.py
+backend/app/strategies/examples/trade_strat_*.py
+trade_strat_*.md
+v1_trade.md
+
+# private planning docs and exploratory notebooks (kept local, never committed)
+[Vv]*_plan.md
+*.ipynb
+finmind.md
+
+# Claude Code files (kept local, never committed)
+CLAUDE.md
+.claude/
