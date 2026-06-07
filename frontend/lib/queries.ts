@@ -21,6 +21,7 @@ import {
   type TradeStats,
   type Trade,
   type TradesQuery,
+  type TrendSnapshot,
 } from "@/lib/api";
 
 const STALE_TRADES = 10_000;
@@ -128,6 +129,17 @@ export function useAlertStats() {
     queryFn: api.getAlertStats,
     refetchInterval: 30_000,
     staleTime: 15_000,
+  });
+}
+
+// 15m trend snapshot. WS `trend_update` is the primary update path; this
+// 30 s poll is a recovery / cold-start fallback so a page loaded between
+// pushes still sees a value within one tick.
+export function useTrend() {
+  return useQuery<TrendSnapshot | null>({
+    queryKey: ["trend"],
+    queryFn: () => api.getTrend(),
+    refetchInterval: 30_000,
   });
 }
 

@@ -57,8 +57,9 @@ def _pnl_points(side: str, entry_price: float, exit_price: float, qty: float) ->
 
 
 class PositionTracker:
-    def __init__(self, hub: NotifierHub) -> None:
+    def __init__(self, hub: NotifierHub, trend_service=None) -> None:
         self._hub = hub
+        self._trend_service = trend_service
         self._open: dict[PositionKey, int] = {}
         self._last_signal_id: dict[PositionKey, int] = {}
         self._task: asyncio.Task[None] | None = None
@@ -228,6 +229,18 @@ class PositionTracker:
         entry_ind: dict | None = None,
     ) -> int:
         payload: dict = {"entry_ind": entry_ind} if entry_ind else {}
+        if self._trend_service is not None:
+            try:
+                snap = await self._trend_service.get_at(ts)
+            except Exception:
+                snap = None
+                log.exception("trend_service.get_at failed in _open_trade")
+            if snap is not None:
+                payload["trend_at_entry"] = {
+                    "label": snap.label,
+                    "score": round(snap.score, 2),
+                    "ts": snap.ts.isoformat(),
+                }
         async with session_scope() as s:
             row = Trade(
                 strategy=strategy,
@@ -252,6 +265,21 @@ class PositionTracker:
         signal_id: int | None,
         exit_ind: dict | None = None,
     ) -> None:
+        # Capture the latest trend snapshot at-or-before exit_ts so the
+        # trade ledger can render both entry-time and exit-time trend bands.
+        trend_at_exit: dict | None = None
+        if self._trend_service is not None:
+            try:
+                snap = await self._trend_service.get_at(ts)
+            except Exception:
+                snap = None
+                log.exception("trend_service.get_at failed in _close")
+            if snap is not None:
+                trend_at_exit = {
+                    "label": snap.label,
+                    "score": round(snap.score, 2),
+                    "ts": snap.ts.isoformat(),
+                }
         async with session_scope() as s:
             row = (
                 await s.execute(select(Trade).where(Trade.id == trade_id))
@@ -269,20 +297,29 @@ class PositionTracker:
                     pnl_points=pnl,
                 )
             )
+            # Merge exit-time JSONB keys as two independent UPDATEs, each
+            # gated in Python. Never bind a Python ``None`` to a JSONB cast:
+            # asyncpg cannot infer the param type at prepare-time and crashes
+            # the whole _close (silently dropped EXIT-side signals on live).
             if exit_ind is not None:
-                # Merge {"exit_ind": ...} into the existing JSONB payload so
-                # the entry_ind block written at open time survives.
                 await s.execute(
                     text(
                         "UPDATE trades "
                         "SET payload = COALESCE(payload, '{}'::jsonb) "
-                        "    || jsonb_build_object('exit_ind', CAST(:exit_ind AS jsonb)) "
-                        "WHERE id = :trade_id"
+                        "    || jsonb_build_object('exit_ind', CAST(:v AS jsonb)) "
+                        "WHERE id = :tid"
                     ),
-                    {
-                        "trade_id": trade_id,
-                        "exit_ind": _json_dumps(exit_ind),
-                    },
+                    {"tid": trade_id, "v": _json_dumps(exit_ind)},
+                )
+            if trend_at_exit is not None:
+                await s.execute(
+                    text(
+                        "UPDATE trades "
+                        "SET payload = COALESCE(payload, '{}'::jsonb) "
+                        "    || jsonb_build_object('trend_at_exit', CAST(:v AS jsonb)) "
+                        "WHERE id = :tid"
+                    ),
+                    {"tid": trade_id, "v": _json_dumps(trend_at_exit)},
                 )
             await s.commit()
 

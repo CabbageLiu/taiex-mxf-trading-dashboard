@@ -53,6 +53,21 @@ class NotifierHub:
         await self._record(signal_id, results)
         return results
 
+    async def notify_ops(self, message: str) -> None:
+        """Fire an operational (non-trading) alert to Discord only.
+
+        Bypasses `dispatch` entirely so this never reaches the in-app queue
+        (PositionTracker) and never writes an alerts/signals row. Best-effort —
+        swallows any error so an infra alert can never destabilise the caller.
+        """
+        notifier = self._notifiers.get("discord")
+        if notifier is None or not isinstance(notifier, DiscordNotifier):
+            return
+        try:
+            await notifier.notify_ops(message)
+        except Exception:
+            log.exception("notify_ops raised; ignoring")
+
     async def _send(
         self, notifier: Notifier, signal: Signal, signal_id: int | None = None
     ) -> AlertResult:

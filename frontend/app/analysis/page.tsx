@@ -297,16 +297,18 @@ function AnalysisContent() {
     body = <SingleLensView lens={lens} btQ={btQA} filter={filter} />;
   }
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        flex: 1,
-        minHeight: 0,
-      }}
-    >
-      <LensBar lens={lens} />
-      {body}
+    <div className="page-shell">
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          flex: 1,
+          minHeight: 0,
+        }}
+      >
+        <LensBar lens={lens} />
+        {body}
+      </div>
     </div>
   );
 }

@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
 import pytest
@@ -55,9 +56,11 @@ class _TickStrategy(Strategy):
     indicator_specs: ClassVar[dict[str, dict]] = {}
 
     received: ClassVar[list[TickEvent]] = []
+    bar_calls: ClassVar[int] = 0
     return_signal: ClassVar[Signal | None] = None
 
     def on_bar(self, ev: BarEvent) -> Signal | None:  # noqa: ARG002
+        type(self).bar_calls += 1
         return None
 
     def on_tick(self, ev: TickEvent) -> Signal | None:
@@ -130,10 +133,12 @@ def _reset_class_counters() -> None:
     """Class-level spies are mutable global state — clear between tests."""
     _NoTickStrategy.bar_calls = 0
     _TickStrategy.received = []
+    _TickStrategy.bar_calls = 0
     _TickStrategy.return_signal = None
     yield
     _NoTickStrategy.bar_calls = 0
     _TickStrategy.received = []
+    _TickStrategy.bar_calls = 0
     _TickStrategy.return_signal = None
 
 
@@ -243,20 +248,27 @@ async def test_on_tick_returning_none_does_not_call_fire(
 
 
 @pytest.mark.asyncio
-async def test_on_bar_close_skips_tick_driven_strategy(
+async def test_on_bar_close_dispatches_to_tick_mode_strategy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Resolutions listed in ``tick_resolutions`` must NOT receive bar_close
-    dispatch in live — otherwise the on_bar shim would fire at bucket
-    timestamp/close price before the tick path runs (ingest queues
-    bar_close ahead of bar_update on the boundary-crossing tick)."""
+    """Tick-mode strategies (those declaring ``tick_resolutions``) MUST
+    also receive ``bar_close`` dispatch — paired with the in-memory bar
+    buffer in ``IngestRunner`` (which appends the just-closed bucket
+    BEFORE this fanout fires), bar_close is a deterministic per-bucket
+    evaluation point that does not depend on cagg refresh latency.
+
+    The strategy's own state (e.g. position-set / latch) is what dedupes
+    the bar_close + tick race — not the dispatcher.
+    """
     loop = _make_loop(monkeypatch)
 
     await loop._on_bar_close("1m", datetime(2026, 1, 3, 12, 34, 0))
 
-    # Tick-routed resolution: on_bar shim never invoked via bar_close path.
+    # Tick-mode strategy: on_bar shim invoked exactly once via bar_close path.
+    assert _TickStrategy.bar_calls == 1
+    # on_tick is reserved for the bar_update path; bar_close does not invoke it.
     assert _TickStrategy.received == []
-    # Bar-only strategy: still dispatched normally.
+    # Bar-only strategy: dispatched normally.
     assert _NoTickStrategy.bar_calls == 1
 
 
@@ -294,6 +306,167 @@ async def test_on_tick_skipped_when_tick_resolutions_empty(
     await loop._on_tick("1m", datetime(2026, 1, 3, 12, 34, 56), 102.5)
 
     assert _OrphanTickStrategy.received == []
+
+
+@pytest.mark.asyncio
+async def test_load_bars_routes_through_ingest_snapshot() -> None:
+    """``_load_bars`` MUST delegate to ``ingest.snapshot_bars`` with the
+    configured ``bar_window`` and the requested resolution. Earlier this
+    code path had a cagg fallback; the strategy-path source of truth is
+    now exclusively the in-memory buffer, and the test asserts so by
+    using a stub ingest with ONLY ``snapshot_bars`` and no other surface.
+    """
+    sentinel = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
+    ingest = SimpleNamespace()
+    ingest.snapshot_bars = MagicMock(return_value=sentinel)
+
+    loop = StrategyLoop(hub=_DummyHub(), ingest=ingest, bar_window=123)  # type: ignore[arg-type]
+
+    df = await loop._load_bars("15m")
+
+    ingest.snapshot_bars.assert_called_once_with("15m", limit=123)
+    assert df is sentinel
+
+
+@pytest.mark.asyncio
+async def test_indicator_compute_failure_isolated_to_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 1.2: an exception inside ``_compute_indicators`` /
+    ``_compute_aux_indicators`` / ``_load_bars`` for one strategy must NOT
+    starve other strategies on the same dispatch, and must not retire
+    the per-resolution loop. The per-strategy try/except wrapping ensures
+    one bad strategy can't poison the dispatcher.
+    """
+    primary_bars = pd.DataFrame(
+        {"close": [100.0, 101.0, 102.0]},
+        index=pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03"]),
+    )
+
+    class _CrashyStrategy(Strategy):
+        name: ClassVar[str] = "_test_crashy"
+        resolutions: ClassVar[list[str]] = ["1m"]
+        tick_resolutions: ClassVar[list[str]] = ["1m"]
+        params_schema: ClassVar[type[BaseModel]] = _StubParams
+        indicator_specs: ClassVar[dict[str, dict]] = {"boom": {"kind": "ma", "params": {}}}
+
+        def on_bar(self, ev: BarEvent) -> Signal | None:  # noqa: ARG002
+            return None
+
+        def on_tick(self, ev: TickEvent) -> Signal | None:  # noqa: ARG002
+            return None
+
+    class _HealthyStrategy(Strategy):
+        name: ClassVar[str] = "_test_healthy"
+        resolutions: ClassVar[list[str]] = ["1m"]
+        tick_resolutions: ClassVar[list[str]] = ["1m"]
+        params_schema: ClassVar[type[BaseModel]] = _StubParams
+        indicator_specs: ClassVar[dict[str, dict]] = {}
+
+        received: ClassVar[list[TickEvent]] = []
+
+        def on_bar(self, ev: BarEvent) -> Signal | None:  # noqa: ARG002
+            return None
+
+        def on_tick(self, ev: TickEvent) -> Signal | None:
+            type(self).received.append(ev)
+            return None
+
+    loop = StrategyLoop(hub=_DummyHub(), ingest=_DummyIngest())  # type: ignore[arg-type]
+
+    async def _fake_load_bars(_resolution: str) -> pd.DataFrame:
+        return primary_bars
+
+    async def _fake_enabled_configs() -> dict[str, dict]:
+        return {
+            _CrashyStrategy.name: {"enabled": True, "params": {}, "channels": []},
+            _HealthyStrategy.name: {"enabled": True, "params": {}, "channels": []},
+        }
+
+    monkeypatch.setattr(loop, "_load_bars", _fake_load_bars)
+    monkeypatch.setattr(loop, "_enabled_configs", _fake_enabled_configs)
+    monkeypatch.setattr(loop, "_fire", AsyncMock())
+    monkeypatch.setattr(
+        loop_mod, "all_strategies",
+        lambda: {_CrashyStrategy.name: _CrashyStrategy, _HealthyStrategy.name: _HealthyStrategy},
+    )
+
+    # Make _compute_indicators raise *only* when called for _CrashyStrategy
+    # so we can verify the healthy strategy still runs.
+    real_compute = loop._compute_indicators
+
+    def _flaky_compute(cls, bars, resolution):
+        if cls is _CrashyStrategy:
+            raise RuntimeError("indicator boom")
+        return real_compute(cls, bars, resolution)
+
+    monkeypatch.setattr(loop, "_compute_indicators", _flaky_compute)
+
+    _HealthyStrategy.received = []
+    await loop._on_tick("1m", datetime(2026, 1, 3, 12, 34, 56), 102.5)
+
+    # Healthy strategy still got dispatched even though the crashy one raised.
+    assert len(_HealthyStrategy.received) == 1
+
+
+@pytest.mark.asyncio
+async def test_loop_iteration_exception_does_not_kill_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 1.2: a raise inside one queue-message iteration must NOT
+    retire the per-resolution loop. The per-iteration try/except keeps
+    the consumer alive across transient failures."""
+    loop = _make_loop(monkeypatch)
+
+    q: asyncio.Queue[dict] = asyncio.Queue()
+    # First message will trigger an error inside _on_tick (price="bad" cannot
+    # cast); second message is well-formed and must still be processed.
+    await q.put({
+        "type": "bar_update",
+        "resolution": "1m",
+        "bucket": "2026-01-03T12:34:00",
+        "ts": "2026-01-03T12:34:56",
+        "price": "not-a-number",
+        "symbol": "MXF",
+    })
+    await q.put({
+        "type": "bar_update",
+        "resolution": "1m",
+        "bucket": "2026-01-03T12:35:00",
+        "ts": "2026-01-03T12:35:01",
+        "price": 102.5,
+        "symbol": "MXF",
+    })
+
+    def _subscribe(_res: str) -> asyncio.Queue:
+        return q
+
+    def _unsubscribe(_res: str, _q: asyncio.Queue) -> None:
+        return None
+
+    monkeypatch.setattr(loop._ingest, "subscribe", _subscribe, raising=False)
+    monkeypatch.setattr(loop._ingest, "unsubscribe", _unsubscribe, raising=False)
+
+    async def _ready() -> None:
+        return None
+
+    monkeypatch.setattr(loop._ingest, "ready", _ready, raising=False)
+
+    async def _drive() -> None:
+        while not q.empty():
+            await asyncio.sleep(0)
+        loop._stop.set()
+        await q.put({"type": "noop"})
+
+    driver = asyncio.create_task(_drive())
+    await loop._loop("1m")
+    await driver
+
+    # Despite the first message raising on float() cast, the second message
+    # was processed — the override-strategy received exactly one tick (the
+    # well-formed second message).
+    assert len(_TickStrategy.received) == 1
+    assert _TickStrategy.received[0].price == 102.5
 
 
 @pytest.mark.asyncio

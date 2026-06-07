@@ -15,8 +15,8 @@ def bars() -> pd.DataFrame:
     )
 
 
-def test_available_lists_all_five():
-    assert set(available()) == {"ma", "macd", "rsi", "kd", "dmi"}
+def test_available_lists_registry():
+    assert set(available()) == {"ma", "macd", "rsi", "kd", "dmi", "atr", "candle_direction"}
 
 
 def test_ma_sma_default_period_20(bars):
@@ -28,6 +28,17 @@ def test_ma_ema_kind(bars):
     df = compute("ma", bars, {"period": 5, "kind": "ema"})
     expected = bars["close"].ewm(span=5, adjust=False).mean().iloc[-1]
     assert df["ma"].iloc[-1] == pytest.approx(expected)
+
+
+def test_ma_output_includes_close(bars):
+    """MA frame must surface the underlying ``close`` so consumers needing
+    both close and the moving average (e.g. strat_1k ``above_ema20`` 5m
+    alignment gate) can read a single aux frame. Additive contract — see
+    smooth-sniffing-meadow plan, Subagent A Phase 0 patch.
+    """
+    df = compute("ma", bars, {"period": 5, "kind": "ema"})
+    assert "close" in df.columns
+    assert df["close"].iloc[-1] == pytest.approx(bars["close"].iloc[-1])
 
 
 def test_macd_columns_and_hist_definition(bars):

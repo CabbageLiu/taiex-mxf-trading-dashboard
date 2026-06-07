@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Feed-liveness backstop for the TAIEX backend. Runs feed_liveness_check.sh
+  every 5 minutes; restarts the backend container only when the feed is stale
+  during an open market session for two consecutive polls (see the script).
+
+  Install (edit the absolute path to match your checkout):
+    cp backend/scripts/com.user.taiex-feed-liveness.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.user.taiex-feed-liveness.plist
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.user.taiex-feed-liveness.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.taiex-feed-liveness</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/Users/raccoon/Desktop/TAIEX/backend/scripts/feed_liveness_check.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/taiex-feed-liveness.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/taiex-feed-liveness.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

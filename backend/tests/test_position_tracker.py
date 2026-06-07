@@ -8,7 +8,7 @@ instance and assert call ordering / arguments. PnL math is exercised via
 
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -430,14 +430,16 @@ async def test_close_emits_payload_merge_when_exit_ind_present(monkeypatch):
     )
 
     # Three execute calls: SELECT, UPDATE values(...), then the
-    # text() merge for exit_ind.
+    # text() merge for exit_ind. trend_service is None here so the
+    # trend_at_exit merge UPDATE is skipped in Python.
     assert len(sess.executes) == 3
     merge_stmt, merge_params = sess.executes[-1]
     assert "jsonb_build_object" in str(merge_stmt)
-    assert merge_params["trade_id"] == 42
+    assert "exit_ind" in str(merge_stmt)
+    assert merge_params["tid"] == 42
     # serialized JSON contains exit_ind keys
-    assert "k" in merge_params["exit_ind"]
-    assert "78.0" in merge_params["exit_ind"]
+    assert "k" in merge_params["v"]
+    assert "78.0" in merge_params["v"]
     assert sess.commits == 1
 
 
@@ -460,3 +462,101 @@ async def test_close_skips_payload_merge_when_exit_ind_absent(monkeypatch):
     # Only the SELECT and the values UPDATE — no merge statement.
     assert len(sess.executes) == 2
     assert sess.commits == 1
+
+
+async def test_close_emits_both_merge_updates_when_trend_service_returns_snap(
+    monkeypatch,
+):
+    """Two-UPDATE equivalence: when trend_service returns a snapshot AND
+    exit_ind is populated, _close should emit one merge UPDATE per key.
+    Each leg uses params {"tid", "v"} and the SQL text identifies which
+    JSONB key it sets."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    hub = NotifierHub()
+    snap = SimpleNamespace(
+        label="盤整",
+        score=0.12,
+        ts=datetime(2026, 4, 30, 9, 30, tzinfo=UTC),
+    )
+    trend_stub = AsyncMock()
+    trend_stub.get_at = AsyncMock(return_value=snap)
+    t = PositionTracker(hub=hub, trend_service=trend_stub)
+    sess = _RecordingSession(
+        side="LONG",
+        entry_price=100.0,
+        qty=1.0,
+        payload_on_load={"entry_ind": _ENTRY_IND},
+    )
+    _patch_session_scope(monkeypatch, sess)
+
+    await t._close(
+        trade_id=42,
+        ts=datetime(2026, 4, 30, 10, 0, tzinfo=UTC),
+        price=110.0,
+        signal_id=2,
+        exit_ind=_EXIT_IND,
+    )
+
+    merge_texts = [
+        str(stmt)
+        for stmt, params in sess.executes
+        if params and "jsonb_build_object" in str(stmt)
+    ]
+    assert any("'exit_ind'" in t for t in merge_texts), "exit_ind merge missing"
+    assert any(
+        "'trend_at_exit'" in t for t in merge_texts
+    ), "trend_at_exit merge missing"
+    # No execute call binds None as either JSONB value.
+    for _stmt, params in sess.executes:
+        if params and "v" in params:
+            assert params["v"] is not None
+    assert sess.commits == 1
+
+
+async def test_close_never_binds_null_trend_at_exit_when_service_returns_none(
+    monkeypatch,
+):
+    """Regression: when trend_service.get_at returns None and exit_ind is
+    provided, _close must not bind a NULL ``:trend_at_exit`` param to a
+    JSONB cast. asyncpg fails such prepares with AmbiguousParameterError,
+    which silently dropped every EXIT-side signal on live data."""
+    from unittest.mock import AsyncMock
+
+    hub = NotifierHub()
+    trend_stub = AsyncMock()
+    trend_stub.get_at = AsyncMock(return_value=None)
+    t = PositionTracker(hub=hub, trend_service=trend_stub)
+    sess = _RecordingSession(
+        side="LONG",
+        entry_price=100.0,
+        qty=1.0,
+        payload_on_load={"entry_ind": _ENTRY_IND},
+    )
+    _patch_session_scope(monkeypatch, sess)
+
+    from datetime import datetime
+
+    await t._close(
+        trade_id=42,
+        ts=datetime(2026, 4, 30, 10, 0, tzinfo=UTC),
+        price=110.0,
+        signal_id=2,
+        exit_ind=_EXIT_IND,
+    )
+
+    for _stmt, params in sess.executes:
+        if not params:
+            continue
+        assert not (
+            "trend_at_exit" in params and params["trend_at_exit"] is None
+        ), "NULL trend_at_exit bound to JSONB cast → asyncpg prepare-time crash"
+
+    merge_calls = [
+        (stmt, params)
+        for stmt, params in sess.executes
+        if params and "jsonb_build_object" in str(stmt) and "'exit_ind'" in str(stmt)
+    ]
+    assert len(merge_calls) == 1, "exit_ind merge UPDATE should still fire"
+    assert "k" in merge_calls[0][1]["v"]

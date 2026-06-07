@@ -1,37 +1,37 @@
-"""Historical tick backfill from FinMind `TaiwanFuturesTick`.
+"""Historical tick backfill via Shioaji ``api.ticks(contract, date)``.
 
-The live `taiwan_futures_snapshot` endpoint is real-time only — it has no
-history. When the server is down (laptop closed, deploy gap, etc.), ticks
-during that window are lost from the live feed. This module fills those
-gaps from FinMind's *historical* tick dataset (Backer/Sponsor tier).
+Live ingest cannot recover ticks missed during outages (laptop closed,
+deploy gap). This module fetches Shioaji's historical tick dataset for
+the configured rolling contract and idempotently UPSERTs into the
+``ticks`` hypertable.
 
 Two entry points:
 
 - `BackfillService.backfill_range(start_date, end_date)` — fetch every
-  trading day between (inclusive). Used by the manual `POST /admin/backfill`
-  endpoint and by the startup auto-backfill.
-
-- `BackfillService.backfill_recent(lookback_days)` — convenience: scan
-  the last N market days for "missing" ones (rows below threshold) and
-  fill those.
+  trading day between (inclusive). Used by `POST /admin/backfill` and
+  the startup auto-backfill.
+- `BackfillService.backfill_recent(lookback_days)` — scan the last N
+  market days for "missing" ones (rows below threshold) and fill those.
 
 Design notes:
 
-* FinMind `TaiwanFuturesTick` updates **end-of-day**. Today's afternoon
-  session does not appear until tonight. The service treats today as
-  "incomplete" and only relies on it as a last resort.
-* Timestamps in the `date` field are **CST naive** (Asia/Taipei). Verified
-  by inspection: rows for `2026-04-29 00:00 to 04:59` correspond to the
-  TAIFEX after-hours session that runs from 15:00 CST the previous
-  evening to 05:00 CST the next morning.
-* Inserts go through the same `ON CONFLICT DO NOTHING` path as the live
+* Shioaji historical data is published once the trading day ends. The
+  service skips today's date in `_missing_days` since live ingest fills
+  the current session.
+* The Shioaji SDK returns ``ts: List[int]`` of nanoseconds since epoch
+  per the official LLM reference. We convert with
+  ``datetime.fromtimestamp(ts_ns / 1e9, tz=Asia/Taipei)``. The first
+  trading day's audit (see `scripts/audit_shioaji_ticks.py`) validated
+  that the resulting datetimes fall inside known TAIFEX session
+  windows; a sanity guard inside ``fetch_day`` re-checks this and
+  raises if the unit assumption ever breaks.
+* Inserts go through the same `ON CONFLICT DO NOTHING` path as live
   ingest, so re-running over the same window is idempotent.
-* `source` is set to `FINMIND_FUTURES_TICK` so historical and live ticks
-  are distinguishable in the `ticks.source` column.
-* TimescaleDB continuous aggregates have a 30-second refresh policy; we
-  do **not** trigger an explicit refresh here — the policy catches up on
-  its own, and triggering a manual refresh on a long historical window
-  is expensive.
+* `source` is set to ``SHIOAJI_FUTURES_TICK_HISTORICAL`` to distinguish
+  these rows from live ticks (``SHIOAJI_FUTURES_TICK``) in
+  ``ticks.source``.
+* TimescaleDB continuous aggregates have a 30-second refresh policy; no
+  explicit refresh is triggered here.
 """
 
 from __future__ import annotations
@@ -41,30 +41,27 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from datetime import time as dtime
 from typing import Any
+from zoneinfo import ZoneInfo
 
-import httpx
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from tenacity import (
-    AsyncRetrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
+from app.adapters import shioaji_client
 from app.adapters.base import Tick
 from app.config import get_settings
 from app.db.engine import session_scope
 from app.db.models import Tick as TickRow
-
 from app.ingest.constants import PRICE_FLOOR
 
 log = logging.getLogger("taiex.backfill")
 
-FINMIND_DATA_URL = "https://api.finmindtrade.com/api/v4/data"
-SOURCE = "FINMIND_FUTURES_TICK"
-DATASET = "TaiwanFuturesTick"
+SOURCE = "SHIOAJI_FUTURES_TICK_HISTORICAL"
+PRICE_CEILING = 100_000.0
+# Serialize Shioaji historical calls; the SDK's thread-safety across the
+# live quote thread and synchronous `ticks` calls is undocumented.
+_historical_lock = asyncio.Lock()
 
 
 @dataclass(slots=True)
@@ -75,106 +72,106 @@ class DayResult:
     error: str | None = None
 
 
-class FinmindHistoricalClient:
-    """Single-day fetcher for `TaiwanFuturesTick`. Independently testable."""
+class ShioajiHistoricalClient:
+    """Single-day fetcher for Shioaji `api.ticks`. Independently testable."""
 
-    def __init__(self, *, token: str, data_id: str, tz_name: str = "Asia/Taipei") -> None:
-        self._token = token
-        self._data_id = data_id
+    def __init__(self, *, contract_code: str, tz_name: str = "Asia/Taipei") -> None:
+        self._contract_code = contract_code
         self._tz_name = tz_name
 
     async def fetch_day(self, day: date) -> list[dict[str, Any]]:
-        from zoneinfo import ZoneInfo
-
         tz = ZoneInfo(self._tz_name)
-        params = {
-            "dataset": DATASET,
-            "data_id": self._data_id,
-            "start_date": day.isoformat(),
-            "end_date": day.isoformat(),
-        }
-        headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
+        api = await shioaji_client.get_api()
+        contract = self._resolve_contract(api, self._contract_code)
 
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=0.5, max=4),
-            retry=retry_if_exception_type((httpx.HTTPError,)),
-            reraise=True,
-        ):
-            with attempt:
-                async with httpx.AsyncClient(timeout=60) as cli:
-                    resp = await cli.get(FINMIND_DATA_URL, headers=headers, params=params)
-                    resp.raise_for_status()
-                    payload = resp.json()
-        if payload.get("status") == 402:
-            raise RuntimeError("FinMind quota exceeded (HTTP 402)")
-        rows = payload.get("data") or []
+        async with _historical_lock:
+            try:
+                ticks = await asyncio.to_thread(
+                    api.ticks, contract=contract, date=day.isoformat()
+                )
+            except Exception:
+                shioaji_client.mark_session_broken()
+                raise
 
-        # Pass 1: filter spreads + floor + parse, keeping contract_date around
-        # so pass 2 can pick the dominant outright contract.
-        from collections import Counter
+        ts_list = getattr(ticks, "ts", None) or []
+        close_list = getattr(ticks, "close", None) or []
+        if not ts_list or not close_list or len(ts_list) != len(close_list):
+            log.info(
+                "backfill day=%s shioaji returned empty/mismatched payload (ts=%d close=%d)",
+                day,
+                len(ts_list),
+                len(close_list),
+            )
+            return []
 
-        intermediate: list[dict[str, Any]] = []
-        skipped_spread = 0
+        clean: list[dict[str, Any]] = []
         skipped_floor = 0
-        for r in rows:
-            if not r.get("date") or r.get("price") is None:
-                continue
-            cdate = str(r.get("contract_date") or "")
-            if "/" in cdate:
-                skipped_spread += 1
+        for raw_ts, raw_price in zip(ts_list, close_list, strict=False):
+            try:
+                ts = datetime.fromtimestamp(int(raw_ts) / 1e9, tz=tz)
+            except (TypeError, ValueError, OverflowError, OSError):
                 continue
             try:
-                price = float(r["price"])
+                price = float(raw_price)
             except (TypeError, ValueError):
                 continue
-            if price < PRICE_FLOOR:
+            if price < PRICE_FLOOR or price > PRICE_CEILING:
                 skipped_floor += 1
                 continue
-            intermediate.append(
-                {
-                    "ts": datetime.fromisoformat(str(r["date"])).replace(tzinfo=tz),
-                    "price": price,
-                    "contract_date": cdate,
-                }
-            )
+            clean.append({"ts": ts, "price": price})
 
-        # Pass 2: pick the dominant (most-traded) contract_date — front month.
-        # Mixing back-months (`202606`, `202609`, `202612`) injects carry
-        # premium and produces price discontinuities. Rows with no
-        # contract_date (legacy payload shape) are kept as a free pass so
-        # tests + older data continue to work.
-        counts = Counter(r["contract_date"] for r in intermediate if r["contract_date"])
-        dominant = counts.most_common(1)[0][0] if counts else None
-        if dominant is None and len(intermediate) > 1:
-            # Degenerate: every row has an empty contract_date. We can't
-            # discriminate front vs back-month — flag loudly so we notice
-            # if FinMind's payload shape regresses.
-            log.warning(
-                "backfill day=%s: no contract_date present on any of %d rows; "
-                "front-month filter is a no-op for this batch",
-                day,
-                len(intermediate),
-            )
-        skipped_off_contract = 0
-        clean: list[dict[str, Any]] = []
-        for r in intermediate:
-            if r["contract_date"] and dominant and r["contract_date"] != dominant:
-                skipped_off_contract += 1
-                continue
-            clean.append({"ts": r["ts"], "price": r["price"]})
+        if clean:
+            _assert_within_session(clean[0]["ts"], day)
 
         log.info(
-            "backfill day=%s rows=%d kept=%d dominant=%s skipped_spread=%d skipped_floor=%d skipped_off_contract=%d",
+            "backfill day=%s rows=%d kept=%d skipped_floor=%d",
             day,
-            len(rows),
+            len(ts_list),
             len(clean),
-            dominant,
-            skipped_spread,
             skipped_floor,
-            skipped_off_contract,
         )
         return clean
+
+    @staticmethod
+    def _resolve_contract(api: Any, code: str) -> Any:
+        if code.startswith("TXF"):
+            try:
+                return getattr(api.Contracts.Futures.TXF, code)
+            except AttributeError:
+                pass
+        return api.Contracts.Futures[code]
+
+
+def _assert_within_session(sample_ts: datetime, day: date) -> None:
+    """Crash loudly if the first tick of a day lands outside TAIFEX hours.
+
+    Day session 08:45-13:45 on `day`. Night session opens 15:00 on the
+    previous calendar day and runs through 05:00 on `day` (Shioaji
+    buckets the entire trading-day session — including the prior
+    evening — under the settle-date query).
+    """
+    local = sample_ts.astimezone(ZoneInfo("Asia/Taipei"))
+    t = local.time()
+    day_open = dtime(8, 45)
+    day_close = dtime(13, 45)
+    night_open = dtime(15, 0)
+    night_cutoff = dtime(5, 0)
+
+    # Day session: same-day 08:45-13:45.
+    if local.date() == day and day_open <= t <= day_close:
+        return
+    # Prior-evening night session: previous calendar day, time >= 15:00.
+    if local.date() == day - timedelta(days=1) and t >= night_open:
+        return
+    # Overnight wrap of the prior evening's session: `day` (or `day+1`
+    # depending on payload framing) at time <= 05:00.
+    if t <= night_cutoff and local.date() in (day, day + timedelta(days=1)):
+        return
+    raise RuntimeError(
+        f"shioaji backfill sanity check failed: first tick {local.isoformat()} "
+        f"falls outside TAIFEX session for {day.isoformat()}; "
+        "ts unit assumption (nanoseconds) may be wrong"
+    )
 
 
 class BackfillService:
@@ -183,16 +180,15 @@ class BackfillService:
     def __init__(
         self,
         *,
-        client: FinmindHistoricalClient | None = None,
+        client: ShioajiHistoricalClient | None = None,
         symbol: str | None = None,
         min_ticks_per_day: int | None = None,
     ) -> None:
         s = get_settings()
         self._symbol = symbol or s.symbol_display
         self._min_ticks_per_day = min_ticks_per_day or s.backfill_min_ticks_per_day
-        self._client = client or FinmindHistoricalClient(
-            token=s.finmind_token,
-            data_id=s.backfill_data_id,
+        self._client = client or ShioajiHistoricalClient(
+            contract_code=s.shioaji_contract,
             tz_name=s.timezone,
         )
 

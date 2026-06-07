@@ -765,7 +765,11 @@ def test_entry_at_15_00_00_taipei_open():
 
 
 def test_exits_run_at_13_00_taipei():
-    """Open position at 11:50 still closes at 13:00 (window gate is entry-only)."""
+    """Open position at 11:50 still closes at 13:00. 13:00 is outside the
+    [09:10, 12:15) ∪ [15:00, 24:00) entry window, so the EOW force-close
+    fires (exits run regardless of the window — just as a force-close here
+    rather than a TP). TP-at-threshold is covered by test_tp_exit_at_threshold.
+    """
     st = mod._state_for(TradeStrat15K.name, SYM)
     st.position = _PositionState(
         side="LONG", entry_price=100.0,
@@ -774,12 +778,12 @@ def test_exits_run_at_13_00_taipei():
     )
 
     end_ts = _utc_for_taipei(2026, 5, 1, 13, 0)
-    bars = _bars(5, last_close=230.0, end_ts=end_ts)  # pnl=+130 → TP
+    bars = _bars(5, last_close=230.0, end_ts=end_ts)
     inds = _inds(bars)
     sig = TradeStrat15K(params=TradeStrat15KParams()).on_bar(_event(bars, inds))
     assert sig is not None
     assert sig.side == "EXIT"
-    assert sig.payload["exit_reason"] == "TP"
+    assert sig.payload["exit_reason"] == "EOW"
 
 
 def test_window_reopen_rising_edge():

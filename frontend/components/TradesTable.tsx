@@ -2,7 +2,7 @@
 
 import { useMemo } from "react";
 
-import type { Trade, TradeIndicators, TradePayload } from "@/lib/api";
+import type { Trade, TradeIndicators, TradePayload, TrendStamp } from "@/lib/api";
 import { t } from "@/lib/i18n";
 import { useStrategies } from "@/lib/queries";
 
@@ -89,6 +89,15 @@ export function formatIndicators(
   return `${kd} / ${macd} / ${dmi}`;
 }
 
+// V5 — 15m trend stamp renderer for the trades table. Returns "—" when the
+// stamp is missing (older pre-trend trades; cold-start gaps); otherwise
+// renders `{label} ±{score}` with score fixed to 2 dp + an explicit sign.
+export function formatTrend(stamp: TrendStamp | null | undefined): string {
+  if (!stamp) return "—";
+  const sign = stamp.score >= 0 ? "+" : "";
+  return `${stamp.label} ${sign}${stamp.score.toFixed(2)}`;
+}
+
 // Inline self-checks (no test runner present). Cheap; no DB / network.
 // `K54 D51 / MACD+9 / +DI33 -DI19` for full snapshot.
 const _SELFCHECK_FULL: TradeIndicators = {
@@ -104,7 +113,7 @@ if (formatIndicators(null) !== "—") {
 }
 
 const SKELETON_ROWS = 8;
-const COLS = 10;
+const COLS = 12;
 
 export function TradesTable({ trades, isLoading }: Props) {
   const sorted = useMemo(() => {
@@ -151,6 +160,8 @@ export function TradesTable({ trades, isLoading }: Props) {
           <th>{t("trades.col.entry_ind")}</th>
           <th style={{ textAlign: "right" }}>{t("trades.col.exit")}</th>
           <th>{t("trades.col.exit_ind")}</th>
+          <th>{t("trades.col.trendIn")}</th>
+          <th>{t("trades.col.trendOut")}</th>
           <th style={{ textAlign: "right" }}>{t("trades.col.hold")}</th>
           <th style={{ textAlign: "right" }}>
             {t("trades.col.pnl")} ({t("kpi.unit.points")})
@@ -188,6 +199,8 @@ export function TradesTable({ trades, isLoading }: Props) {
             const payload = (tr.payload ?? {}) as TradePayload;
             const entryInd = formatIndicators(payload.entry_ind);
             const exitInd = formatIndicators(payload.exit_ind);
+            const trendIn = formatTrend(payload.trend_at_entry);
+            const trendOut = formatTrend(payload.trend_at_exit);
 
             return (
               <tr key={tr.id}>
@@ -209,9 +222,11 @@ export function TradesTable({ trades, isLoading }: Props) {
                 </td>
                 <td title={tr.strategy}>{displayNameOf(tr.strategy)}</td>
                 <td className="num">{fmtPrice(tr.entry_price)}</td>
-                <td className="tnum">{entryInd}</td>
+                <td className="mono">{entryInd}</td>
                 <td className="num">{fmtPrice(tr.exit_price)}</td>
-                <td className="tnum">{exitInd}</td>
+                <td className="mono">{exitInd}</td>
+                <td className="mono">{trendIn}</td>
+                <td className="mono">{trendOut}</td>
                 <td className="num">{fmtHold(tr.entry_ts, tr.exit_ts)}</td>
                 <td
                   className={`num${pnl.tone === "win" ? " win" : pnl.tone === "loss" ? " loss" : ""}`}

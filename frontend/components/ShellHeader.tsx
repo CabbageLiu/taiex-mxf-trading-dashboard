@@ -6,6 +6,7 @@ import { Suspense } from "react";
 
 import { dict, t } from "@/lib/i18n";
 import { StatusPill } from "./StatusPill";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 const NAV: { href: string; key: "nav.trading" | "nav.analysis" }[] = [
   { href: "/trading", key: "nav.trading" },
@@ -42,6 +43,7 @@ export function ShellHeader() {
       </Suspense>
       <span className="shell-spacer" />
       <StatusPill />
+      <ThemeToggle />
     </header>
   );
 }

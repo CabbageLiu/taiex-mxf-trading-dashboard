@@ -5,20 +5,11 @@ indicators (MACD, DMI, KD, RSI, MA), multi-resolution bars
 (1m/2m/3m/5m/10m/15m/30m/1h/4h/12h/1d/1w/1mo), a plug-in strategy framework, and
 fan-out alerting to Discord + n8n.
 
-> **Not intended for open-internet deployment.** This is a single-user
-> Tailscale-only dashboard. The FastAPI backend uses `allow_origins=["*"]`
-> and several mutating endpoints (`/strategies/*`, `/insights/strategy`,
-> `/admin/*`, `/backtest/run`) are unauthenticated by design. If you stand
-> this up on a publicly reachable host without adding auth + tightening CORS,
-> anyone who finds it can trigger backfills and webhook tests.
-
-The plug-in framework discovers strategies under
-`backend/app/strategies/examples/`. A no-op `always_long` baseline ships in
-the repo; the production strategies that ran live (`strat_1k`, `strat_15k`,
-`strat_30k`, `trade_strat_v1`, `trade_strat_v2`) are not published — drop
-your own `.py` files into that directory to register strategies of your own.
-Each closed trade carries a KD / MACD / DMI snapshot at entry and exit so
-the analysis log shows the full conditions side-by-side.
+Two example strategies ship in-tree (`trade_strat_v1` / `trade_strat_v2`)
+with Traditional-Chinese display names (`30分鐘線策略` / `5分鐘策略`)
+backed by the canonical DB key for cache stability. Each closed trade
+carries a KD / MACD / DMI snapshot at entry and exit so the analysis
+log shows the full conditions side-by-side.
 
 ```
 [FinMind 5-sec TAIEX] ──► [adapter] ──► [ingest loop] ──► TimescaleDB

@@ -773,10 +773,12 @@ def test_entry_inside_night_window():
     assert sig.side == "LONG"
 
 
-def test_exit_runs_at_13_00_taipei():
-    """Window gate is entry-only; exits run anytime.
+def test_exit_runs_inside_window_tp():
+    """Window gate is entry-only; a TP-crossing tick inside the window
+    closes the position with a TP exit.
 
-    Open at 11:00 Taipei → tick at 13:00 Taipei (outside window) crosses TP.
+    Open at 11:00 Taipei → tick at 11:30 Taipei (still inside the day
+    window [09:10, 12:15)) crosses TP.
     """
     strat = TradeStrat30K(params=TradeStrat30KParams())
     bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 11, 0))
@@ -784,8 +786,8 @@ def test_exit_runs_at_13_00_taipei():
     assert sig_open is not None and sig_open.side == "LONG"
     entry_price = sig_open.price
 
-    # Tick at 13:00 Taipei (outside window). Use same bars/inds; only ts changes.
-    tick_ts = _tpe_dt(2026, 5, 1, 13, 0)
+    # Tick at 11:30 Taipei (inside window). Use same bars/inds; only ts changes.
+    tick_ts = _tpe_dt(2026, 5, 1, 11, 30)
     ev = _tick_event(
         bars, inds, ts=tick_ts, price=entry_price + 181.0
     )
@@ -793,6 +795,29 @@ def test_exit_runs_at_13_00_taipei():
     assert sig is not None
     assert sig.side == "EXIT"
     assert sig.payload["exit_reason"] == "TP"
+
+
+def test_exit_runs_outside_window_eow():
+    """Window gate is entry-only; a tick outside the window force-closes
+    the open position with an EOW exit (current 30K behaviour).
+
+    Open at 11:00 Taipei → tick at 13:00 Taipei (inside the 12:15–15:00
+    closed gap) → EOW force-close fires regardless of price.
+    """
+    strat = TradeStrat30K(params=TradeStrat30KParams())
+    bars, inds, bucket = _make_event_at(_tpe_dt(2026, 5, 1, 11, 0))
+    sig_open = strat.on_bar(_event(bars, inds, bucket=bucket))
+    assert sig_open is not None and sig_open.side == "LONG"
+    entry_price = sig_open.price
+
+    tick_ts = _tpe_dt(2026, 5, 1, 13, 0)
+    ev = _tick_event(
+        bars, inds, ts=tick_ts, price=entry_price + 181.0
+    )
+    sig = strat.on_tick(ev)
+    assert sig is not None
+    assert sig.side == "EXIT"
+    assert sig.payload["exit_reason"] == "EOW"
 
 
 def test_window_reopen_rising_edge_redetect():

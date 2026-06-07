@@ -5,6 +5,7 @@ from logging import getLogger
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.adapters import shioaji_client
 from app.api.routes import (
     admin,
     alerts,
@@ -17,15 +18,19 @@ from app.api.routes import (
     status,
     strategies,
     trades,
+    trend,
 )
 from app.api.ws import router as ws_router
 from app.config import get_settings
-from app.db.engine import dispose_engine, init_engine
+from app.db.engine import dispose_engine, get_engine, init_engine
+from app.indicators.service import cache as indicator_cache
 from app.ingest.backfill import BackfillService
 from app.ingest.runner import IngestRunner
 from app.notify.hub import NotifierHub
+from app.runner.missed_entry_detector import MissedEntryDetector
 from app.runner.position_tracker import PositionTracker
 from app.runner.strategy_loop import StrategyLoop
+from app.services.trend import TrendService
 
 log = getLogger("taiex")
 
@@ -49,12 +54,22 @@ async def lifespan(app: FastAPI):
     await init_engine()
     hub = NotifierHub()
     await hub.start()
-    ingest = IngestRunner()
+    ingest = IngestRunner(hub=hub)
     await ingest.start()
-    strat = StrategyLoop(hub=hub, ingest=ingest)
+    trend_service = TrendService(
+        ingest=ingest,
+        indicator_cache=indicator_cache,
+        engine=get_engine(),
+        hub=hub,
+        symbol=get_settings().symbol_display,
+    )
+    await trend_service.start()
+    strat = StrategyLoop(hub=hub, ingest=ingest, trend_service=trend_service)
     await strat.start()
-    tracker = PositionTracker(hub=hub)
+    tracker = PositionTracker(hub=hub, trend_service=trend_service)
     await tracker.start()
+    detector = MissedEntryDetector(hub=hub, ingest=ingest)
+    await detector.start()
 
     settings = get_settings()
     backfill_task = asyncio.create_task(
@@ -66,6 +81,8 @@ async def lifespan(app: FastAPI):
     app.state.hub = hub
     app.state.strategies = strat
     app.state.position_tracker = tracker
+    app.state.missed_entry_detector = detector
+    app.state.trend_service = trend_service
     app.state.backfill_task = backfill_task
 
     try:
@@ -76,10 +93,13 @@ async def lifespan(app: FastAPI):
             await backfill_task
         except (asyncio.CancelledError, Exception):
             pass
+        await app.state.trend_service.stop()
+        await detector.stop()
         await tracker.stop()
         await strat.stop()
         await ingest.stop()
         await hub.stop()
+        await shioaji_client.logout()
         await dispose_engine()
 
 
@@ -102,6 +122,7 @@ def create_app() -> FastAPI:
     app.include_router(admin.router, prefix="/admin", tags=["admin"])
     app.include_router(signals.router)
     app.include_router(backtest.router)
+    app.include_router(trend.router)
     app.include_router(ws_router)
 
     @app.get("/health")

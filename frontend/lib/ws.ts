@@ -16,6 +16,19 @@ export type WsMessage =
       price: number;
       reason: string;
       payload: Record<string, unknown>;
+    }
+  | {
+      type: "trend_update";
+      ts: string;
+      symbol: string;
+      label: string;
+      score: number;
+      ema20: number;
+      ema50: number;
+      plus_di: number;
+      minus_di: number;
+      adx: number;
+      direction: -1 | 0 | 1;
     };
 
 const wsBase = () => {

@@ -132,6 +132,18 @@ export const dict = {
   "alerts.test_send": "測試發送",
   "alerts.none_signals": "尚無觸發訊號",
   "alerts.none_alerts": "尚無遞送紀錄",
+
+  // 15m trend badge + trades-table columns
+  "trend.label":         "趨勢",
+  "trend.score":         "趨勢分數",
+  "trend.strongUp":      "強勢上升",
+  "trend.gentleUp":      "溫和上升",
+  "trend.neutral":       "盤整",
+  "trend.gentleDown":    "溫和下降",
+  "trend.strongDown":    "強勢下降",
+  "trend.legend.title":  "趨勢分數對照",
+  "trades.col.trendIn":  "進場趨勢",
+  "trades.col.trendOut": "出場趨勢",
 } as const;
 
 export type DictKey = keyof typeof dict;

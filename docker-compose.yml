@@ -6,10 +6,7 @@ services:
     environment:
       POSTGRES_DB: taiex
       POSTGRES_USER: taiex
-      # Default password for LOCAL DEV ONLY. Bound to 127.0.0.1 below so it is not
-      # reachable from the network. CHANGE THIS (and DATABASE_URL below) before
-      # running on any host that exposes port 5432 externally.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taiex}
+      POSTGRES_PASSWORD: taiex
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -19,6 +16,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   backend:
     build: ./backend
@@ -41,6 +43,11 @@ services:
       timeout: 3s
       retries: 12
       start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   frontend:
     build: ./frontend
@@ -62,6 +69,11 @@ services:
       - ./frontend:/app
       - /app/node_modules
       - /app/.next
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   taiex-pg:

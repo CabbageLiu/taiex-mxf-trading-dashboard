@@ -31,7 +31,11 @@ export function KpiCard({ label, value, sub, tone = "neutral", isLoading = false
     <div className="kpi-card card-enter">
       <div className="label">{label}</div>
       <div className="num" style={{ color: valueColor }}>
-        {isLoading ? <Skeleton width={100} height={30} /> : value}
+        {isLoading ? (
+          <Skeleton width={100} height={30} />
+        ) : (
+          <span className="num" key={String(value)}>{value}</span>
+        )}
       </div>
       {sub != null && (
         <div className="delta">

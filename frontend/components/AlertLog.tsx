@@ -241,7 +241,7 @@ export function AlertLog({ liveSignals }: { liveSignals: SignalRow[] }) {
                 {configured && (
                   <button
                     type="button"
-                    className="btn"
+                    className="btn-text"
                     style={{
                       minHeight: 24,
                       padding: "2px 6px",

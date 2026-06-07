@@ -67,22 +67,58 @@ export type TradeEvent = {
 };
 
 // TW market convention: red = up 漲, green = down 跌
-const UP = "#c0392b";
-const DOWN = "#3a7d4f";
-const INK = "#1f1d1a";
-const ACCENT = "#a8773d";
 const TZ = "Asia/Taipei";
 
-// V4 Phase 3 Slice B — per-strategy plot palette. lightweight-charts paints
-// markers on a `<canvas>` and does NOT resolve CSS custom properties at draw
-// time, so the SeriesMarker `color` field needs an explicit hex literal.
-// CSS tokens still drive any DOM-visible chrome that wants to match.
-const STRATEGY_COLORS: Record<string, { token: string; hex: string }> = {
-  trade_strat_v1: { token: "var(--strategy-1)", hex: "#1e88e5" },
-  trade_strat_v2: { token: "var(--strategy-2)", hex: "#fb8c00" },
-  strat_30k: { token: "var(--strategy-3)", hex: "#43a047" },
-  strat_15k: { token: "var(--strategy-4)", hex: "#8e24aa" },
-  strat_1k: { token: "var(--strategy-5)", hex: "#d81b60" },
+// Theme-aware palette. CSS custom properties drive the live values; we read
+// them at mount + on every `taiex:theme` CustomEvent so a runtime theme flip
+// repaints the chart without remounting. The hardcoded fallback hex values
+// mirror the light theme so SSR and the first paint stay deterministic.
+type Palette = {
+  up: string; down: string; accent: string;
+  ink: string; inkMuted: string; rule: string;
+  panel: string; bg: string;
+  strategy1: string; strategy2: string;
+  strategy3: string; strategy4: string; strategy5: string;
+};
+function readPalette(): Palette {
+  if (typeof document === "undefined") {
+    return {
+      up: "#c0392b", down: "#3a7d4f", accent: "#a8773d",
+      ink: "#1a1916", inkMuted: "#7a7268", rule: "#e3dccf",
+      panel: "#fbf7ee", bg: "#f5efe6",
+      strategy1: "#1e88e5", strategy2: "#fb8c00",
+      strategy3: "#43a047", strategy4: "#8e24aa", strategy5: "#d81b60",
+    };
+  }
+  const cs = getComputedStyle(document.documentElement);
+  const v = (n: string, fb: string) => (cs.getPropertyValue(n).trim() || fb);
+  return {
+    up:        v("--up", "#c0392b"),
+    down:      v("--down", "#3a7d4f"),
+    accent:    v("--accent", "#a8773d"),
+    ink:       v("--ink", "#1a1916"),
+    inkMuted:  v("--ink-muted", "#7a7268"),
+    rule:      v("--rule", "#e3dccf"),
+    panel:     v("--panel", "#fbf7ee"),
+    bg:        v("--bg", "#f5efe6"),
+    strategy1: v("--strategy-1", "#1e88e5"),
+    strategy2: v("--strategy-2", "#fb8c00"),
+    strategy3: v("--strategy-3", "#43a047"),
+    strategy4: v("--strategy-4", "#8e24aa"),
+    strategy5: v("--strategy-5", "#d81b60"),
+  };
+}
+
+// Per-strategy palette index. lightweight-charts paints markers on a `<canvas>`
+// and does NOT resolve CSS custom properties at draw time, so the marker
+// `color` field needs an explicit hex literal — we resolve from the live
+// Palette per draw rather than baking hexes at module scope.
+const STRATEGY_PALETTE_KEYS: Record<string, keyof Palette> = {
+  trade_strat_v1: "strategy1",
+  trade_strat_v2: "strategy2",
+  strat_30k: "strategy3",
+  strat_15k: "strategy4",
+  strat_1k: "strategy5",
 };
 
 // Pixel offset applied to every marker so the dot sits to the right of the
@@ -90,9 +126,10 @@ const STRATEGY_COLORS: Record<string, { token: string; hex: string }> = {
 // readable even with several markers stacked on adjacent bars.
 const MARKER_X_OFFSET = 14;
 
-function strategyHex(name: string | null | undefined): string {
-  if (!name) return "#8a8175";
-  return STRATEGY_COLORS[name]?.hex ?? "#8a8175";
+function strategyHex(name: string | null | undefined, palette: Palette): string {
+  if (!name) return palette.inkMuted;
+  const key = STRATEGY_PALETTE_KEYS[name];
+  return key ? palette[key] : palette.inkMuted;
 }
 
 // Paint one trade marker on the overlay canvas. Both OPEN and CLOSE render
@@ -119,12 +156,13 @@ function paintMarker(
   x: number,
   y: number,
   hovered: boolean,
+  palette: Palette,
   outOfRange: "above" | "below" | null = null,
 ): void {
-  const stratColor = strategyHex(ev.strategy);
+  const stratColor = strategyHex(ev.strategy, palette);
   const isClose = ev.kind === "CLOSE";
   const isWin = isClose && (ev.pnl ?? 0) >= 0;
-  const fill = isClose ? (isWin ? UP : DOWN) : stratColor;
+  const fill = isClose ? (isWin ? palette.up : palette.down) : stratColor;
   const glyph = isClose ? "出" : "進";
   const r = hovered ? 13 : 11;
 
@@ -259,6 +297,23 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
   const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const maRef = useRef<ISeriesApi<"Line"> | null>(null);
 
+  // Theme-aware palette state. Initialized from the document's computed CSS
+  // tokens (or hardcoded light fallbacks during SSR), and refreshed on every
+  // `taiex:theme` CustomEvent so a runtime theme flip propagates to the chart
+  // without remounting. `paletteRef` mirrors the state so callbacks created
+  // before a theme flip (paint, draw) still see the latest hex values.
+  const [palette, setPalette] = useState<Palette>(() => readPalette());
+  const paletteRef = useRef<Palette>(palette);
+  useEffect(() => {
+    paletteRef.current = palette;
+  }, [palette]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onTheme = () => setPalette(readPalette());
+    window.addEventListener("taiex:theme", onTheme);
+    return () => window.removeEventListener("taiex:theme", onTheme);
+  }, []);
+
   // Sub-pane refs — each entry exists only while its indicator is enabled.
   const macdRef = useRef<{
     pane: IPaneApi<Time>;
@@ -352,26 +407,27 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     const reduceMotion =
       typeof window !== "undefined" &&
       window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const p0 = paletteRef.current;
     const chart = createChart(containerRef.current, {
       autoSize: true,
       layout: {
-        background: { color: "#fbf7ee" },
-        textColor: INK,
+        background: { color: p0.bg },
+        textColor: p0.ink,
         // Make the pane separator visible + draggable. lightweight-charts v5
         // exposes color/hover styling but no separator thickness option.
         // Keep the row height at the library's measured 1px so autoSize and
         // pane layout calculations stay in sync.
         panes: {
-          separatorColor: "#a8773d",
-          separatorHoverColor: "#1f1d1a",
+          separatorColor: p0.accent,
+          separatorHoverColor: p0.ink,
           enableResize: true,
         },
       },
-      grid: { vertLines: { color: "#ece5d6" }, horzLines: { color: "#ece5d6" } },
+      grid: { vertLines: { color: p0.rule }, horzLines: { color: p0.rule } },
       timeScale: {
         timeVisible: true,
         secondsVisible: false,
-        borderColor: "#e3dccf",
+        borderColor: p0.rule,
         // lightweight-charts has no native tz option — we render every tick
         // mark via Intl.DateTimeFormat pinned to Asia/Taipei so the x-axis
         // matches local trading hours (08:45–13:45 CST).
@@ -418,17 +474,17 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
           });
         },
       },
-      rightPriceScale: { borderColor: "#e3dccf" },
-      crosshair: { vertLine: { color: "#8a8175" }, horzLine: { color: "#8a8175" } },
+      rightPriceScale: { borderColor: p0.rule },
+      crosshair: { vertLine: { color: p0.inkMuted }, horzLine: { color: p0.inkMuted } },
     });
     chartRef.current = chart;
     candleRef.current = chart.addSeries(CandlestickSeries, {
-      upColor: UP,
-      downColor: DOWN,
-      borderUpColor: UP,
-      borderDownColor: DOWN,
-      wickUpColor: UP,
-      wickDownColor: DOWN,
+      upColor: p0.up,
+      downColor: p0.down,
+      borderUpColor: p0.up,
+      borderDownColor: p0.down,
+      wickUpColor: p0.up,
+      wickDownColor: p0.down,
     });
     if (reduceMotion) {
       candleRef.current.applyOptions({ priceLineVisible: false });
@@ -546,6 +602,78 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     };
   }, []);
 
+  // ─── Re-apply palette on theme change ─────────────────────────────────
+  // Refreshes chart chrome (layout, grid, scales, crosshair, pane separators)
+  // and every active series' colors (candle, MA, MACD, RSI, KD, DMI) plus the
+  // live entry/TP/SL price lines so a theme flip propagates without remount.
+  // Marker overlay is canvas-painted via `paletteRef`, so we just trigger a
+  // redraw at the bottom of this effect.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    chart.applyOptions({
+      layout: {
+        background: { color: palette.bg },
+        textColor: palette.ink,
+        panes: {
+          separatorColor: palette.accent,
+          separatorHoverColor: palette.ink,
+          enableResize: true,
+        },
+      },
+      grid: {
+        vertLines: { color: palette.rule },
+        horzLines: { color: palette.rule },
+      },
+      rightPriceScale: { borderColor: palette.rule },
+      timeScale: { borderColor: palette.rule },
+      crosshair: {
+        vertLine: { color: palette.inkMuted },
+        horzLine: { color: palette.inkMuted },
+      },
+    });
+    if (candleRef.current) {
+      candleRef.current.applyOptions({
+        upColor: palette.up,
+        downColor: palette.down,
+        borderUpColor: palette.up,
+        borderDownColor: palette.down,
+        wickUpColor: palette.up,
+        wickDownColor: palette.down,
+      });
+    }
+    if (maRef.current) {
+      maRef.current.applyOptions({ color: palette.accent });
+    }
+    if (macdRef.current) {
+      macdRef.current.hist.applyOptions({ color: palette.inkMuted });
+      macdRef.current.line.applyOptions({ color: palette.ink });
+      macdRef.current.sig.applyOptions({ color: palette.accent });
+    }
+    if (rsiRef.current) {
+      rsiRef.current.line.applyOptions({ color: palette.strategy4 });
+    }
+    if (kdRef.current) {
+      kdRef.current.k.applyOptions({ color: palette.strategy3 });
+      kdRef.current.d.applyOptions({ color: palette.accent });
+    }
+    if (dmiRef.current) {
+      dmiRef.current.plus.applyOptions({ color: palette.up });
+      dmiRef.current.minus.applyOptions({ color: palette.down });
+      dmiRef.current.adx.applyOptions({ color: palette.accent });
+    }
+    // Live position lines (entry/TP/SL) — applyOptions on each if present.
+    if (entryLineRef.current) {
+      entryLineRef.current.applyOptions({ color: palette.inkMuted });
+    }
+    if (tpLineRef.current) {
+      tpLineRef.current.applyOptions({ color: palette.up });
+    }
+    if (slLineRef.current) {
+      slLineRef.current.applyOptions({ color: palette.down });
+    }
+  }, [palette]);
+
   // ─── Push bars ─────────────────────────────────────────────────────────
   // After Track B, `bars` is closed-history only — the WS owns the live
   // in-progress bar. Refetches must NOT clobber `lastBarRef`; instead, we
@@ -636,7 +764,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       return;
     }
     if (!maRef.current) {
-      maRef.current = chart.addSeries(LineSeries, { color: ACCENT, lineWidth: 1 }, 0);
+      maRef.current = chart.addSeries(LineSeries, { color: palette.accent, lineWidth: 1 }, 0);
     }
     const rows = indicators.ma ?? [];
     const data: LineData<Time>[] = rows
@@ -675,9 +803,9 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       pane.setHeight(paneHeightsRef.current.macd ?? DEFAULT_PANE_HEIGHTS.macd);
       const idx = pane.paneIndex();
       const opts = { priceFormat: { type: "price", precision: 2, minMove: 0.01 } } as const;
-      const hist = chart.addSeries(HistogramSeries, { ...opts, color: "#8a8175" }, idx);
-      const line = chart.addSeries(LineSeries, { ...opts, color: INK, lineWidth: 1 }, idx);
-      const sig = chart.addSeries(LineSeries, { ...opts, color: ACCENT, lineWidth: 1 }, idx);
+      const hist = chart.addSeries(HistogramSeries, { ...opts, color: palette.inkMuted }, idx);
+      const line = chart.addSeries(LineSeries, { ...opts, color: palette.ink, lineWidth: 1 }, idx);
+      const sig = chart.addSeries(LineSeries, { ...opts, color: palette.accent, lineWidth: 1 }, idx);
       macdRef.current = { pane, line, sig, hist };
     }
     const rows = indicators.macd ?? [];
@@ -686,7 +814,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       .map((p) => ({
         time: p.time as Time,
         value: p.hist as number,
-        color: (p.hist as number) >= 0 ? `${UP}55` : `${DOWN}55`,
+        color: (p.hist as number) >= 0 ? `${palette.up}55` : `${palette.down}55`,
       }));
     const lineData: LineData<Time>[] = rows.filter((p) => p.macd != null).map((p) => ({ time: p.time as Time, value: p.macd as number }));
     const sigData: LineData<Time>[] = rows.filter((p) => p.signal != null).map((p) => ({ time: p.time as Time, value: p.signal as number }));
@@ -701,7 +829,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       }
     }
     lookups.current.macd = m;
-  }, [indicators.macd, wantMACD]);
+  }, [indicators.macd, wantMACD, palette]);
 
   // ─── RSI pane ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -721,7 +849,8 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       const pane = chart.addPane();
       pane.setHeight(paneHeightsRef.current.rsi ?? DEFAULT_PANE_HEIGHTS.rsi);
       const idx = pane.paneIndex();
-      const line = chart.addSeries(LineSeries, { color: "#5d3f6e", lineWidth: 1 }, idx);
+      // RSI uses strategy4 (purple) as a distinct accent that survives theme flip.
+      const line = chart.addSeries(LineSeries, { color: palette.strategy4, lineWidth: 1 }, idx);
       rsiRef.current = { pane, line };
     }
     const rows = (indicators.rsi ?? []).filter((p) => p.rsi != null);
@@ -751,8 +880,9 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       const pane = chart.addPane();
       pane.setHeight(paneHeightsRef.current.kd ?? DEFAULT_PANE_HEIGHTS.kd);
       const idx = pane.paneIndex();
-      const k = chart.addSeries(LineSeries, { color: "#2a6f5a", lineWidth: 1 }, idx);
-      const d = chart.addSeries(LineSeries, { color: ACCENT, lineWidth: 1 }, idx);
+      // K = strategy3 (green-ish) vs D = accent (gold) for clear separation.
+      const k = chart.addSeries(LineSeries, { color: palette.strategy3, lineWidth: 1 }, idx);
+      const d = chart.addSeries(LineSeries, { color: palette.accent, lineWidth: 1 }, idx);
       kdRef.current = { pane, k, d };
     }
     const rows = indicators.kd ?? [];
@@ -787,9 +917,9 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       pane.setHeight(paneHeightsRef.current.dmi ?? DEFAULT_PANE_HEIGHTS.dmi);
       const idx = pane.paneIndex();
       // +DI = 漲 = 紅; −DI = 跌 = 綠 (TW); ADX = sumi-gold
-      const plus = chart.addSeries(LineSeries, { color: UP, lineWidth: 1 }, idx);
-      const minus = chart.addSeries(LineSeries, { color: DOWN, lineWidth: 1 }, idx);
-      const adx = chart.addSeries(LineSeries, { color: ACCENT, lineWidth: 1 }, idx);
+      const plus = chart.addSeries(LineSeries, { color: palette.up, lineWidth: 1 }, idx);
+      const minus = chart.addSeries(LineSeries, { color: palette.down, lineWidth: 1 }, idx);
+      const adx = chart.addSeries(LineSeries, { color: palette.accent, lineWidth: 1 }, idx);
       dmiRef.current = { pane, plus, minus, adx };
     }
     const rows = indicators.dmi ?? [];
@@ -1055,7 +1185,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       }
       const x = xRaw + MARKER_X_OFFSET;
       const isHovered = hovered === ev;
-      paintMarker(ctx, ev, x, y, isHovered, outOfRange);
+      paintMarker(ctx, ev, x, y, isHovered, paletteRef.current, outOfRange);
       // Mirror the painted pixel into the cache so hover hit-testing finds
       // this marker — including clamped exits whose `priceToCoordinate`
       // would return null at hover time.
@@ -1171,10 +1301,12 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
     };
   }, [scheduleOverlayDraw]);
 
-  // Redraw when the events list or hovered state changes.
+  // Redraw when the events list, hovered state, or palette changes. Palette
+  // is included so a theme flip repaints markers with the new up/down/accent
+  // hexes (the canvas reads from `paletteRef.current` per draw).
   useEffect(() => {
     scheduleOverlayDraw();
-  }, [filteredTradeEvents, hoveredEvent, bars, scheduleOverlayDraw]);
+  }, [filteredTradeEvents, hoveredEvent, bars, palette, scheduleOverlayDraw]);
 
   // ─── Live updates from WS ─────────────────────────────────────────────
   const lastBarRef = useRef<{ time: number; open: number; high: number; low: number; close: number } | null>(null);
@@ -1263,9 +1395,10 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       const entry = m.price;
       const tp = isLong ? entry + tpPts : entry - tpPts;
       const sl = isLong ? entry - slPts : entry + slPts;
+      const p = paletteRef.current;
       entryLineRef.current = series.createPriceLine({
         price: entry,
-        color: "#8a8175",
+        color: p.inkMuted,
         lineWidth: 1,
         lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
@@ -1273,7 +1406,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       });
       tpLineRef.current = series.createPriceLine({
         price: tp,
-        color: UP,
+        color: p.up,
         lineWidth: 1,
         lineStyle: LineStyle.Dotted,
         axisLabelVisible: true,
@@ -1281,7 +1414,7 @@ export function Chart({ res, bars, indicators, state, onSignal, markerStrategies
       });
       slLineRef.current = series.createPriceLine({
         price: sl,
-        color: DOWN,
+        color: p.down,
         lineWidth: 1,
         lineStyle: LineStyle.Dotted,
         axisLabelVisible: true,

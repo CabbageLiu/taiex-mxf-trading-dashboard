@@ -3,6 +3,15 @@
 .env.local
 .env.*.local
 
+# secrets / certs — NEVER commit
+*.pfx
+*.pem
+*.key
+*.p12
+
+# caveman-compress backups
+*.original.md
+
 # python
 .venv/
 __pycache__/
@@ -33,18 +42,3 @@ dist/
 
 # logs
 *.log
-
-# private trading-strategy source (kept local, never committed)
-backend/app/strategies/examples/strat_*.py
-backend/app/strategies/examples/trade_strat_*.py
-trade_strat_*.md
-v1_trade.md
-
-# private planning docs and exploratory notebooks (kept local, never committed)
-[Vv]*_plan.md
-*.ipynb
-finmind.md
-
-# Claude Code files (kept local, never committed)
-CLAUDE.md
-.claude/

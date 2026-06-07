@@ -21,3 +21,12 @@ class MarketDataAdapter(Protocol):
     def stream_ticks(self) -> AsyncIterator[Tick]: ...
 
     async def backfill(self, start: datetime, end: datetime) -> list[Tick]: ...
+
+    async def reconnect(self) -> None:
+        """Tear down and re-establish the upstream session from scratch.
+
+        Called by the feed-health watchdog when ticks stop flowing during
+        market hours. Implementations that have no session to recover may
+        omit this; callers must guard with ``hasattr``.
+        """
+        ...

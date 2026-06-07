@@ -63,6 +63,34 @@ export type TradeIndicators = {
   adx: number | null;
 };
 
+// 15m trend snapshot stamped onto a trade at entry / exit. `score` is the
+// continuous trend score (-1.0..+1.0, rounded to 4 dp server-side); `label`
+// is its 5-band Chinese bucket (強勢上升 / 溫和上升 / 盤整 / 溫和下降 / 強勢下降);
+// `ts` is the ISO8601 timestamp of the 15m bucket-close that produced it.
+export type TrendStamp = {
+  label: string;
+  score: number;
+  ts: string;
+};
+
+// Live 15m trend snapshot served by GET /trend and pushed via WS
+// `trend_update`. `direction` is the discrete sign of the trend
+// (-1 down, 0 flat, +1 up); `label` is the same 5-band Chinese bucket
+// shape used by TrendStamp.
+export type TrendSnapshot = {
+  ts: string;
+  symbol: string;
+  resolution: string;
+  ema20: number;
+  ema50: number;
+  plus_di: number;
+  minus_di: number;
+  adx: number;
+  direction: -1 | 0 | 1;
+  score: number;
+  label: string;
+};
+
 // V5 Phase A — Trade.payload shape. Documents the known keys without locking
 // down the rest (strategies are free to stash extra context like
 // `entry_reason`, `exit_reason`, etc., which downstream consumers read via
@@ -70,6 +98,8 @@ export type TradeIndicators = {
 export type TradePayload = {
   entry_ind?: TradeIndicators | null;
   exit_ind?: TradeIndicators | null;
+  trend_at_entry?: TrendStamp | null;
+  trend_at_exit?: TrendStamp | null;
   [key: string]: unknown;
 };
 
@@ -386,6 +416,16 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+
+  // 15m trend snapshot. 404 when the trend tracker has not yet produced a
+  // bucket (e.g. cold start before the first 15m close) — surface as `null`
+  // so the UI can render a placeholder instead of erroring out.
+  async getTrend(): Promise<TrendSnapshot | null> {
+    const res = await fetch(`${base}/trend`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`/trend HTTP ${res.status}`);
+    return (await res.json()) as TrendSnapshot;
+  },
 };
 
 // Standalone exports for direct ergonomic use (Agent D)

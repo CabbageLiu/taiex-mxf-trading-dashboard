@@ -5,7 +5,9 @@ from typing import Any
 
 import pandas as pd
 
+from app.indicators.atr import ATR
 from app.indicators.base import Indicator
+from app.indicators.candle import CandleDirection
 from app.indicators.dmi import DMI
 from app.indicators.kd import KD
 from app.indicators.ma import MA
@@ -18,6 +20,8 @@ _REGISTRY: dict[str, type[Indicator]] = {
     "rsi": RSI,
     "kd": KD,
     "dmi": DMI,
+    "atr": ATR,
+    "candle_direction": CandleDirection,
 }
 
 

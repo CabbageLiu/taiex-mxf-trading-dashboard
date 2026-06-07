@@ -66,3 +66,28 @@ async def test_channels_filter(signal):
     assert [r.channel for r in results] == ["b"]
     assert a.calls == []
     assert len(b.calls) == 1
+
+
+async def test_notify_ops_routes_to_discord_only_no_db_record():
+    """`notify_ops` must hit DiscordNotifier.notify_ops and NOT call dispatch's
+    DB-recording path (no alerts/signals row, no in-app fan-out → no phantom
+    trade)."""
+    from unittest.mock import AsyncMock
+
+    from app.notify.discord import DiscordNotifier
+
+    discord = DiscordNotifier(url="https://discord.test/hook")
+    discord.notify_ops = AsyncMock(return_value=AlertResult(channel="discord", ok=True))
+    hub = NotifierHub(notifiers=[discord])
+    with patch.object(hub, "_record") as record:
+        await hub.notify_ops("ops message")
+    discord.notify_ops.assert_awaited_once_with("ops message")
+    record.assert_not_called()
+
+
+async def test_notify_ops_without_discord_is_safe():
+    """No Discord notifier configured → notify_ops is a silent no-op."""
+    a = _Recorder("a")
+    hub = NotifierHub(notifiers=[a])
+    await hub.notify_ops("ops message")  # must not raise
+    assert a.calls == []

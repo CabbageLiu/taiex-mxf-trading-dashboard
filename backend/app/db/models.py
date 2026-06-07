@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     func,
 )
@@ -85,3 +86,21 @@ class Trade(Base):
 
 Index("ix_trades_strategy_entry_ts", Trade.strategy, Trade.entry_ts.desc())
 Index("ix_trades_symbol_entry_ts", Trade.symbol, Trade.entry_ts.desc())
+
+
+class Trend(Base):
+    __tablename__ = "trends"
+    symbol: Mapped[str] = mapped_column(String, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    resolution: Mapped[str] = mapped_column(String, nullable=False)
+    ema20: Mapped[float] = mapped_column(Float, nullable=False)
+    ema50: Mapped[float] = mapped_column(Float, nullable=False)
+    plus_di: Mapped[float] = mapped_column(Float, nullable=False)
+    minus_di: Mapped[float] = mapped_column(Float, nullable=False)
+    adx: Mapped[float] = mapped_column(Float, nullable=False)
+    direction: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    label: Mapped[str] = mapped_column(String, nullable=False)
+
+
+Index("ix_trends_symbol_ts_desc", Trend.symbol, Trend.ts.desc())

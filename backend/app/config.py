@@ -13,7 +13,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    finmind_token: str = Field(default="", alias="FINMIND_TOKEN")
     database_url: str = Field(
         default="postgresql+asyncpg://taiex:taiex@localhost:5432/taiex",
         alias="DATABASE_URL",
@@ -30,16 +29,45 @@ class Settings(BaseSettings):
     # 05:00 and all of Sunday are closed.
     night_session_open: time = Field(default=time(15, 0), alias="NIGHT_SESSION_OPEN")
     night_session_close: time = Field(default=time(5, 0), alias="NIGHT_SESSION_CLOSE")
-    poll_interval_sec: float = Field(default=5.0, alias="POLL_INTERVAL_SEC")
     symbol_display: str = Field(default="MXF", alias="SYMBOL_DISPLAY")
-    # FinMind taiwan_futures_snapshot only serves TXF / TMF / CDF on the
-    # sponsor tier — MXF (小台) returns 0 rows. Keep source = TXF so the feed
-    # stays alive; SYMBOL_DISPLAY decouples the UI label.
-    symbol_source: str = Field(default="TXF", alias="SYMBOL_SOURCE")
 
-    # Historical backfill (V2.5) — TaiwanFuturesTick dataset for gap fills
-    # and backtesting.
-    backfill_data_id: str = Field(default="MTX", alias="BACKFILL_DATA_ID")
+    # Shioaji (SinoPac) credentials — live + historical feed
+    shioaji_api_key: SecretStr | None = Field(default=None, alias="SHIOAJI_API_KEY")
+    shioaji_secret_key: SecretStr | None = Field(default=None, alias="SHIOAJI_SECRET_KEY")
+    shioaji_ca_cert_path: str = Field(default="", alias="SHIOAJI_CA_CERT_PATH")
+    shioaji_ca_password: SecretStr | None = Field(default=None, alias="SHIOAJI_CA_PASSWORD")
+    shioaji_person_id: str = Field(default="", alias="SHIOAJI_PERSON_ID")
+    shioaji_simulation: bool = Field(default=False, alias="SHIOAJI_SIMULATION")
+    # Contract code subscribed for live + historical. TXFR1 = TXF rolling
+    # near-month alias; SinoPac auto-rolls on expiry. DB rows are still
+    # labelled with `symbol_display` (e.g. MXF) since TXF + MXF track the
+    # same TAIEX index and strategies are agnostic.
+    shioaji_contract: str = Field(default="TXFR1", alias="SHIOAJI_CONTRACT")
+    # Bound on the in-process tick queue between the SDK callback thread
+    # and the asyncio consumer. Oldest tick is dropped on overflow.
+    shioaji_queue_maxsize: int = Field(default=10_000, alias="SHIOAJI_QUEUE_MAXSIZE")
+    # Cool-down between login attempts (daily login cap = 1000/day).
+    shioaji_login_cooldown_sec: float = Field(
+        default=30.0, alias="SHIOAJI_LOGIN_COOLDOWN_SEC"
+    )
+
+    # Feed-health watchdog — detects silent tick-starvation (the SDK's own
+    # auto-reconnect can fail permanently with the session stuck "down") and
+    # forces a full re-login during market hours. See IngestRunner.
+    feed_watchdog_enabled: bool = Field(default=True, alias="FEED_WATCHDOG_ENABLED")
+    # Tick silence (s) during an open session before forcing a reconnect.
+    feed_stale_seconds: float = Field(default=90.0, alias="FEED_STALE_SECONDS")
+    # Upper bound on the exponential backoff between forced reconnects.
+    feed_reconnect_backoff_max_sec: float = Field(
+        default=300.0, alias="FEED_RECONNECT_BACKOFF_MAX_SEC"
+    )
+    # Hard cap on forced reconnects per market session (protects the
+    # 1000-logins/day SinoPac budget when the feed will not recover).
+    feed_max_reconnects_per_session: int = Field(
+        default=10, alias="FEED_MAX_RECONNECTS_PER_SESSION"
+    )
+
+    # Historical backfill — gap fills and backtesting via Shioaji `api.ticks`.
     backfill_on_startup_days: int = Field(default=7, alias="BACKFILL_ON_STARTUP_DAYS")
     backfill_min_ticks_per_day: int = Field(default=1000, alias="BACKFILL_MIN_TICKS_PER_DAY")
 

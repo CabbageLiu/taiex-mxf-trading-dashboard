@@ -5,6 +5,7 @@ import { Suspense, useMemo, useState } from "react";
 
 import { Chart } from "@/components/Chart";
 import { DailyConfidenceBadge } from "@/components/DailyConfidenceBadge";
+import { TrendBadge } from "@/components/TrendBadge";
 import { TopBar } from "@/components/TopBar";
 import { AlertLog, type SignalRow } from "@/components/AlertLog";
 import { api } from "@/lib/api";
@@ -71,8 +72,9 @@ function TradingPageInner() {
   });
 
   return (
-    <div className="trading-grid">
-      <div className="trading-main">
+    <div className="page-shell page-shell--flush">
+      <div className="trading-grid">
+        <div className="trading-main">
         <TopBar
           resolution={res}
           onResolutionChange={setRes}
@@ -103,10 +105,12 @@ function TradingPageInner() {
         </div>
       </div>
 
-      <aside className="trading-side">
-        <DailyConfidenceBadge strategy={strategy ?? null} />
-        <AlertLog liveSignals={signals} />
-      </aside>
+        <aside className="trading-side">
+          <TrendBadge />
+          <DailyConfidenceBadge strategy={strategy ?? null} />
+          <AlertLog liveSignals={signals} />
+        </aside>
+      </div>
     </div>
   );
 }

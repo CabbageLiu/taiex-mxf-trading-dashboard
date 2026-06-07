@@ -10,9 +10,12 @@ import pytest
 from app.ingest.backfill import (
     BackfillService,
     DayResult,
-    FinmindHistoricalClient,
+    ShioajiHistoricalClient,
     _trading_days,
 )
+
+TPE = ZoneInfo("Asia/Taipei")
+
 
 # ---------------------------------------------------------------------------
 # _trading_days helper
@@ -40,145 +43,144 @@ def test_trading_days_only_weekend_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# FinmindHistoricalClient.fetch_day
+# ShioajiHistoricalClient.fetch_day
 # ---------------------------------------------------------------------------
 
 
+def _ns(year: int, month: int, day: int, hh: int, mm: int, ss: int = 0) -> int:
+    """Asia/Taipei wall time → nanoseconds since UTC epoch."""
+    return int(datetime(year, month, day, hh, mm, ss, tzinfo=TPE).timestamp() * 1e9)
+
+
+class _FakeShioajiTicks:
+    """Mimics the columnar return shape of `api.ticks(...)`."""
+
+    def __init__(self, ts: list[int], close: list[float], volume: list[int] | None = None):
+        self.ts = ts
+        self.close = close
+        self.volume = volume or [1] * len(ts)
+
+
+class _FakeShioajiApi:
+    def __init__(self, payload: _FakeShioajiTicks):
+        self._payload = payload
+        # `api.Contracts.Futures.TXF.TXFR1` resolves to any sentinel.
+        self.Contracts = SimpleNamespace(
+            Futures=SimpleNamespace(TXF=SimpleNamespace(TXFR1=object()))
+        )
+
+    def ticks(self, contract, date):  # noqa: A002 - matches SDK signature
+        return self._payload
+
+
+def _patch_get_api(payload: _FakeShioajiTicks):
+    fake = _FakeShioajiApi(payload)
+    return patch(
+        "app.ingest.backfill.shioaji_client.get_api",
+        new=AsyncMock(return_value=fake),
+    )
+
+
 @pytest.mark.asyncio
-async def test_fetch_day_parses_naive_timestamps_as_taipei():
-    payload = {
-        "status": 200,
-        "msg": "success",
-        "data": [
-            {"date": "2026-04-29 09:00:00", "price": 39200.0, "volume": 5},
-            {"date": "2026-04-29 09:00:01", "price": 39201.0, "volume": 1},
-            {"date": "bad-row", "price": 1.0},  # parsed → ValueError → filtered out
-            {"date": "2026-04-29 09:00:02", "price": None},  # filtered (no price)
+async def test_fetch_day_parses_ns_timestamps_and_returns_taipei_aware():
+    payload = _FakeShioajiTicks(
+        ts=[
+            _ns(2026, 4, 29, 9, 0, 0),
+            _ns(2026, 4, 29, 9, 0, 1),
         ],
-    }
-
-    class FakeResponse:
-        def __init__(self, body):
-            self._body = body
-
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return self._body
-
-    class FakeClient:
-        def __init__(self, *_, **__):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_):
-            return False
-
-        async def get(self, url, headers=None, params=None):
-            return FakeResponse(payload)
-
-    client = FinmindHistoricalClient(token="t", data_id="MTX")
-    with patch("app.ingest.backfill.httpx.AsyncClient", FakeClient):
-        # The current implementation drops rows where fromisoformat raises;
-        # with the bad-row test data we'd hit that. Strip the bad row to
-        # keep the test focused on the success path.
-        payload["data"] = [r for r in payload["data"] if r.get("date", "").startswith("2026")]
+        close=[39200.0, 39201.5],
+    )
+    client = ShioajiHistoricalClient(contract_code="TXFR1")
+    with _patch_get_api(payload):
         rows = await client.fetch_day(date(2026, 4, 29))
 
     assert len(rows) == 2
-    tz = ZoneInfo("Asia/Taipei")
-    assert rows[0]["ts"] == datetime(2026, 4, 29, 9, 0, 0, tzinfo=tz)
+    assert rows[0]["ts"] == datetime(2026, 4, 29, 9, 0, 0, tzinfo=TPE)
     assert rows[0]["price"] == 39200.0
-    assert rows[1]["ts"] == datetime(2026, 4, 29, 9, 0, 1, tzinfo=tz)
+    assert rows[1]["ts"] == datetime(2026, 4, 29, 9, 0, 1, tzinfo=TPE)
 
 
 @pytest.mark.asyncio
-async def test_fetch_day_filters_calendar_spreads_and_low_prices():
-    """TaiwanFuturesTick mixes outright trades with calendar-spread combos.
-
-    Spreads (contract_date contains '/') quote the spread differential, not
-    the absolute price — values like 86, 150, 173 destroy continuous
-    aggregates' min(price). They must be dropped at the source.
-    """
-    payload = {
-        "status": 200,
-        "msg": "success",
-        "data": [
-            # Outright contract — kept
-            {"date": "2026-04-29 09:00:00", "contract_date": "202605", "price": 39200.0},
-            # Calendar spread (slash in contract_date) — dropped even though price > floor
-            {"date": "2026-04-29 09:00:01", "contract_date": "202604W5/202605", "price": 173.0},
-            # Outright but price below floor — dropped (defensive against future bad payloads)
-            {"date": "2026-04-29 09:00:02", "contract_date": "202605", "price": 500.0},
-            # Outright contract — kept
-            {"date": "2026-04-29 09:00:03", "contract_date": "202605", "price": 39201.5},
-            # Outright with no contract_date field at all — kept (legacy payload shape)
-            {"date": "2026-04-29 09:00:04", "price": 39202.0},
+async def test_fetch_day_drops_sub_floor_and_above_ceiling():
+    payload = _FakeShioajiTicks(
+        ts=[
+            _ns(2026, 4, 29, 9, 0, 0),
+            _ns(2026, 4, 29, 9, 0, 1),
+            _ns(2026, 4, 29, 9, 0, 2),
+            _ns(2026, 4, 29, 9, 0, 3),
         ],
-    }
-
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return payload
-
-    class FakeClient:
-        def __init__(self, *_, **__):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_):
-            return False
-
-        async def get(self, url, headers=None, params=None):
-            return FakeResponse()
-
-    client = FinmindHistoricalClient(token="t", data_id="MTX")
-    with patch("app.ingest.backfill.httpx.AsyncClient", FakeClient):
+        close=[39200.0, 500.0, 200_000.0, 39201.5],
+    )
+    client = ShioajiHistoricalClient(contract_code="TXFR1")
+    with _patch_get_api(payload):
         rows = await client.fetch_day(date(2026, 4, 29))
 
-    assert len(rows) == 3
     prices = [r["price"] for r in rows]
-    assert prices == [39200.0, 39201.5, 39202.0]
-    # No row below the 1000 floor leaks through
-    assert all(p >= 1000.0 for p in prices)
+    assert prices == [39200.0, 39201.5]
 
 
 @pytest.mark.asyncio
-async def test_fetch_day_raises_on_quota_exceeded():
-    payload = {"status": 402, "msg": "Requests reach the upper limit."}
+async def test_fetch_day_returns_empty_for_empty_payload():
+    client = ShioajiHistoricalClient(contract_code="TXFR1")
+    with _patch_get_api(_FakeShioajiTicks(ts=[], close=[])):
+        rows = await client.fetch_day(date(2026, 4, 29))
+    assert rows == []
 
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
 
-        def json(self):
-            return payload
+@pytest.mark.asyncio
+async def test_fetch_day_returns_empty_when_lengths_mismatch():
+    payload = _FakeShioajiTicks(
+        ts=[_ns(2026, 4, 29, 9, 0)], close=[39200.0, 39201.0]
+    )
+    client = ShioajiHistoricalClient(contract_code="TXFR1")
+    with _patch_get_api(payload):
+        rows = await client.fetch_day(date(2026, 4, 29))
+    assert rows == []
 
-    class FakeClient:
-        def __init__(self, *_, **__):
-            pass
 
-        async def __aenter__(self):
-            return self
+@pytest.mark.asyncio
+async def test_fetch_day_raises_when_first_tick_outside_session():
+    """Sanity check fires if ts unit assumption (nanoseconds) is wrong.
 
-        async def __aexit__(self, *_):
-            return False
-
-        async def get(self, url, headers=None, params=None):
-            return FakeResponse()
-
-    client = FinmindHistoricalClient(token="t", data_id="MTX")
-    with patch("app.ingest.backfill.httpx.AsyncClient", FakeClient):
-        with pytest.raises(RuntimeError, match="quota exceeded"):
+    A `ts` value of 2026-04-29 06:00 Taipei is outside both the day session
+    (08:45-13:45) and the previous-night carry window (<=05:00), so the
+    sanity guard must raise rather than persist garbage.
+    """
+    payload = _FakeShioajiTicks(
+        ts=[_ns(2026, 4, 29, 6, 0)],
+        close=[39200.0],
+    )
+    client = ShioajiHistoricalClient(contract_code="TXFR1")
+    with _patch_get_api(payload):
+        with pytest.raises(RuntimeError, match="outside TAIFEX session"):
             await client.fetch_day(date(2026, 4, 29))
+
+
+@pytest.mark.asyncio
+async def test_fetch_day_accepts_night_session_wrap():
+    """A tick at 04:00 the morning AFTER the queried date is valid carry."""
+    payload = _FakeShioajiTicks(
+        ts=[_ns(2026, 4, 30, 4, 0)],
+        close=[39200.0],
+    )
+    client = ShioajiHistoricalClient(contract_code="TXFR1")
+    with _patch_get_api(payload):
+        rows = await client.fetch_day(date(2026, 4, 29))
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_day_accepts_prior_evening_night_session():
+    """Shioaji buckets the prior evening's night session under the next
+    settle-date query, so a tick at 23:00 the previous day is valid."""
+    payload = _FakeShioajiTicks(
+        ts=[_ns(2026, 4, 28, 23, 0)],
+        close=[39200.0],
+    )
+    client = ShioajiHistoricalClient(contract_code="TXFR1")
+    with _patch_get_api(payload):
+        rows = await client.fetch_day(date(2026, 4, 29))
+    assert len(rows) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +190,7 @@ async def test_fetch_day_raises_on_quota_exceeded():
 
 @pytest.mark.asyncio
 async def test_backfill_day_inserts_via_persist():
-    fake_client = AsyncMock(spec=FinmindHistoricalClient)
+    fake_client = AsyncMock(spec=ShioajiHistoricalClient)
     fake_client.fetch_day.return_value = [
         {"ts": datetime(2026, 4, 29, 9, 0, tzinfo=UTC), "price": 39200.0},
         {"ts": datetime(2026, 4, 29, 9, 0, 1, tzinfo=UTC), "price": 39201.0},
@@ -204,12 +206,12 @@ async def test_backfill_day_inserts_via_persist():
     ticks_arg = mock_persist.call_args.args[0]
     assert len(ticks_arg) == 2
     assert ticks_arg[0].symbol == "MXF"
-    assert ticks_arg[0].source == "FINMIND_FUTURES_TICK"
+    assert ticks_arg[0].source == "SHIOAJI_FUTURES_TICK_HISTORICAL"
 
 
 @pytest.mark.asyncio
 async def test_backfill_day_returns_zero_when_no_rows():
-    fake_client = AsyncMock(spec=FinmindHistoricalClient)
+    fake_client = AsyncMock(spec=ShioajiHistoricalClient)
     fake_client.fetch_day.return_value = []
 
     svc = BackfillService(client=fake_client, symbol="MXF", min_ticks_per_day=1)
@@ -222,15 +224,15 @@ async def test_backfill_day_returns_zero_when_no_rows():
 
 @pytest.mark.asyncio
 async def test_backfill_day_swallows_fetch_errors_into_result():
-    fake_client = AsyncMock(spec=FinmindHistoricalClient)
-    fake_client.fetch_day.side_effect = RuntimeError("quota exceeded (HTTP 402)")
+    fake_client = AsyncMock(spec=ShioajiHistoricalClient)
+    fake_client.fetch_day.side_effect = RuntimeError("shioaji unauthorized")
 
     svc = BackfillService(client=fake_client, symbol="MXF", min_ticks_per_day=1)
     res = await svc.backfill_day(date(2026, 4, 29))
 
     assert res.fetched == 0
     assert res.inserted == 0
-    assert res.error is not None and "quota" in res.error
+    assert res.error is not None and "unauthorized" in res.error
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +242,7 @@ async def test_backfill_day_swallows_fetch_errors_into_result():
 
 @pytest.mark.asyncio
 async def test_backfill_range_iterates_only_weekdays():
-    fake_client = AsyncMock(spec=FinmindHistoricalClient)
+    fake_client = AsyncMock(spec=ShioajiHistoricalClient)
     fake_client.fetch_day.return_value = []
 
     svc = BackfillService(client=fake_client, symbol="MXF", min_ticks_per_day=1)
@@ -257,7 +259,7 @@ async def test_backfill_range_iterates_only_weekdays():
 
 @pytest.mark.asyncio
 async def test_backfill_range_rejects_inverted_window():
-    svc = BackfillService(client=AsyncMock(spec=FinmindHistoricalClient), symbol="MXF")
+    svc = BackfillService(client=AsyncMock(spec=ShioajiHistoricalClient), symbol="MXF")
     with pytest.raises(ValueError):
         await svc.backfill_range(date(2026, 4, 29), date(2026, 4, 28))
 
@@ -269,10 +271,6 @@ async def test_backfill_range_rejects_inverted_window():
 
 @pytest.mark.asyncio
 async def test_missing_days_filters_under_threshold_and_skips_today():
-    today = datetime.now(ZoneInfo("Asia/Taipei")).date()
-    yesterday = today.replace(day=max(today.day - 1, 1))
-    # We can't easily synthesize "yesterday" across month boundaries; pick a
-    # known historical pair instead.
     yesterday = date(2026, 4, 28)
     today_overridden = date(2026, 4, 29)
 
@@ -296,10 +294,10 @@ async def test_missing_days_filters_under_threshold_and_skips_today():
         async def __aexit__(self, *_):
             return False
 
-    fake_client = AsyncMock(spec=FinmindHistoricalClient)
+    fake_client = AsyncMock(spec=ShioajiHistoricalClient)
     svc = BackfillService(client=fake_client, symbol="MXF", min_ticks_per_day=1000)
 
-    fixed_now = datetime(2026, 4, 29, 14, 30, tzinfo=ZoneInfo("Asia/Taipei"))
+    fixed_now = datetime(2026, 4, 29, 14, 30, tzinfo=TPE)
 
     class FixedDateTime(datetime):
         @classmethod
@@ -321,16 +319,16 @@ async def test_missing_days_filters_under_threshold_and_skips_today():
 
 @pytest.mark.asyncio
 async def test_backfill_recent_no_op_when_lookback_zero():
-    svc = BackfillService(client=AsyncMock(spec=FinmindHistoricalClient), symbol="MXF")
+    svc = BackfillService(client=AsyncMock(spec=ShioajiHistoricalClient), symbol="MXF")
     out = await svc.backfill_recent(0)
     assert out == []
 
 
 @pytest.mark.asyncio
 async def test_backfill_recent_runs_each_missing_day():
-    fake_client = AsyncMock(spec=FinmindHistoricalClient)
+    fake_client = AsyncMock(spec=ShioajiHistoricalClient)
     fake_client.fetch_day.return_value = [
-        {"ts": datetime(2026, 4, 28, 9, 0, tzinfo=UTC), "price": 1.0},
+        {"ts": datetime(2026, 4, 28, 9, 0, tzinfo=UTC), "price": 39200.0},
     ]
 
     svc = BackfillService(client=fake_client, symbol="MXF", min_ticks_per_day=1)
@@ -341,55 +339,3 @@ async def test_backfill_recent_runs_each_missing_day():
 
     assert [r.day for r in results] == [date(2026, 4, 27), date(2026, 4, 28)]
     assert all(r.inserted == 1 for r in results)
-
-
-@pytest.mark.asyncio
-async def test_fetch_day_keeps_only_dominant_contract_date():
-    """When TaiwanFuturesTick mixes contract_dates (front + back months),
-    keep only rows from the most-traded one."""
-    payload = {
-        "status": 200,
-        "msg": "success",
-        "data": [
-            # Front month — 3 rows
-            {"date": "2026-04-29 09:00:00", "contract_date": "202605", "price": 39200.0},
-            {"date": "2026-04-29 09:00:01", "contract_date": "202605", "price": 39201.0},
-            {"date": "2026-04-29 09:00:02", "contract_date": "202605", "price": 39202.0},
-            # Next month — 1 row (off-contract)
-            {"date": "2026-04-29 09:00:03", "contract_date": "202606", "price": 39600.0},
-            # Far month — 1 row (off-contract)
-            {"date": "2026-04-29 09:00:04", "contract_date": "202703", "price": 40550.0},
-        ],
-    }
-
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return payload
-
-    class FakeClient:
-        def __init__(self, *_, **__):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_):
-            return False
-
-        async def get(self, url, headers=None, params=None):
-            return FakeResponse()
-
-    client = FinmindHistoricalClient(token="t", data_id="MTX")
-    with patch("app.ingest.backfill.httpx.AsyncClient", FakeClient):
-        rows = await client.fetch_day(date(2026, 4, 29))
-
-    # Only the 3 front-month (202605) rows survive
-    assert len(rows) == 3
-    prices = sorted(r["price"] for r in rows)
-    assert prices == [39200.0, 39201.0, 39202.0]
-    # Off-contract rows are excluded
-    assert 39600.0 not in prices
-    assert 40550.0 not in prices

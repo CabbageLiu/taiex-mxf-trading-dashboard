@@ -246,6 +246,7 @@ tailscale down
   you outgrow this.
 - ⚠ V2: CORS is wide open and mutating endpoints are unauthenticated.
   Tailscale-only deploys are fine; public exposure is **not** safe yet.
+  See `V3_plan.md`.
 
 ---
 
@@ -270,6 +271,21 @@ tailscale down
 | Hot-reload not picking up changes | Editor saving outside `./backend` or `./frontend`, or filesystem watcher quirks on macOS | `docker compose restart backend` (or `frontend`) |
 | Trade list empty even though strategies fired signals | Strategy emits LONG only (no EXIT/SHORT), so trades stay open and aren't counted as closed | Add an exit rule to the strategy. Open trades show as `open_count` in `/trades/stats`, not in `trade_count` |
 | Want to nuke everything and start clean | — | `docker compose down -v && docker compose up --build` |
+| No ticks / no trades all session, `/status` `ingest_running:true` but `ingest_lag_seconds` huge | Shioaji session stuck "down" — SDK auto-reconnect failed permanently | The in-process feed-health watchdog now auto-recovers within ~90s during session hours (forces a full re-login). If `/status.feed.feed_healthy:false` persists, check `docker compose logs backend` for repeated `forcing reconnect` + `Session Down`; manual kick: `docker compose restart backend`. Watchdog tunables: `FEED_*` in `.env`. |
+
+### 6.1 Feed-liveness backstop (optional, macOS launchd)
+
+In-process recovery handles the normal case. For defence against a fully wedged
+event loop, install the external backstop (restarts the container only when the
+in-process watchdog is itself dead — stale feed during a session with
+`reconnect_count==0`, debounced over two 5-min polls, capped at 5 restarts/day):
+
+```sh
+# edit the absolute path inside the plist to match your checkout first
+cp backend/scripts/com.user.taiex-feed-liveness.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.user.taiex-feed-liveness.plist
+tail -f /tmp/taiex-feed-liveness.log     # watch decisions
+```
 
 ---
 
@@ -636,8 +652,8 @@ Notes:
 - TaiwanFuturesTick is **Backer/Sponsor tier**. Free tokens get HTTP 402
   on this dataset.
 - The `/admin/backfill` endpoint is unauthenticated in V2.5 — same gap
-  as the rest of the mutating endpoints. Do not expose it publicly until
-  the auth layer lands.
+  documented in `V3_plan.md` for the rest of the mutating endpoints. Do
+  not expose it publicly until the auth layer lands.
 
 Verify a backfill landed:
 
@@ -756,6 +772,196 @@ succession after a backend restart — the second one is correctly rejected.
 
 ---
 
+## 11. V5 — strategy spec compliance + chart marker hardening
+
+### 11.1 The two example strategies
+
+**`trade_strat_v1`** (display name `30分鐘線策略`) — see
+`v1_trade.md` for the source-of-truth.
+
+| facet | rule |
+|---|---|
+| resolutions | `["3m", "30m", "1d"]` |
+| entry tf | 30m bar close |
+| entry conditions (LONG) | `KD > 20` AND MACD just-turned-positive (`macd[-3] <= 0 AND macd[-2] > 0 AND macd[-1] > macd[-2]`) AND `+DI > 21` |
+| entry conditions (SHORT) | symmetric: KD < 20-ceiling, MACD just-turned-negative (mirrored via `-macd`), `-DI > 21` |
+| exit assist tf | 3m bar close |
+| exit assist | `-DI > 23` (strict `>`) closes LONG; `+DI > 23` closes SHORT |
+| TP / SL | 250 / 75 points, eval on entry-tf bar close |
+| daily 1d display | counts how many of the 3 entry conditions hold long/short side; shown as 0..3 dots in `DailyConfidenceBadge` |
+| cooldown | 5 × 30m bars after exit |
+
+**`trade_strat_v2`** (display name `5分鐘策略`) — see
+`v2_trade.md`.
+
+| facet | rule |
+|---|---|
+| resolutions | `["1m", "3m", "5m", "1d"]` |
+| entry tf | 5m bar close |
+| entry conditions | identical shape to v1, on 5m |
+| exit assist tf | 3m bar close |
+| exit assist | `-DI ≥ 23` (note: `>=`, not `>` — this is the v2 spec's distinction from v1) |
+| TP / SL | 65 / 50 points, eval on **1m** bar close (separate code path with no entry logic — `_check_tp_sl_minute`); 5m bar close does NOT evaluate TP/SL |
+| daily 1d display | same as v1 |
+| cooldown | 5 × 5m bars after exit |
+
+Both strategies emit `Signal.payload.entry_ind` and
+`payload.exit_ind` with the full 8-key snapshot (`{k, d, macd, signal,
+hist, plus_di, minus_di, adx}`, 2-decimal-rounded, NaN → None). The
+position tracker copies these into `Trade.payload` so the analysis log
+renders the conditions side-by-side.
+
+### 11.2 strat_30k / strat_15k / strat_1k (MA120 trend strategies)
+
+Three LONG-only strategies. All three are **tick-driven on their primary resolution** (entries fire intra-bar; price-based exits fire the moment the tick crosses the threshold). Spec authority: `three_strats.md` at repo root. Per-strategy windows + aux gates have diverged — see the table below.
+
+**Per-strategy entry windows (Asia/Taipei, half-open; 30K/15K block past midnight, 1K wraps overnight to 05:00):**
+
+| canonical | window |
+|-----------|--------|
+| `strat_30k` | `[09:10, 12:15) ∪ [15:00, 24:00)` |
+| `strat_15k` | `[09:10, 12:15) ∪ [15:00, 24:00)` |
+| `strat_1k`  | `[08:45, 13:45) ∪ [15:00, 05:00 next-day)` |
+
+**Per-strategy entry gates** (all must pass on a rising-edge false→true; `strat_30k` / `strat_15k` use the close>MA120 + MA-rising gate, `strat_1k` does NOT).
+
+| gate | strat_30k | strat_15k | strat_1k |
+|------|-----------|-----------|----------|
+| MA120 trend | close>MA AND MA rising (30m) | close>MA AND MA rising (15m) | — (dropped) |
+| Primary KD | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<75` (30m) | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<65` (15m) | `k_prev>d_prev`, `k_curr>d_curr`, `k_prev<70` (1m, mandatory) |
+| Primary MACD hist | `hist_prev<0 AND hist_curr>0` (zero-cross, 30m) | `hist_prev<0 AND hist_curr>0` (zero-cross, 15m) | `hist_curr > 0` (strict positive, 1m, mandatory) |
+| Primary DMI | `+DI>-DI` both rows AND `-DI` shrinking (30m) | same (15m) | rising — `+DI[-1]>+DI[-2] AND -DI[-1]<-DI[-2]` (1m, mandatory) |
+| Aux MACD | 5m `hist[-1] > 0` (positive only, ≤15min staleness) | 30m `hist_prev<0 AND hist_curr>0` (zero-cross, ≤90min) | — (dropped) |
+
+`strat_1k` entry is now a pure AND across the three 1m gates above (no branches, no aux). Staleness thresholds (where applicable) use the `3 × delta` convention (matches the ingest watchdog retire threshold).
+
+**Per-strategy exit / cooldown / extra exit:**
+
+| canonical | display | primary | TP | SL | Trail | Cooldown | Extra exit |
+|-----------|---------|---------|-----|-----|-------|----------|------------|
+| `strat_30k` | 30K策略 | 30m | 180 | 70 | 80 | 9000s (5×30m) | — |
+| `strat_15k` | 15K策略 | 15m | 130 | 70 | 80 | 4500s (5×15m) | — |
+| `strat_1k`  | 1K策略  | 1m  | ToD-segmented (see below) | — (dropped) | 40 | 300s (5×1m) | — (DI_JUMP_1M removed) |
+
+**`strat_1k` ToD-segmented TP** (Asia/Taipei wall-clock of the evaluation `ts`, half-open):
+
+| bucket | TP |
+|--------|----|
+| `[08:45, 10:31)` | 50 |
+| `[10:31, 13:45)` | 40 |
+| `[15:00, 18:01)` | 30 |
+| `[18:01, 23:31)` | 50 |
+| `[23:31, 24:00) ∪ [00:00, 05:00)` | 30 |
+| closed gaps `[13:45, 15:00) ∪ [05:00, 08:45)` | 40 (fallback; market closed) |
+
+`strat_1k` trail is uniformly 40 across all buckets. Hard SL and DI_JUMP_1M are removed: the trailing stop alone caps downside (a 40-pt drop from peak — including a 40-pt drawdown from the entry, where peak_pnl=0 — closes the position).
+
+All three declare `tick_resolutions: ["<primary>"]`.
+
+- `strat_30k` aux specs: `{"macd_5m": macd(12, 26, 9) @ 5m}`.
+- `strat_15k` aux specs: `{"macd_30m": macd(12, 26, 9) @ 30m}`.
+- `strat_1k` aux specs: `{}` (no aux indicators; entry is AND across three 1m gates only).
+
+**Trailing stop semantics:** `peak_pnl` tracks from entry, starts at 0. Exit fires when `current_pnl ≤ peak_pnl − trail_points`. For `strat_30k` / `strat_15k` SL handles the never-profitable case (SL < trail, so SL fires first). For `strat_1k` SL is gone — trail alone caps the immediate-drawdown case. Peak update happens after all priority checks.
+
+**Exit priority:** TP → SL → TRAIL → hold for `strat_30k` / `strat_15k`; TP → TRAIL → hold for `strat_1k` (no SL, no DI_JUMP_1M). **Exits ignore the window gate AND every aux gate** so an open position is always closeable across the no-entry gap (`12:15–15:00` for 30K/15K, `13:45–15:00` + `05:00–08:45` for 1K).
+
+**Cooldown:** time-based (`cooldown_until: datetime | None`). After exit, blocks new entries until `ts ≥ cooldown_until`; resets `last_long_ready` so the rising-edge latch re-arms cleanly when cooldown expires (and same for the window-blocked path — closed window resets the latch so a window reopen with pre-aligned gates fires fresh).
+
+**Fill convention:** tick-driven. `Signal.ts` carries the raw tick timestamp; `signals.ts` / `trades.entry_ts` / `trades.exit_ts` reflect actual fill time, not bucket boundaries.
+
+**Indicator specs:** `ma120 (period=120 SMA)` for `strat_30k` / `strat_15k` only, `kd (9, 3, 3)`, `macd (12, 26, 9)`, `dmi (14)`. MA120 needs ~2.5 days of primary bars to fully warm up; default `BACKFILL_ON_STARTUP_DAYS=7` covers it. The `entry_ind` / `exit_ind` payload snapshot keeps the existing 8-key shape (`{k, d, macd, signal, hist, plus_di, minus_di, adx}`) — MA120 is intentionally NOT in the snapshot.
+
+**Operator deploy step:** restart backend; the registry autodiscovers the new modules. Default `enabled=False` in `strategy_config`. Operator enables the three new strategies in the Strategies UI; toggles `trade_strat_v1` / `trade_strat_v2` off if previously enabled.
+
+### 11.3 `bars_3m` continuous aggregate
+
+Migration `0004_bars_3m.py` (mirrors `0003_bars_2m_10m.py`) adds a
+`bars_3m` continuous aggregate with the same 30 s
+`add_continuous_aggregate_policy`. `RESOLUTIONS`,
+`RESOLUTION_DELTAS`, and `VALID_RES` are extended with `3m`. The
+`/bars` endpoint serves it like any other resolution. Run
+`docker compose down -v && docker compose up -d --build` (or
+`uv run alembic upgrade head` on the host) to apply.
+
+### 11.4 Chart marker behavior
+
+- **Pane-relative y clamp** in `frontend/components/Chart.tsx`. When
+  `series.priceToCoordinate(price)` returns null OR returns a y outside
+  the candle pane's height (fetched via `chart.paneSize(0).height` with
+  a defensive fallback to container height), the marker's y is clamped
+  into `[8, paneHeight - 8]` and a directional `▲` / `▼` chevron is
+  painted beside the disc so users see the off-screen exit.
+- **Hover hit-test cache** keyed on the same pixel coords the paint loop
+  used (`paintedCoordsRef: Map<TradeEvent, {x, y, outOfRange}>`). Clamped
+  exit dots are now hoverable; the tooltip shows the `#tradeId` chip.
+- **`window.__taiexMarkerStats`** exposes
+  `{events, drewOpen, drewClose, skipped, clamped, retryScheduled,
+  hitTestable}` for browser-console debugging.
+- **MarkerFilterPills** in TopBar gate which strategies render markers.
+  `全部` / `30分鐘線策略` / `5分鐘策略`. Local component state, no URL
+  persistence. `<Chart>` accepts a new
+  `markerStrategies?: Set<string> | null` prop (null = show all).
+
+### 11.5 What to do when a strategy spec changes
+
+1. Edit the strategy module under `backend/app/strategies/examples/`.
+2. Update the matching `backend/tests/test_<strategy>.py` cases — lock
+   the new condition with both positive and negative test fixtures.
+3. If the spec adds a new resolution, write an alembic migration that
+   adds the corresponding `bars_<N>` continuous aggregate and extend
+   `RESOLUTIONS` / `RESOLUTION_DELTAS` / `VALID_RES`. Mirror the latest
+   `0004_bars_3m.py` template.
+4. If the spec changes the indicator-snapshot shape, update both
+   strategies' `_ind_snapshot` helpers AND the frontend
+   `TradeIndicators` type in `frontend/lib/api.ts` AND the
+   `formatIndicators` rendering helper in
+   `frontend/components/TradesTable.tsx` — keep the fixed-key shape in
+   sync everywhere.
+5. After a strategy code edit, `module_mtime` invalidates the
+   per-strategy backtest LRU cache so subsequent `/backtest/run` calls
+   re-compute against the new code (V4 phase 1).
+6. Live trades from the previous spec remain in `trades` with
+   `payload.entry_ind` / `payload.exit_ind` matching the old shape. The
+   frontend renders missing fields as `—`, so historical rows don't
+   crash; manual cleanup is optional.
+
+---
+
+## 12. V5.1 — `trade_strat_v1` exit re-spec (current live rules)
+
+The 30 分鐘線策略 (`trade_strat_v1`) exit logic was rewritten on
+2026-04-30. Live rules:
+
+| condition | rule | reason code |
+|---|---|---|
+| TP | profit ≥ 250 點 | `TP` |
+| SL | loss ≥ 75 點 | `SL` |
+| 10m DMI flip | `-DI > +DI` closes LONG; `+DI > -DI` closes SHORT | `DI_FLIP_10M` |
+| 30m MACD-falling | `macd[-2] > macd[-1]` closes LONG; mirror for SHORT | `MACD_DOWN_30M` |
+
+The previous 3m `-DI > 23` rule is gone. `resolutions` is
+`["10m", "30m", "1d"]`. `Params.exit_di_threshold` was deleted.
+
+Priority inside `_on_30m`: TP/SL → MACD-falling → entry eval. A 30m bar
+that simultaneously hits TP and has falling MACD emits TP only.
+
+The `Params.tp_points` code default is **250**, `sl_points` is **75**.
+If you previously saved older values (150 / 220 / 199 / 60) via the
+dashboard params popover, that DB override is still the live value —
+use the popover to update or `DELETE FROM strategy_config WHERE
+name='trade_strat_v1'` to fall back to the code default. Confirm via:
+
+```sh
+curl -s http://127.0.0.1:8000/strategies | python3 -c \
+  "import json,sys; [print(s['name'], s['params'].get('tp_points'), s['params'].get('sl_points')) for s in json.load(sys.stdin) if s['name'].startswith('trade_strat')]"
+```
+
+The same DB-override gotcha applies to `trade_strat_v2.tp_points`
+(code default **65** as of 2026-05-01; was 70).
+
+---
+
 ## 13. Pane height persistence (V5.1, frontend)
 
 Chart pane heights survive indicator toggles, resolution changes, and
@@ -847,7 +1053,7 @@ Cross-cutting items not yet addressed. None of these block live operation; they 
 - No TW holiday calendar (backfill iterates Mon-Fri incl holidays — wasted API calls).
 - `/admin/backfill` synchronous (multi-month windows block).
 - No per-trade fees / slippage / position sizing in backtest engine.
-- Backtest fills at signal-bar close (no `next_bar_open` mode). Live `strat_1k` is now tick-driven (entries + exits fire intra-bar); `strat_30k` / `strat_15k` / `trade_strat_v1` / `trade_strat_v2` still bar_close. Backtest does not replay raw ticks, so backtest results for `strat_1k` will diverge slightly from live (DI_JUMP_1M still bar-close in both modes; TP/SL/TRAIL fire at bar close in backtest vs tick price in live).
+- Backtest fills at signal-bar close (no `next_bar_open` mode). Live `strat_1k` is now tick-driven (entries + exits fire intra-bar); `strat_30k` / `strat_15k` / `trade_strat_v1` / `trade_strat_v2` still bar_close. Backtest does not replay raw ticks, so backtest results for `strat_1k` will diverge slightly from live (TP/TRAIL fire at bar close in backtest vs tick price in live).
 - No auth / multi-user.
 - `_STATE` swap convention module-introspection-based; brittle to non-`_STATE` naming.
 - `wipe_and_rebackfill.py` has no env guard — destructive, dev container only.

@@ -13,5 +13,9 @@ class MA:
             ma = bars["close"].ewm(span=period, adjust=False).mean()
         else:
             ma = bars["close"].rolling(window=period, min_periods=period).mean()
-        out = pd.DataFrame({"ma": ma}, index=bars.index)
+        # Surface the underlying close alongside the MA so consumers that need
+        # both (e.g. strat_1k's ``above_ema20`` 5m alignment gate) can read a
+        # single aux frame without a second lookup. Additive; existing readers
+        # of the ``ma`` column are unaffected.
+        out = pd.DataFrame({"close": bars["close"], "ma": ma}, index=bars.index)
         return out

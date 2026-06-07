@@ -312,3 +312,23 @@ async def test_discord_send_handles_http_error():
         result = await n.send(sig)
     assert result.ok is False
     assert "boom" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_notify_ops_posts_plain_embed():
+    """`notify_ops` posts an ops embed (no Signal, no fields requiring one)."""
+    notifier = DiscordNotifier(url="https://discord.test/hook")
+    with patch("app.notify.discord.httpx.AsyncClient", _StubClient):
+        res = await notifier.notify_ops("資料流靜默 120s — 強制重連")
+    assert res.ok
+    body = _StubClient.last_body
+    assert body is not None
+    assert body["username"] == "TAIEX ops"
+    assert "強制重連" in body["embeds"][0]["description"]
+
+
+@pytest.mark.asyncio
+async def test_notify_ops_noop_without_webhook():
+    notifier = DiscordNotifier(url="")
+    res = await notifier.notify_ops("anything")
+    assert res.ok is False
