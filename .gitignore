@@ -1,0 +1,108 @@
+# env
+.env
+.env.local
+.env.*.local
+
+# secrets / certs — NEVER commit
+*.pfx
+*.pem
+*.key
+*.p12
+
+# caveman-compress backups
+*.original.md
+
+# local-only scratch / planning / legacy docs (keep on disk, never push)
+20260607_change.md
+V2_plan.md
+V3_plan.md
+finmind.md
+imp.md
+requests.md
+three_strats.md
+trade_strat_v1.md
+trend_loss_analysis.md
+trend_loss_analysis.docx
+v1_trade.md
+v2_trade.md
+v3_trade.md
+v4_plan.md
+v5_plan.md
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv
+# (keep uv.lock — committed for reproducible installs)
+
+# node / next
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# jupyter
+.ipynb_checkpoints/
+
+# logs
+*.log
+
+# local-only — internal docs + scratch notebook (keep on disk, never push)
+API_test.ipynb
+CLAUDE.md
+NOTES.md
+
+# local-only — superpowers plans/specs scratch
+docs/
+
+# local-only — proprietary strategies + their tests (keep on disk, never push)
+backend/app/strategies/examples/strat_15k.py
+backend/app/strategies/examples/strat_1k.py
+backend/app/strategies/examples/strat_1k_ai.py
+backend/app/strategies/examples/strat_30k.py
+backend/app/strategies/examples/strat_ai_orb.py
+backend/app/strategies/examples/trade_strat_v1.py
+backend/app/strategies/examples/trade_strat_v2.py
+backend/tests/test_strat_15k.py
+backend/tests/test_strat_1k.py
+backend/tests/test_strat_1k_ai.py
+backend/tests/test_strat_30k.py
+backend/tests/test_strat_ai_orb.py
+backend/tests/test_trade_strat_v1.py
+backend/tests/test_trade_strat_v2.py
+backend/tests/test_strategy_force_close.py
+backend/tests/test_missed_entry_detector.py
+
+# local-only — strategy research / evaluation scripts (keep on disk, never push)
+backend/scripts/_risk_norm_study.py
+backend/scripts/eda_edge_v2.py
+backend/scripts/eda_regime_profile.py
+backend/scripts/enrich_5m_alignment.py
+backend/scripts/exit_path_pathology.py
+backend/scripts/loss_heatmap_25cell.py
+backend/scripts/permutation_inference.py
+backend/scripts/proto_backtest.py
+backend/scripts/proto_openmom_robust.py
+backend/scripts/quant_eval.py
+backend/scripts/regime_quintile_eval.py
+backend/scripts/replay_strategies.py
+backend/scripts/sweep_5m_alignment.py
+backend/scripts/sweep_orb_refinement.py
+backend/scripts/trail_counterfactual.py
+backend/scripts/trend_analysis.py
+backend/scripts/trend_for_losses.py
+backend/scripts/trend_wins_losses.py
+backend/tests/test_permutation_inference.py
